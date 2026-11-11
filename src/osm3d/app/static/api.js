@@ -28,4 +28,5 @@ export const api = {
     request("PUT", `${path(key)}/review`, { status, note, overrides }),
   resetReview: (key) => request("DELETE", `${path(key)}/review`),
   export: () => request("POST", "/api/export"),
+  archive: (status, archived = true) => request("POST", "/api/reviews/archive", { status, archived }),
 };

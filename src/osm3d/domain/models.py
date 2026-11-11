@@ -179,6 +179,7 @@ class Building(BaseModel):
     # "accepted" são exportados; correções manuais entram nas partes com source=manual.
     review_status: ReviewStatus = "pending"
     review_note: str | None = None
+    review_archived: bool = False  # aceite já submetido / rejeitado arquivado
 
     @property
     def key(self) -> str:

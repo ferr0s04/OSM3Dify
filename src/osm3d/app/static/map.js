@@ -87,6 +87,7 @@ export class BuildingMap {
         "line-width": ["case", ["boolean", ["feature-state", "selected"], false], 3.5, ["get", "osm3d"], 2.4, ["get", "needs_review"], 1.4, 0.6],
       },
     });
+    this.setShowArchived(this.showArchived ?? false);
     for (const layer of ["b-fill", "b-extrusion"]) {
       this.map.on("click", layer, (e) => e.features[0] && this.onSelect(e.features[0].properties.key));
       this.map.on("mouseenter", layer, () => (this.map.getCanvas().style.cursor = "pointer"));
@@ -106,6 +107,15 @@ export class BuildingMap {
     real.legend.default = defaults.roof;
     real.labels.default = "sem roof:colour (omissão)";
     if (this.mode === "real") this.renderLegend();
+  }
+
+  setShowArchived(on) {
+    // Arquivados (aceites já submetidos, rejeitados) ficam escondidos por omissão.
+    this.showArchived = on;
+    const filter = on ? null : ["!", ["boolean", ["get", "archived"], false]];
+    for (const id of ["b-fill", "b-extrusion", "b-line"]) {
+      if (this.map.getLayer(id)) this.map.setFilter(id, filter);
+    }
   }
 
   setColorMode(mode) {

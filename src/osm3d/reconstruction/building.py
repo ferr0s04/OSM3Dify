@@ -24,12 +24,20 @@ from shapely.geometry import Polygon, box
 from shapely.geometry.base import BaseGeometry
 
 from osm3d.config import Config
-from osm3d.domain.models import Building, BuildingPart, Estimate, QAFlag, RoofShape, Source
+from osm3d.domain.models import (
+    Building,
+    BuildingPart,
+    Estimate,
+    GroundChoice,
+    QAFlag,
+    RoofShape,
+    Source,
+)
 from osm3d.geospatial.point_clouds import PointSet, assign_points, read_points
 from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation, wall_foot_profile
-from osm3d.reconstruction.ground import STEP_THRESHOLD_M, choose_ground, parse_levels
 from osm3d.geospatial.registration import estimate_tile_offset
 from osm3d.geospatial.tiling import TileKey, tile_of
+from osm3d.reconstruction.ground import STEP_THRESHOLD_M, choose_ground, parse_levels
 from osm3d.reconstruction.roof_fitting import (
     FitParams,
     RoofFit,
@@ -177,7 +185,7 @@ def reconstruct_building(
         height = height.model_copy(update={"value": height.value + ground - chosen})
     diagnostics["terrain_step_m"] = ground_info.step_m
     if ground_info.step_m > STEP_THRESHOLD_M:
-        alt = "high" if ground_info.choice == "low" else "low"
+        alt: GroundChoice = "high" if ground_info.choice == "low" else "low"
         alt_height = height.value + chosen - ground_info.elevation(alt)
         flags.append(
             _flag(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -18,6 +18,11 @@ from osm3d.review import Overrides
 
 STATIC_DIR = Path(__file__).parent / "static"
 T = TypeVar("T")
+
+
+class ArchiveIn(BaseModel):
+    status: Literal["accepted", "rejected"]
+    archived: bool = True
 
 
 class ReviewIn(BaseModel):
@@ -78,6 +83,11 @@ def create_app(cfg: Config, service: ReviewService | None = None) -> FastAPI:
     @app.delete("/api/buildings/{osm_type}/{osm_id}/review")
     def reset_review(osm_type: str, osm_id: int) -> dict[str, Any]:
         return call(svc.reset_review, key_of(osm_type, osm_id))
+
+    @app.post("/api/reviews/archive")
+    def archive(body: ArchiveIn) -> dict[str, Any]:
+        """Arquiva (ou desarquiva) todos os aceites ou todos os rejeitados."""
+        return svc.archive(body.status, body.archived)
 
     @app.post("/api/export")
     def export() -> dict[str, Any]:

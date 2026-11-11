@@ -134,6 +134,17 @@ com o eixo do edifício (o S3DB renderiza mal telhados inclinados em partes irre
 - **Cota do terreno.** Concordo com o alerta do documento. Convenção proposta:
   percentil baixo do MDT num anel à volta do footprint (buffer de 1–3 m), usando o
   MDT do *mesmo* levantamento LiDAR. Documentar a convenção no código.
+  **Encosta e patamares** (`reconstruction/ground.py`): o percentil baixo apanha a
+  estrada abaixo de um muro de suporte e dá alturas excessivas (exemplo
+  `way/1441884233`: 9,1 m em vez de ~4,3 m). Por isso mede-se o terreno no pé das
+  paredes, troço a troço. Com desnível > 2 m, escolhe-se entre "chão baixo" e
+  "terreno do lote":
+  1. se o beiral fica a menos de 2,2 m do lote, o edifício está encaixado na
+     encosta e usa-se o chão baixo;
+  2. senão, com `building:levels`, usa-se o chão que dá uma altura por piso plausível;
+  3. sem evidência, usa-se o chão baixo, com sinalização `terrain_step` para revisão.
+
+  Na aplicação de revisão, o terreno de referência pode ser trocado num clique.
 - **Ortofotos não "true ortho".** Em ortofotos convencionais o telhado está deslocado
   relativamente ao footprint (inclinação do edifício). Amostrar a cor numa máscara
   derivada do LiDAR, erodida, e não diretamente no footprint OSM.

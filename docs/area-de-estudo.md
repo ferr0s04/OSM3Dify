@@ -170,6 +170,32 @@ com cantos em esquadria, e as pontas `gabled` são prolongadas.
 | Edifícios a rever | 29 % | **24 %** |
 | Tempo `roofs` + `colours` | ~6,3 min | **~5 min** |
 
+**v7 — encosta e patamares** (exemplo `way/1441884233`: casa num patamar acima da
+estrada, com muro de suporte):
+
+- **O problema:** com o chão no ponto mais baixo à volta do edifício, a altura dava
+  9,1 m em vez de ~4,3 m.
+- **A solução:** o terreno passa a ser medido no pé das paredes, troço a troço, e com
+  desnível > 2 m escolhe-se entre "chão baixo" e "terreno do lote" (ver
+  `reconstruction/ground.py`).
+
+71 dos 504 edifícios reconstruídos têm desnível > 2 m:
+
+| Decisão | Edifícios |
+| --- | ---: |
+| `building:levels` → terreno do lote | 39 |
+| `building:levels` → chão baixo | 6 |
+| Encaixado na encosta (beiral perto do lado de cima) → chão baixo | 7 |
+| Sem evidência → chão baixo + `terrain_step` para revisão | 19 |
+
+| Altura vs `building:levels` (n = 390) | v6 | **v7** |
+| --- | ---: | ---: |
+| Altura por piso plausível (2,4–4,0 m) | 64 % | **70 %** |
+| P90 da altura por piso | 5,18 m | **4,68 m** |
+
+Esta melhoria está inflacionada: nos 45 casos decididos por `building:levels`, a
+mesma tag escolhe e avalia. Os 26 restantes não dependem dela.
+
 O tempo de `roofs` + `colours` chegou a **~6,3 min** por 509 edifícios na v5. A procura
 do volume principal faz até 80 ajustes rápidos em cada edifício difícil. Para o concelho, a ~28 000 edifícios, seriam ~6 h: há que otimizar
 antes de escalar, por exemplo vetorizando os ajustes de todas as hipóteses de uma vez.

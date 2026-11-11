@@ -91,6 +91,62 @@ def test_preview_review_export(client: TestClient) -> None:
     assert d["status"] == "pending" and not d["edited"]
 
 
+def test_archive_accepted_and_rejected(client: TestClient) -> None:
+    client.put("/api/buildings/way/10/review", json={"status": "accepted"})
+    client.put("/api/buildings/relation/30/review", json={"status": "rejected"})
+
+    r = client.post("/api/reviews/archive", json={"status": "accepted"}).json()
+    assert r["changed"] == 1
+    rows = {x["key"]: x for x in client.get("/api/buildings").json()}
+    assert rows["way/10"]["archived"] and rows["way/10"]["status"] == "accepted"
+    assert not rows["relation/30"]["archived"]
+    s = client.get("/api/summary").json()
+    assert s["archived"] == {"accepted": 1} and s["status"] == {"rejected": 1}
+    # Arquivado = já submetido: não volta a ser exportado.
+    assert client.post("/api/export").json()["exported"] == 0
+
+    client.post("/api/reviews/archive", json={"status": "rejected"})
+    assert all(x["archived"] for x in client.get("/api/buildings").json())
+    # Desarquivar aceites devolve-os à exportação.
+    client.post("/api/reviews/archive", json={"status": "accepted", "archived": False})
+    assert client.post("/api/export").json()["exported"] == 1
+    assert client.post("/api/reviews/archive", json={"status": "pending"}).status_code == 422
+
+
+def test_archived_review_survives_new_osm_version(tmp_path: Path) -> None:
+    from shapely.geometry import box
+
+    from osm3d.domain.models import Building
+    from osm3d.review import Review, apply_review
+
+    b = Building(osm_type="way", osm_id=1, osm_version=5, footprint=box(0, 0, 10, 10))
+    old = Review(osm_key="way/1", osm_version=4, status="accepted")
+    assert apply_review(b, old).review_status == "pending"  # desatualizado
+    archived = old.model_copy(update={"archived_at": old.reviewed_at})
+    got = apply_review(b, archived)
+    assert got.review_status == "accepted" and got.review_archived
+
+
+def test_store_migrates_old_schema(tmp_path: Path) -> None:
+    import sqlite3
+
+    from osm3d.review import ReviewStore
+
+    path = tmp_path / "old.sqlite"
+    with sqlite3.connect(path) as c:
+        c.execute(
+            "CREATE TABLE reviews (osm_key TEXT PRIMARY KEY, osm_version INTEGER NOT NULL,"
+            " status TEXT NOT NULL, note TEXT, overrides TEXT NOT NULL, reviewed_at TEXT NOT NULL)"
+        )
+        c.execute(
+            "INSERT INTO reviews VALUES ('way/1', 1, 'accepted', NULL, '{}', '2026-11-11T10:00:00')"
+        )
+    store = ReviewStore(path)
+    assert not store.all()["way/1"].archived
+    assert store.set_archived("accepted", True) == 1
+    assert store.all()["way/1"].archived
+
+
 def test_invalid_review_rejected(client: TestClient) -> None:
     bad = client.put("/api/buildings/way/10/review", json={"status": "talvez"})
     assert bad.status_code == 422

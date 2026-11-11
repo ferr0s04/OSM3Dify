@@ -24,6 +24,7 @@ from osm3d.domain.models import (
     Building,
     BuildingPart,
     Estimate,
+    GroundChoice,
     QAFlag,
     ReviewStatus,
     Roof,
@@ -49,6 +50,8 @@ class Overrides(BaseModel):
     roof_direction: float | None = Field(default=None, ge=0, lt=360)
     roof_colour: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
     building_colour: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    # Encosta: medir height a partir do chão baixo ou do terreno do lote.
+    ground: GroundChoice | None = None
 
     def is_empty(self) -> bool:
         return all(v is None for v in self.model_dump().values())
@@ -61,6 +64,16 @@ class Review(BaseModel):
     note: str | None = None
     overrides: Overrides = Field(default_factory=Overrides)
     reviewed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # Arquivada: aceite já submetido ao OSM, ou rejeitado que não se quer voltar a ver.
+    # Sai da lista/mapa e das exportações; a decisão mantém-se.
+    archived_at: datetime | None = None
+
+    @property
+    def archived(self) -> bool:
+        return self.archived_at is not None
+
+
+_COLUMNS = "osm_key, osm_version, status, note, overrides, reviewed_at, archived_at"
 
 
 class ReviewStore:
@@ -72,17 +85,18 @@ class ReviewStore:
                 "CREATE TABLE IF NOT EXISTS reviews ("
                 " osm_key TEXT PRIMARY KEY, osm_version INTEGER NOT NULL,"
                 " status TEXT NOT NULL, note TEXT, overrides TEXT NOT NULL,"
-                " reviewed_at TEXT NOT NULL)"
+                " reviewed_at TEXT NOT NULL, archived_at TEXT)"
             )
+            cols = {r[1] for r in c.execute("PRAGMA table_info(reviews)")}
+            if "archived_at" not in cols:  # bases de dados anteriores ao arquivo
+                c.execute("ALTER TABLE reviews ADD COLUMN archived_at TEXT")
 
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path)
 
     def all(self) -> dict[str, Review]:
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT osm_key, osm_version, status, note, overrides, reviewed_at FROM reviews"
-            ).fetchall()
+            rows = c.execute(f"SELECT {_COLUMNS} FROM reviews").fetchall()
         return {
             r[0]: Review(
                 osm_key=r[0],
@@ -91,6 +105,7 @@ class ReviewStore:
                 note=r[3],
                 overrides=Overrides.model_validate_json(r[4]),
                 reviewed_at=datetime.fromisoformat(r[5]),
+                archived_at=datetime.fromisoformat(r[6]) if r[6] else None,
             )
             for r in rows
         }
@@ -98,7 +113,7 @@ class ReviewStore:
     def save(self, review: Review) -> None:
         with self._conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO reviews VALUES (?, ?, ?, ?, ?, ?)",
+                f"INSERT OR REPLACE INTO reviews ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     review.osm_key,
                     review.osm_version,
@@ -106,8 +121,19 @@ class ReviewStore:
                     review.note,
                     review.overrides.model_dump_json(),
                     review.reviewed_at.isoformat(),
+                    review.archived_at.isoformat() if review.archived_at else None,
                 ),
             )
+
+    def set_archived(self, status: ReviewStatus, archived: bool) -> int:
+        """(Des)arquiva todas as revisões com ``status``. Devolve o n.º de alteradas."""
+        value = datetime.now(UTC).isoformat() if archived else None
+        cond = "archived_at IS NULL" if archived else "archived_at IS NOT NULL"
+        with self._conn() as c:
+            cur = c.execute(
+                f"UPDATE reviews SET archived_at = ? WHERE status = ? AND {cond}", (value, status)
+            )
+            return cur.rowcount
 
     def delete(self, osm_key: str) -> None:
         with self._conn() as c:
@@ -252,18 +278,63 @@ def apply_review(b: Building, review: Review | None) -> Building:
     """Edifício com a decisão e as correções da revisão aplicadas."""
     if review is None:
         return b
+    if review.archived:
+        # Arquivado: a decisão está fechada. Depois de submeter, a versão OSM muda por
+        # causa da própria edição; isso não torna a revisão desatualizada.
+        return apply_corrections(b, review.overrides).model_copy(
+            update={
+                "review_status": review.status,
+                "review_note": review.note,
+                "review_archived": True,
+            }
+        )
     if review.osm_version != b.osm_version:
         flag = QAFlag(
             code="review_stale",
             message=f"Revisto na versão {review.osm_version}; a versão OSM atual é {b.osm_version}",
         )
         return b.model_copy(update={"qa_flags": [*b.qa_flags, flag]})
-    parts = b.parts
-    if parts and not review.overrides.is_empty():
-        parts = [apply_overrides(b, parts[0], review.overrides), *parts[1:]]
-    return b.model_copy(
-        update={"review_status": review.status, "review_note": review.note, "parts": parts}
+    b = apply_corrections(b, review.overrides)
+    return b.model_copy(update={"review_status": review.status, "review_note": review.note})
+
+
+def apply_ground(b: Building, choice: GroundChoice) -> Building:
+    """Muda a cota do terreno de referência mantendo o topo do telhado no mesmo sítio."""
+    if b.ground is None or b.ground_elevation_m is None or b.ground.choice == choice:
+        return b
+    new_ground = b.ground.elevation(choice)
+    delta = b.ground_elevation_m - new_ground
+    parts = [
+        p.model_copy(
+            update={
+                "height": Estimate[float](
+                    value=p.height.value + delta, confidence=1.0, source=Source.MANUAL
+                )
+            }
+        )
+        for p in b.parts
+    ]
+    ground = b.ground.model_copy(
+        update={"choice": choice, "basis": "manual", "reason": "escolhido na revisão"}
     )
+    flags = [f for f in b.qa_flags if f.code != "terrain_step"]
+    return b.model_copy(
+        update={
+            "ground_elevation_m": new_ground,
+            "ground": ground,
+            "parts": parts,
+            "qa_flags": flags,
+        }
+    )
+
+
+def apply_corrections(b: Building, ov: Overrides) -> Building:
+    """Aplica as correções (terreno primeiro, depois telhado/alturas/cores)."""
+    if ov.ground is not None:
+        b = apply_ground(b, ov.ground)
+    if b.parts and not ov.is_empty():
+        b = b.model_copy(update={"parts": [apply_overrides(b, b.parts[0], ov), *b.parts[1:]]})
+    return b
 
 
 def orientation_of(b: Building, part: BuildingPart) -> Literal["along", "across"] | None:

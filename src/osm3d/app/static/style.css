@@ -100,6 +100,7 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-radius: 3
 .form input, .form select, .form textarea { font: inherit; padding: 4px 6px; border: 1px solid var(--border); border-radius: 5px; color: var(--text); }
 .form .full { grid-column: 1 / -1; }
 .form .est { font-size: 11px; color: var(--muted); font-weight: 400; }
+.form label.ground { background: #fff7e8; border-left: 3px solid var(--warn); padding: 6px 8px; border-radius: 4px; }
 table.kv { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 table.kv td, table.kv th { padding: 3px 6px; border-bottom: 1px solid #f0f2f5; text-align: left; vertical-align: top; }
 table.kv th { color: var(--muted); font-weight: 500; }

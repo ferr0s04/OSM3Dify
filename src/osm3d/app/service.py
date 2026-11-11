@@ -32,12 +32,13 @@ from osm3d.pipeline import (
     review_store_path,
     tag_policy,
 )
+from osm3d.reconstruction.ground import STEP_THRESHOLD_M
 from osm3d.reconstruction.skeleton import has_skeleton, renders_as_skeleton
 from osm3d.review import (
     Overrides,
     Review,
     ReviewStore,
-    apply_overrides,
+    apply_corrections,
     apply_review,
     orientation_of,
 )
@@ -144,6 +145,7 @@ class ReviewService:
             "osm_parts": change.osm_parts,
             "key": b.key,
             "status": b.review_status,
+            "archived": b.review_archived,
             "needs_review": b.needs_review,
             "flags": [f.code for f in b.qa_flags if f.severity != "info"],
             "info_flags": [f.code for f in b.qa_flags if f.severity == "info"],
@@ -185,6 +187,7 @@ class ReviewService:
                             "building_colour",
                             "osm3d",
                             "change",
+                            "archived",
                         )
                     }
                     | {"flags": ",".join(row["flags"])},
@@ -294,6 +297,7 @@ class ReviewService:
             "estimated": self._part_info(base),
             "effective": self._part_info(b),
             "ground_m": _num(b.ground_elevation_m),
+            "ground": self._ground_info(b),
             "offset": list(b.registration_offset_m),
             "bbox": list(self._geom_wgs84(key).bounds),
         }
@@ -399,10 +403,30 @@ class ReviewService:
         base = self.base.get(key)
         if base is None:
             raise NotFound(key)
-        b = base
-        if base.parts:
-            b = base.model_copy(update={"parts": [apply_overrides(base, base.parts[0], overrides)]})
-        return {"mesh": self.mesh_for(b), "tags": self._tags(b), "effective": self._part_info(b)}
+        b = apply_corrections(base, overrides)
+        return {
+            "mesh": self.mesh_for(b),
+            "tags": self._tags(b),
+            "effective": self._part_info(b),
+            "ground": self._ground_info(b),
+        }
+
+    def _ground_info(self, b: Building) -> dict[str, Any] | None:
+        """Terreno de referência e, em encosta, a altura com cada candidato."""
+        g = b.ground
+        if g is None or not b.parts or b.ground_elevation_m is None:
+            return None
+        top = b.ground_elevation_m + b.parts[0].height.value
+        return {
+            "low_m": _num(g.low_m),
+            "high_m": _num(g.high_m),
+            "step_m": _num(g.step_m),
+            "choice": g.choice,
+            "basis": g.basis,
+            "reason": g.reason,
+            "is_slope": g.step_m > STEP_THRESHOLD_M,
+            "heights": {c: self._h(top - g.elevation(c)) for c in ("low", "high")},
+        }
 
     def save_review(
         self, key: str, status: ReviewStatus, note: str | None, overrides: Overrides
@@ -420,6 +444,14 @@ class ReviewService:
         self.store.save(review)
         self.reviews[key] = review
         return self.detail(key)
+
+    def archive(self, status: ReviewStatus, archived: bool = True) -> dict[str, Any]:
+        """(Des)arquiva todos os aceites ou todos os rejeitados."""
+        if status == "pending":
+            raise ValueError("Só se arquivam aceites ou rejeitados")
+        changed = self.store.set_archived(status, archived)
+        self.reviews = self.store.all()
+        return {"status": status, "archived": archived, "changed": changed}
 
     def reset_review(self, key: str) -> dict[str, Any]:
         if key not in self.base:
@@ -446,7 +478,8 @@ class ReviewService:
             "area": self.cfg.area.name,
             "source": str(self.source),
             "n_buildings": len(buildings),
-            "status": dict(Counter(r["status"] for r in rows)),
+            "status": dict(Counter(r["status"] for r in rows if not r["archived"])),
+            "archived": dict(Counter(r["status"] for r in rows if r["archived"])),
             "needs_review": sum(r["needs_review"] for r in rows),
             "edited": sum(r["edited"] for r in rows),
             "shapes": dict(Counter(r["shape"] or "sem dados" for r in rows)),

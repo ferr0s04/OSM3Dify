@@ -9,7 +9,7 @@ const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const fmt = (v, unit = "") => (v === null || v === undefined ? "—" : `${v}${unit}`);
 const SHAPES = ["flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "unknown"];
-const OVERRIDE_FIELDS = ["roof_shape", "height", "roof_height", "roof_orientation", "roof_direction", "roof_colour", "building_colour"];
+const OVERRIDE_FIELDS = ["ground", "roof_shape", "height", "roof_height", "roof_orientation", "roof_direction", "roof_colour", "building_colour"];
 const COLOUR_SOURCE = { "omissão": "sem tag: cor por omissão", OSM: "já no OSM", estimada: "estimada (LiDAR)", manual: "corrigida" };
 
 // Converte qualquer cor CSS (p.ex. "red", do OSM) em #rrggbb para os campos de cor.
@@ -54,6 +54,7 @@ function applyFilters() {
   const shape = $("#f-shape").value;
   const flagged = $("#f-flagged").checked;
   const mismatch = $("#f-mismatch").checked;
+  const showArchived = $("#f-archived").checked;
   const osm = $("#f-osm").value;
   const sort = $("#f-sort").value;
   let rows = state.rows.filter(
@@ -63,7 +64,8 @@ function applyFilters() {
       (!shape || (r.shape ?? "unknown") === shape) &&
       (!flagged || r.needs_review) &&
       (!mismatch || r.match === false) &&
-      (!osm || (osm === "osm3d" ? r.osm3d : r.change === osm)),
+      (!osm || (osm === "osm3d" ? r.osm3d : r.change === osm)) &&
+      (showArchived || !r.archived),
   );
   const by = {
     priority: (a, b) => priority(a) - priority(b),
@@ -102,10 +104,12 @@ function renderList() {
 
 function renderProgress() {
   const c = { pending: 0, accepted: 0, rejected: 0 };
-  state.rows.forEach((r) => c[r.status]++);
+  let archived = 0;
+  state.rows.forEach((r) => (r.archived ? archived++ : c[r.status]++));
   $("#progress").innerHTML =
     `<span>por rever <b>${c.pending}</b></span><span style="color:var(--ok)">aceites <b>${c.accepted}</b></span>` +
-    `<span style="color:var(--bad)">rejeitados <b>${c.rejected}</b></span>`;
+    `<span style="color:var(--bad)">rejeitados <b>${c.rejected}</b></span>` +
+    `<span class="muted" title="Aceites já submetidos e rejeitados arquivados">arquivados <b>${archived}</b></span>`;
 }
 
 function move(delta) {
@@ -153,6 +157,21 @@ function overrides() {
     out[f] = ["height", "roof_height", "roof_direction"].includes(f) ? Number(el.value) : el.value;
   }
   return out;
+}
+
+function renderGround(d, val, t) {
+  // Encosta/patamar: escolher a partir de que terreno se mede height.
+  const g = d.ground;
+  if (!g || !g.is_slope) return "";
+  const sel = val("ground", g.choice);
+  const opt = (c, label) =>
+    `<option value="${c}" ${sel === c ? "selected" : ""}>${label}: chão ${g[c + "_m"]} m → height ${g.heights[c]} m</option>`;
+  return `<label class="full ground ${t("ground")}">terreno de referência (desnível de ${g.step_m} m)
+      <span class="est">${esc(g.reason)}</span>
+      <select name="ground">
+        ${opt("low", "baixo (ponto mais baixo, p.ex. estrada)")}
+        ${opt("high", "lote (terreno dominante junto às paredes)")}
+      </select></label>`;
 }
 
 function renderOsmChange(d) {
@@ -206,6 +225,7 @@ function renderDetail() {
   const josmType = d.osm_type === "way" ? "w" : "r";
   $("#detail").innerHTML = `
     <h2>${d.key} <span class="chip ${statusChip}">${{ pending: "por rever", accepted: "aceite", rejected: "rejeitado" }[d.status]}</span>
+      ${d.archived ? '<span class="chip" title="Arquivado: fora da lista e das exportações">arquivado</span>' : ""}
       ${d.edited ? '<span class="chip">corrigido</span>' : ""}</h2>
     <div class="links">
       <a href="${d.osm_url}" target="_blank" rel="noopener">abrir no OSM ↗</a>
@@ -221,6 +241,7 @@ function renderDetail() {
 
     <h3>Correções</h3>
     <form class="form" id="edit-form" autocomplete="off">
+      ${renderGround(d, val, t)}
       <label class="${t("roof_shape")}">forma do telhado <span class="est">estimado: ${fmt(est.roof_shape)} (${fmt(est.roof_shape_conf)})</span>
         <select name="roof_shape">${shapeOpts(val("roof_shape", eff.roof_shape))}</select></label>
       <label class="${t("height")}">height (m) <span class="est">estimado: ${fmt(est.height)}</span>
@@ -288,6 +309,9 @@ function schedulePreview() {
       if (token !== state.token) return;
       viewer.setModel(p.mesh);
       $("#tags").innerHTML = renderTags(p.tags, state.detail.existing_tags);
+      // Mudar o terreno de referência recalcula a altura (se não foi corrigida à mão).
+      const h = document.querySelector('[name="height"]');
+      if (h && !state.touched.has("height") && p.effective) h.value = p.effective.height;
     } catch (e) {
       toast(`Pré-visualização falhou: ${e.message}`);
     }
@@ -337,6 +361,11 @@ async function resetReview() {
 // ------------------------------------------------------------- arranque
 
 function wire() {
+  $("#f-archived").addEventListener("input", (e) => {
+    map.setShowArchived(e.target.checked);
+    applyFilters();
+  });
+  $("#archive-action").addEventListener("input", (e) => archiveAction(e.target));
   ["#f-search", "#f-status", "#f-shape", "#f-osm", "#f-flagged", "#f-mismatch", "#f-sort"].forEach((s) =>
     $(s).addEventListener("input", applyFilters),
   );
@@ -386,6 +415,40 @@ function wire() {
     else if (k === "r") review("rejected");
     else if (k === "u") resetReview();
   });
+}
+
+async function archiveAction(select) {
+  const action = select.value;
+  select.value = "";
+  if (!action) return;
+  const unarchive = action.startsWith("unarchive-");
+  const status = unarchive ? action.slice("unarchive-".length) : action;
+  const n = state.rows.filter((r) => r.status === status && r.archived === unarchive).length;
+  const label = status === "accepted" ? "aceites" : "rejeitados";
+  if (!n) return toast(`Não há ${label} para ${unarchive ? "desarquivar" : "arquivar"}.`);
+  const msg = unarchive
+    ? `Desarquivar ${n} ${label}? Voltam à lista e ao mapa${status === "accepted" ? " e às exportações" : ""}.`
+    : status === "accepted"
+      ? `Arquivar ${n} aceites?\n\nFaça-o só depois de os ter exportado e submetido ao OSM: deixam de aparecer na lista e no mapa e de ser exportados.`
+      : `Arquivar ${n} rejeitados? Deixam de aparecer na lista e no mapa.`;
+  if (!confirm(msg)) return;
+  try {
+    const r = await api.archive(status, !unarchive);
+    toast(`${r.changed} ${label} ${unarchive ? "desarquivados" : "arquivados"}.`);
+    await reload();
+  } catch (e) {
+    toast(`Erro: ${e.message}`);
+  }
+}
+
+async function reload() {
+  const [rows, geojson] = await Promise.all([api.buildings(), api.geojson()]);
+  state.rows = rows;
+  renderProgress();
+  applyFilters();
+  await map.setData(geojson);
+  const current = state.filtered.find((r) => r.key === state.selected) ?? state.filtered[0];
+  if (current) select(current.key);
 }
 
 async function init() {

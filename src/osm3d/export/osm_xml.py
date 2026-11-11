@@ -52,7 +52,9 @@ def plan_export(
     for b in buildings:
         accepted = b.review_status == "accepted"
         reason = None
-        if b.review_status == "rejected":
+        if b.review_archived:
+            reason = "arquivado (já submetido ou rejeitado)"
+        elif b.review_status == "rejected":
             reason = "rejeitado na revisão"
         elif not accepted and not include_pending:
             reason = "por rever"

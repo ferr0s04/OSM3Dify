@@ -24,6 +24,13 @@
       <button class="tab" data-tab="results">Resultados</button>
     </nav>
     <div class="progress" id="progress"></div>
+    <select id="archive-action" class="btn" title="Arquivar decisões já tratadas: deixam de aparecer na lista e no mapa e de ser exportadas">
+      <option value="">Arquivo…</option>
+      <option value="accepted">Arquivar aceites (já submetidos ao OSM)</option>
+      <option value="rejected">Arquivar rejeitados</option>
+      <option value="unarchive-accepted">Desarquivar aceites</option>
+      <option value="unarchive-rejected">Desarquivar rejeitados</option>
+    </select>
     <button id="btn-export" class="btn primary" title="Gera o .osm para o JOSM (aplica as revisões)">Exportar .osm</button>
   </header>
 
@@ -57,6 +64,7 @@
         <div class="row">
           <label class="check"><input id="f-flagged" type="checkbox"> só sinalizados</label>
           <label class="check"><input id="f-mismatch" type="checkbox"> ≠ OSM</label>
+          <label class="check" title="Mostrar aceites já submetidos e rejeitados arquivados"><input id="f-archived" type="checkbox"> arquivados</label>
         </div>
         <div class="row">
           <select id="f-sort">

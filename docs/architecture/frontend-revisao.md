@@ -165,6 +165,15 @@ aplicadas (`export.include_pending: false`, por omissão desde 2026-11-11).
   - indicadores e matriz de confusão contra o OSM (exatidão estrita e "compatível");
   - formas e cores, relação com o OSM, sinalizações e motivos de exportação.
 
+- **Arquivo** (menu "Arquivo…" na barra de topo):
+  - **arquivar aceites** depois de os submeter ao OSM;
+  - **arquivar rejeitados** que não se quer voltar a ver.
+
+  Os arquivados saem da lista, do mapa e das exportações, e a decisão fica guardada
+  (`archived_at` em `reviews.sqlite`). Um aceite arquivado não fica "desatualizado"
+  quando a versão OSM muda, porque essa mudança é a própria submissão. O filtro
+  "arquivados" volta a mostrá-los, e o menu permite desarquivar.
+
 ### Por fazer
 
 - Ortofoto como camada de fundo opcional (hoje: OSM raster).
