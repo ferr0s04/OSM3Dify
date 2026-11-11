@@ -36,6 +36,33 @@ def _run(config: Config, stage: Stage, force: bool = False) -> None:
 
 
 @app.command()
+def review(
+    config: ConfigOption = DEFAULT_CONFIG,
+    host: Annotated[str, typer.Option(help="Endereço (só local por omissão).")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="Porta HTTP.")] = 8765,
+    browser: Annotated[bool, typer.Option(help="Abrir o browser.")] = True,
+) -> None:
+    """Aplicação de revisão: mapa, 3D (modelo vs. LiDAR), edição de tags, exportação."""
+    import threading
+    import webbrowser
+
+    import uvicorn
+
+    from osm3d.app.server import create_app
+
+    cfg = _load(config)
+    try:
+        application = create_app(cfg)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    url = f"http://{host}:{port}/"
+    typer.secho(f"Aplicação de revisão em {url} (Ctrl+C para terminar)", fg=typer.colors.GREEN)
+    if browser:
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
+    uvicorn.run(application, host=host, port=port, log_level="warning")
+
+
+@app.command()
 def evaluate(config: ConfigOption = DEFAULT_CONFIG) -> None:
     """Compara os resultados com as tags roof:shape / building:levels do OSM."""
     from osm3d.evaluation.benchmark import evaluate as run_eval

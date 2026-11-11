@@ -10,9 +10,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from osm3d.config import Config
 from osm3d.export.s3db_tags import TagPolicy
+
+if TYPE_CHECKING:
+    from osm3d.domain.models import Building
+    from osm3d.export.osm_xml import ExportRecord
 
 
 class Stage(StrEnum):
@@ -55,8 +60,12 @@ def tag_policy(config: Config) -> TagPolicy:
 # Fases ainda sem processamento próprio: passam o artefacto anterior adiante.
 # HEIGHTS: integrada em ROOFS (a altura vem do topo do modelo de telhado).
 # PARTS: Fase 4 — por agora, uma parte por edifício.
-# COLOURS: Fase 5 — desligada em config (appearance.enabled).
-_PASSTHROUGH = {Stage.HEIGHTS, Stage.PARTS, Stage.COLOURS}
+# COLOURS: só quando appearance.enabled.
+_PASSTHROUGH = {Stage.HEIGHTS, Stage.PARTS}
+
+
+def _is_passthrough(config: Config, stage: Stage) -> bool:
+    return stage in _PASSTHROUGH or (stage is Stage.COLOURS and not config.appearance.enabled)
 
 
 def _require(path: Path, stage: Stage) -> Path:
@@ -68,7 +77,7 @@ def _require(path: Path, stage: Stage) -> Path:
 def _input_of(config: Config, stage: Stage) -> Path:
     """Artefacto de entrada: o da fase anterior, saltando fases de passagem."""
     idx = STAGE_ORDER.index(stage) - 1
-    while STAGE_ORDER[idx] in _PASSTHROUGH:
+    while _is_passthrough(config, STAGE_ORDER[idx]):
         idx -= 1
     prev = STAGE_ORDER[idx]
     return _require(artefact_path(config, prev), prev)
@@ -83,7 +92,7 @@ def run_stage(
 ) -> Path:
     """Executa uma fase e devolve o caminho do artefacto produzido."""
     out = artefact_path(config, stage)
-    if stage in _PASSTHROUGH:
+    if _is_passthrough(config, stage):
         return _input_of(config, stage)
 
     match stage:
@@ -117,6 +126,15 @@ def run_stage(
                 progress(f"  quadrículas com LAZ+MDT: {', '.join(sorted(set(lidar) & set(dtm)))}")
             result, _ = reconstruct_area(buildings, lidar, dtm, config, progress)
             return write_buildings(result, out, config.processing_crs)
+        case Stage.COLOURS:
+            from osm3d.appearance.area import colour_area
+            from osm3d.export.geopackage import read_buildings, write_buildings
+            from osm3d.geospatial.point_clouds import index_tiles
+
+            buildings = read_buildings(_input_of(config, stage))
+            lidar = index_tiles(config.sources.lidar_dir, (".laz", ".las"))
+            coloured = colour_area(buildings, lidar, progress)
+            return write_buildings(coloured, out, config.processing_crs)
         case Stage.QA:
             from osm3d.export.geopackage import read_buildings, write_buildings
             from osm3d.validation.quality import check_building
@@ -129,23 +147,43 @@ def run_stage(
             return write_buildings(checked, out, config.processing_crs)
         case Stage.EXPORT:
             from osm3d.export.geopackage import read_buildings
-            from osm3d.export.osm_xml import plan_export, write_josm_file, write_report
+            from osm3d.review import ReviewStore, apply_review
 
-            buildings = read_buildings(_input_of(config, stage))
-            selected, records = plan_export(
-                buildings,
-                tag_policy(config),
-                include_pending=config.export.include_pending,
-                overwrite=config.export.overwrite_existing_tags,
-            )
-            report = write_report(records, out.with_name(f"{config.area.name}_export.csv"))
+            reviews = ReviewStore(review_store_path(config)).all()
+            buildings = [
+                apply_review(b, reviews.get(b.key))
+                for b in read_buildings(_input_of(config, stage))
+            ]
+            path, n_selected, records = export_area(config, buildings)
             if progress:
                 n_conf = sum(bool(r.conflicts) for r in records)
+                n_rev = sum(b.review_status != "pending" for b in buildings)
                 progress(
-                    f"  {len(selected)} de {len(buildings)} edifícios exportados, "
-                    f"{n_conf} com conflitos de tags (mantido o valor OSM) → {report}"
+                    f"  {n_selected} de {len(buildings)} edifícios exportados ({n_rev} revistos), "
+                    f"{n_conf} com conflitos de tags (mantido o valor OSM)"
                 )
-            source = _require(artefact_path(config, Stage.FETCH), Stage.FETCH)
-            return write_josm_file(selected, source, out, upload=config.export.josm_upload)
+            return path
         case _:
             raise NotImplementedError(f"Fase '{stage.value}' ainda não implementada")
+
+
+def review_store_path(config: Config) -> Path:
+    """Revisões humanas: fora dos artefactos das fases, para sobreviverem a novas corridas."""
+    return area_dir(config) / "reviews.sqlite"
+
+
+def export_area(config: Config, buildings: list[Building]) -> tuple[Path, int, list[ExportRecord]]:
+    """Escreve o ``.osm`` para o JOSM e o relatório CSV. Devolve (caminho, n.º, registos)."""
+    from osm3d.export.osm_xml import plan_export, write_josm_file, write_report
+
+    out = artefact_path(config, Stage.EXPORT)
+    selected, records = plan_export(
+        buildings,
+        tag_policy(config),
+        include_pending=config.export.include_pending,
+        overwrite=config.export.overwrite_existing_tags,
+    )
+    write_report(records, out.with_name(f"{config.area.name}_export.csv"))
+    source = _require(artefact_path(config, Stage.FETCH), Stage.FETCH)
+    write_josm_file(selected, source, out, upload=config.export.josm_upload)
+    return out, len(selected), records

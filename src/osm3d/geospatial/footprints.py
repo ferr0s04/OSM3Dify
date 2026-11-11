@@ -157,7 +157,30 @@ def load_footprints(osm_file: Path, crs: str, min_area_m2: float) -> list[Buildi
             )
         )
     log.info("%d edifícios carregados, %d ignorados", len(buildings), skipped)
-    return buildings
+    return _attach_osm_parts(buildings, data, to_crs)
+
+
+def _attach_osm_parts(
+    buildings: list[Building], data: OsmData, to_crs: Transformer
+) -> list[Building]:
+    """Associa a cada edifício as ``building:part`` já mapeadas dentro do contorno."""
+    parts: list[tuple[int, BaseGeometry]] = []
+    for way in data.ways.values():
+        if "building:part" in way.tags and (poly := _way_polygon(way, data)) is not None:
+            projected = _polygonal(shapely.transform(poly, lambda xy: _project(to_crs, xy)))
+            if projected is not None:
+                parts.append((way.id, projected.representative_point()))
+    if not parts or not buildings:
+        return buildings
+    tree = shapely.STRtree([b.footprint.buffer(0.5) for b in buildings])
+    part_idx, bld_idx = tree.query([p for _, p in parts], predicate="within")
+    found: dict[int, list[int]] = {}
+    for pi, bi in zip(part_idx.tolist(), bld_idx.tolist(), strict=True):
+        found.setdefault(bi, []).append(parts[pi][0])
+    return [
+        b.model_copy(update={"osm_parts": sorted(found[i])}) if i in found else b
+        for i, b in enumerate(buildings)
+    ]
 
 
 def _project(transformer: Transformer, xy):  # type: ignore[no-untyped-def]

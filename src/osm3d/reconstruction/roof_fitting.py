@@ -25,7 +25,7 @@ import numpy as np
 import numpy.typing as npt
 from shapely.geometry.base import BaseGeometry
 
-from osm3d.domain.models import Estimate, Roof, RoofShape, Source
+from osm3d.domain.models import Estimate, Roof, RoofModel, RoofShape, Source
 from osm3d.geospatial.point_clouds import PointSet
 from osm3d.reconstruction.roof_models import N_PARAMS, LocalFrame, roof_surface
 
@@ -39,6 +39,9 @@ _CONFIDENCE_SCALE = 10.0
 # Grelha do comprimento relativo da cumeeira dos telhados hipped (meia cumeeira / a).
 # Abaixo de 0,10 o telhado é, na prática, uma pirâmide (hipótese própria).
 HIPPED_RIDGE_RATIOS = tuple(round(r, 2) for r in np.arange(0.10, 0.951, 0.05))
+# side_hipped: cumeeira / comprimento. Abaixo de 0,3 a ponta em hip ocuparia mais de
+# 70 % do comprimento, o que é implausível; perto de 1 aproxima-se de gabled.
+SIDE_HIPPED_RIDGE_RATIOS = tuple(round(r, 2) for r in np.arange(0.30, 0.951, 0.05))
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,7 @@ class FitParams:
         RoofShape.SKILLION,
         RoofShape.GABLED,
         RoofShape.HIPPED,
+        RoofShape.SIDE_HIPPED,
         RoofShape.PYRAMIDAL,
     )
     max_rmse_m: float = 0.35
@@ -62,18 +66,18 @@ class FitParams:
 class Hypothesis:
     shape: RoofShape
     frame: LocalFrame
-    flip: bool = False  # skillion: água virada para -v em vez de +v
-    ridge_ratio: float | None = None  # hipped: meia cumeeira / a
+    flip: bool = False  # skillion: água virada para −v; side_hipped: hip em −u
+    ridge_ratio: float | None = None  # hipped/side_hipped: cumeeira / comprimento
 
     def basis(self, x: Array, y: Array) -> Array | None:
         """f(u, v) do modelo, ou ``None`` para telhado plano."""
         if self.shape is RoofShape.FLAT:
             return None
         u, v = self.frame.to_local(x, y)
-        if self.flip:
-            v = -v
         a, b = self.frame.half_length, self.frame.half_width
-        return roof_surface(self.shape, u, v, a, b, z0=0.0, h=1.0, ridge_ratio=self.ridge_ratio)
+        return roof_surface(
+            self.shape, u, v, a, b, z0=0.0, h=1.0, ridge_ratio=self.ridge_ratio, flip=self.flip
+        )
 
     def slope_deg(self, h: float) -> float:
         a, b = self.frame.half_length, self.frame.half_width
@@ -81,21 +85,25 @@ class Hypothesis:
             RoofShape.SKILLION: 2 * b,
             RoofShape.GABLED: b,
             RoofShape.HIPPED: b,
+            RoofShape.SIDE_HIPPED: b,
             RoofShape.PYRAMIDAL: min(a, b),
         }.get(self.shape)
         return 0.0 if run is None else math.degrees(math.atan2(h, run))
 
     @property
     def ridge_azimuth_deg(self) -> float | None:
-        if self.shape in (RoofShape.GABLED, RoofShape.HIPPED):
+        if self.shape in (RoofShape.GABLED, RoofShape.HIPPED, RoofShape.SIDE_HIPPED):
             return self.frame.azimuth_deg % 180.0
         return None
 
     @property
     def facing_azimuth_deg(self) -> float | None:
-        if self.shape is not RoofShape.SKILLION:
-            return None
-        return (self.frame.v_azimuth_deg + (180.0 if self.flip else 0.0)) % 360.0
+        """``roof:direction``: para onde olha a água (skillion) ou a ponta em hip."""
+        if self.shape is RoofShape.SKILLION:
+            return (self.frame.v_azimuth_deg + (180.0 if self.flip else 0.0)) % 360.0
+        if self.shape is RoofShape.SIDE_HIPPED:
+            return (self.frame.azimuth_deg + (180.0 if self.flip else 0.0)) % 360.0
+        return None
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,15 @@ def hypotheses_for(geometry: BaseGeometry, candidates: tuple[RoofShape, ...]) ->
                 # Comprimento da cumeeira livre: as águas das pontas podem ter inclinação
                 # diferente das laterais (frequente em Portugal).
                 hyps += [Hypothesis(shape, frame, ridge_ratio=r) for r in HIPPED_RIDGE_RATIOS]
+            case RoofShape.SIDE_HIPPED:
+                # Três águas (hip numa só ponta). A cumeeira pode seguir qualquer dos
+                # lados: metade de um hipped dividido ao meio fica com ela no lado curto.
+                hyps += [
+                    Hypothesis(shape, f, flip, ridge_ratio=r)
+                    for f in (frame, across)
+                    for flip in (False, True)
+                    for r in SIDE_HIPPED_RIDGE_RATIOS
+                ]
             case RoofShape.SKILLION:
                 hyps += [
                     Hypothesis(shape, f, flip) for f in (frame, across) for flip in (False, True)
@@ -270,6 +287,17 @@ def fit_roof(
         ridge_azimuth_deg=hyp.ridge_azimuth_deg,
         facing_azimuth_deg=hyp.facing_azimuth_deg,
         rmse_m=best.rmse_m,
+        model=RoofModel(
+            cx=hyp.frame.cx,
+            cy=hyp.frame.cy,
+            azimuth_deg=hyp.frame.azimuth_deg,
+            half_length=hyp.frame.half_length,
+            half_width=hyp.frame.half_width,
+            flip=hyp.flip,
+            ridge_ratio=hyp.ridge_ratio,
+            eave_z=best.z0,
+            roof_height=0.0 if best.shape is RoofShape.FLAT else best.h,
+        ),
     )
     height = Estimate[float](
         value=best.top_z - ground_z, confidence=height_conf, source=Source.LIDAR

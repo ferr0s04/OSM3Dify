@@ -55,7 +55,8 @@ heights:
   min_points_per_building: 50
 
 roofs:
-  candidate_shapes: [flat, skillion, gabled, hipped, pyramidal]
+  # side_hipped = "três águas": hip numa ponta, empena na outra (roof:direction = ponta em hip).
+  candidate_shapes: [flat, skillion, gabled, hipped, side_hipped, pyramidal]
   flat_max_slope_deg: 5.0
   # Abaixo deste valor de confiança a forma é exportada como desconhecida (não é tag).
   min_shape_confidence: 0.7
@@ -66,8 +67,10 @@ roofs:
   max_rmse_m: 0.20
 
 appearance:
-  enabled: false                   # Fase 5
-  colour_palette: [white, lightgrey, grey, darkgrey, black, red, darkred, brown, orange, beige]
+  # roof:colour a partir do RGB do LiDAR, com uma paleta realista (telha, branco,
+  # cinzentos). Ver src/osm3d/appearance/roof_colours.py. A cor das fachadas não é
+  # estimada: o LiDAR aéreo não tem pontos nas fachadas.
+  enabled: true
   min_colour_confidence: 0.6
 
 export:

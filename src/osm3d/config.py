@@ -80,6 +80,7 @@ class RoofsConfig(BaseModel):
         RoofShape.SKILLION,
         RoofShape.GABLED,
         RoofShape.HIPPED,
+        RoofShape.SIDE_HIPPED,
         RoofShape.PYRAMIDAL,
     ]
     flat_max_slope_deg: float = 5.0
@@ -88,8 +89,7 @@ class RoofsConfig(BaseModel):
 
 
 class AppearanceConfig(BaseModel):
-    enabled: bool = False
-    colour_palette: list[str] = []
+    enabled: bool = True
     min_colour_confidence: float = Field(default=0.6, ge=0, le=1)
 
 

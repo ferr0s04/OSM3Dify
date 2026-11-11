@@ -56,10 +56,8 @@ def make_roof(
     x, y = frame.to_world(u, v)
 
     mu, mv = model_frame.to_local(x, y)
-    if flip:
-        mv = -mv
     a, b = model_frame.half_length, model_frame.half_width
-    z = roof_surface(shape, mu, mv, a, b, eave_z, roof_height, ridge_ratio=ridge_ratio)
+    z = roof_surface(shape, mu, mv, a, b, eave_z, roof_height, ridge_ratio=ridge_ratio, flip=flip)
     z = z + rng.normal(0, noise_m, n)
 
     if chimney:

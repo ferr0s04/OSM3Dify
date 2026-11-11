@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>osm3d — Revisão</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">osm3d <span class="muted">revisão</span> <span id="area-name" class="chip"></span></div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="review">Revisão</button>
+      <button class="tab" data-tab="results">Resultados</button>
+    </nav>
+    <div class="progress" id="progress"></div>
+    <button id="btn-export" class="btn primary" title="Gera o .osm para o JOSM (aplica as revisões)">Exportar .osm</button>
+  </header>
+
+  <main id="view-review" class="view review-layout">
+    <aside class="sidebar">
+      <div class="filters">
+        <input id="f-search" type="search" placeholder="Procurar (id OSM)…">
+        <div class="row">
+          <select id="f-status">
+            <option value="">Todos os estados</option>
+            <option value="pending">Por rever</option>
+            <option value="accepted">Aceites</option>
+            <option value="rejected">Rejeitados</option>
+          </select>
+          <select id="f-shape">
+            <option value="">Todas as formas</option>
+            <option>flat</option><option>skillion</option><option>gabled</option>
+            <option>hipped</option><option>side_hipped</option><option>pyramidal</option><option>unknown</option>
+          </select>
+        </div>
+        <div class="row">
+          <select id="f-osm" title="Relação com o OSM">
+            <option value="">OSM: todos</option>
+            <option value="osm3d">já com 3D no OSM</option>
+            <option value="diverge">diverge do OSM</option>
+            <option value="complementa">complementa o OSM</option>
+            <option value="igual">igual ao OSM</option>
+            <option value="novo">novo (sem 3D no OSM)</option>
+          </select>
+        </div>
+        <div class="row">
+          <label class="check"><input id="f-flagged" type="checkbox"> só sinalizados</label>
+          <label class="check"><input id="f-mismatch" type="checkbox"> ≠ OSM</label>
+        </div>
+        <div class="row">
+          <select id="f-sort">
+            <option value="priority">Ordenar: prioridade</option>
+            <option value="conf">Confiança (crescente)</option>
+            <option value="height">Altura (decrescente)</option>
+            <option value="area">Área (decrescente)</option>
+            <option value="key">Id OSM</option>
+          </select>
+        </div>
+        <div class="muted small" id="list-count"></div>
+      </div>
+      <ul id="list" class="list"></ul>
+      <div class="hint small muted">
+        <kbd>J</kbd>/<kbd>K</kbd> seguinte/anterior · <kbd>A</kbd> aceitar · <kbd>R</kbd> rejeitar · <kbd>U</kbd> repor
+      </div>
+    </aside>
+
+    <section class="map-pane">
+      <div id="map"></div>
+      <div class="map-controls">
+        <select id="m-color" title="Colorir por">
+          <option value="real">Cor: cores reais (roof:colour)</option>
+          <option value="change">Cor: alterações ao OSM</option>
+          <option value="status">Cor: estado da revisão</option>
+          <option value="match">Cor: concordância com OSM</option>
+          <option value="shape">Cor: forma do telhado (análise)</option>
+        </select>
+        <label class="check"><input id="m-3d" type="checkbox"> 3D</label>
+      </div>
+      <div id="legend" class="legend"></div>
+    </section>
+
+    <section class="detail-pane">
+      <div class="viewer-wrap">
+        <div id="viewer"></div>
+        <div class="viewer-controls">
+          <select id="v-color" title="Cor dos pontos">
+            <option value="rgb">Pontos: RGB</option>
+            <option value="class">Pontos: classe</option>
+            <option value="inside">Pontos: do edifício</option>
+          </select>
+          <label class="check"><input id="v-points" type="checkbox" checked> pontos</label>
+          <label class="check"><input id="v-context" type="checkbox" checked> contexto</label>
+          <label class="check"><input id="v-model" type="checkbox" checked> modelo</label>
+          <label class="check"><input id="v-transparent" type="checkbox" checked> transparente</label>
+        </div>
+        <div id="viewer-status" class="viewer-status"></div>
+      </div>
+      <div id="detail" class="detail"><p class="muted pad">Selecione um edifício na lista ou no mapa.</p></div>
+    </section>
+  </main>
+
+  <main id="view-results" class="view results-layout hidden"></main>
+
+  <datalist id="palette"></datalist>
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

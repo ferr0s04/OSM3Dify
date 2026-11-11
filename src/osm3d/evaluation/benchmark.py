@@ -20,7 +20,16 @@ from osm3d.domain.models import Building, RoofShape
 # Valores OSM equivalentes às formas suportadas.
 _SHAPE_ALIASES = {"lean_to": "skillion"}
 _SUPPORTED = {s.value for s in RoofShape} - {"unknown"}
-SHAPE_LABELS = ["flat", "skillion", "gabled", "hipped", "pyramidal", "outra", "unknown"]
+SHAPE_LABELS = [
+    "flat",
+    "skillion",
+    "gabled",
+    "hipped",
+    "side_hipped",
+    "pyramidal",
+    "outra",
+    "unknown",
+]
 
 
 def normalize_osm_shape(value: str | None) -> str | None:

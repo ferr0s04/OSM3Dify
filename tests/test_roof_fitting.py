@@ -51,6 +51,32 @@ def test_hipped_with_free_ridge_length(ridge_ratio: float) -> None:
     _check_common(fit, syn, RoofShape.HIPPED)
 
 
+@pytest.mark.parametrize("azimuth", AZIMUTHS)
+@pytest.mark.parametrize("flip", [False, True])
+def test_side_hipped(azimuth: float, flip: bool) -> None:
+    # Três águas (caso real way/330892659): hip numa ponta, empena na outra.
+    syn = make_roof(
+        RoofShape.SIDE_HIPPED, length=18, width=10, azimuth_deg=azimuth, flip=flip, seed=3
+    )
+    fit = fit_roof(syn.footprint, syn.points, syn.ground_z)
+    _check_common(fit, syn, RoofShape.SIDE_HIPPED)
+    # roof:direction aponta para a ponta em hip.
+    expected = azimuth + (180.0 if flip else 0.0)
+    assert direction_difference_deg(fit.roof.facing_azimuth_deg, expected) < 2.0
+    tags = part_to_tags(
+        BuildingPart(id="p", geometry=syn.footprint, height=fit.height, roof=fit.roof)
+    )
+    assert tags["roof:shape"] == "side_hipped"
+    assert "roof:orientation" not in tags and "roof:direction" in tags
+
+
+def test_side_hipped_vs_hipped_and_gabled() -> None:
+    # Os vizinhos de side_hipped continuam a ser reconhecidos como tal.
+    for shape in (RoofShape.HIPPED, RoofShape.GABLED):
+        syn = make_roof(shape, length=18, width=10, azimuth_deg=37, seed=4)
+        assert fit_roof(syn.footprint, syn.points, syn.ground_z).roof.shape.value is shape
+
+
 def test_hipped_ridge_ratio_bounds() -> None:
     from osm3d.reconstruction.roof_models import roof_surface
 

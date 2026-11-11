@@ -13,6 +13,8 @@ from osm3d.geometry import axis_difference_deg, longest_side_azimuth_deg
 
 # Formas com cumeeira cuja direção se exprime via roof:orientation (along/across).
 _RIDGED_SHAPES = {RoofShape.GABLED, RoofShape.HIPPED}
+# Formas cuja direção se exprime via roof:direction (azimute).
+_DIRECTED_SHAPES = {RoofShape.SKILLION, RoofShape.SIDE_HIPPED}
 
 
 @dataclass(frozen=True)
@@ -69,7 +71,9 @@ def part_to_tags(part: BuildingPart, policy: TagPolicy | None = None) -> dict[st
         if axis_difference_deg(roof.ridge_azimuth_deg, long_axis) > 45.0:
             tags["roof:orientation"] = "across"
 
-    if shape is RoofShape.SKILLION and roof.facing_azimuth_deg is not None:
+    # skillion: para onde olha a água; side_hipped: para onde olha a ponta em hip
+    # (a água do meio das três). roof:orientation não se aplica a nenhuma das duas.
+    if shape in _DIRECTED_SHAPES and roof.facing_azimuth_deg is not None:
         tags["roof:direction"] = str(round(roof.facing_azimuth_deg) % 360)
 
     if roof.colour is not None and roof.colour.confidence >= policy.min_colour_confidence:

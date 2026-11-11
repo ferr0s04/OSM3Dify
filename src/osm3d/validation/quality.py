@@ -22,6 +22,16 @@ def check_building(building: Building) -> list[QAFlag]:
         )
     if not building.parts:
         flags.append(QAFlag(code="no_parts", message="Edifício sem partes reconstruídas"))
+    if building.osm_parts:
+        # Os renderizadores desenham as partes e escondem o contorno: tags 3D no contorno
+        # seriam ignoradas ou contraditórias. Exige decisão humana.
+        flags.append(
+            QAFlag(
+                code="osm_building_parts",
+                message=f"Já tem {len(building.osm_parts)} building:part no OSM "
+                f"({', '.join(f'way/{i}' for i in building.osm_parts[:5])})",
+            )
+        )
     for part in building.parts:
         if not part.geometry.within(building.footprint.buffer(0.5)):
             flags.append(

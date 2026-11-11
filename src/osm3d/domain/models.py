@@ -44,6 +44,7 @@ class RoofShape(StrEnum):
     SKILLION = "skillion"
     GABLED = "gabled"
     HIPPED = "hipped"
+    SIDE_HIPPED = "side_hipped"  # três águas: hip numa ponta, empena na outra
     PYRAMIDAL = "pyramidal"
     UNKNOWN = "unknown"
 
@@ -66,6 +67,26 @@ class Estimate[T](BaseModel):
     source: Source
 
 
+class RoofModel(BaseModel):
+    """Parâmetros exatos do modelo paramétrico ajustado, para gerar a geometria 3D.
+
+    Coordenadas no referencial do LiDAR (footprint já deslocado pelo co-registo).
+    Não é exportado para o OSM: serve a visualização e a revisão.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    cx: float
+    cy: float
+    azimuth_deg: float  # eixo u do modelo (cumeeira em gabled/hipped)
+    half_length: float
+    half_width: float
+    flip: bool = False  # skillion: água virada para −v; side_hipped: hip em −u
+    ridge_ratio: float | None = None  # hipped/side_hipped: cumeeira / comprimento
+    eave_z: float  # cota absoluta do beiral
+    roof_height: float
+
+
 class Roof(BaseModel):
     shape: Estimate[RoofShape]
     height: Estimate[float] | None = Field(
@@ -85,6 +106,7 @@ class Roof(BaseModel):
     )
     colour: Estimate[str] | None = None
     rmse_m: float | None = Field(default=None, description="Resíduo do ajuste do modelo.")
+    model: RoofModel | None = None
 
 
 class BuildingPart(BaseModel):
@@ -115,6 +137,9 @@ class Building(BaseModel):
     osm_version: int = Field(description="Versão OSM no download — usada para detetar conflitos.")
     footprint: Geometry
     existing_tags: dict[str, str] = Field(default_factory=dict)
+    osm_parts: list[int] = Field(
+        default_factory=list, description="Ids das ways building:part já mapeadas no contorno."
+    )
     ground_elevation_m: float | None = None
     registration_offset_m: tuple[float, float] = (0.0, 0.0)
     parts: list[BuildingPart] = Field(default_factory=list)
