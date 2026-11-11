@@ -9,16 +9,19 @@ O resultado não é um modelo fotorealista nem uma malha 3D: são **tags
 `building:part`…) em edifícios OSM existentes, que é o que os mapas 3D (F4 Map,
 OSM2World, Streets GL…) interpretam.
 
-> **Estado:** em desenvolvimento (Fases 1 e 3).
+> **Estado:** em desenvolvimento. O pipeline já corre de ponta a ponta até QA
+> sobre dados reais de Vila do Conde.
 >
-> Implementado e testado:
-> - modelo de domínio e configuração;
-> - download OSM (Overpass) e leitura de footprints;
-> - resumo por quadrícula;
-> - ajuste de telhados por modelos paramétricos (validado em dados sintéticos);
-> - mapeamento para tags S3DB.
+> - Exatidão de `roof:shape` face às tags do OSM: **79 %**.
+> - Edifícios isolados: **88 %**.
 >
-> Por fazer: leitura LiDAR, co-registo, alturas sobre dados reais, exportação.
+> Ver [resultados](docs/area-de-estudo.md#primeiros-resultados-quadrículas-155480--156480-2026-11-11).
+>
+> Por fazer:
+> - telhados partilhados por edifícios encostados;
+> - partes (`building:part`);
+> - cores;
+> - exportação `.osm` para o JOSM.
 
 ## Documentação
 
@@ -63,10 +66,16 @@ uv sync --extra osm        # + leitura de extratos PBF (pyosmium)
 
 ```bash
 uv run osm3d info                      # configuração ativa e estado dos artefactos
-uv run osm3d stage heights             # executa uma fase
-uv run osm3d run --from fetch --to qa  # executa um intervalo de fases
-uv run osm3d stage export              # gera o .osm para revisão no JOSM
+uv run osm3d stage fetch               # edifícios OSM da área (Overpass)
+uv run osm3d tiles                     # edifícios por quadrícula LiDAR (com id DGT)
+uv run osm3d dgt -t 155480 --dry-run   # verificar disponibilidade no Centro de Dados DGT
+uv run osm3d dgt -t 155480             # descarregar LAZ + MDT (credenciais em .env)
+uv run osm3d run --from prepare --to qa  # reconstrução → GeoPackage
+uv run osm3d evaluate                  # comparar com as tags roof:shape/building:levels do OSM
 ```
+
+O download da DGT precisa de `DGT_USER` e `DGT_PASSWORD` num ficheiro `.env` na raiz
+do repositório, que não é versionado.
 
 A configuração por omissão está em [config/config.yaml](config/config.yaml). Para
 uma área de estudo própria, copiar para `config/local.yaml` (ignorado pelo git) e usar

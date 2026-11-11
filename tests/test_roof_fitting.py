@@ -40,6 +40,24 @@ def test_hipped(azimuth: float) -> None:
     assert axis_difference_deg(fit.roof.ridge_azimuth_deg, azimuth) < 1.0
 
 
+@pytest.mark.parametrize("ridge_ratio", [0.2, 0.3, 0.7])
+def test_hipped_with_free_ridge_length(ridge_ratio: float) -> None:
+    # Caso real de Vila do Conde: planta alongada, águas das pontas mais inclinadas
+    # (cumeeira curta). Com águas iguais, o modelo confundia-o com pyramidal.
+    syn = make_roof(
+        RoofShape.HIPPED, length=18, width=9, azimuth_deg=37, ridge_ratio=ridge_ratio, seed=7
+    )
+    fit = fit_roof(syn.footprint, syn.points, syn.ground_z)
+    _check_common(fit, syn, RoofShape.HIPPED)
+
+
+def test_hipped_ridge_ratio_bounds() -> None:
+    from osm3d.reconstruction.roof_models import roof_surface
+
+    with pytest.raises(ValueError):
+        roof_surface(RoofShape.HIPPED, np.zeros(1), np.zeros(1), 5, 3, 0, 1, ridge_ratio=1.0)
+
+
 @pytest.mark.parametrize("azimuth", AZIMUTHS)
 def test_pyramidal(azimuth: float) -> None:
     syn = make_roof(RoofShape.PYRAMIDAL, length=10, width=10, azimuth_deg=azimuth)

@@ -36,8 +36,9 @@ Array = npt.NDArray[np.float64]
 _NOISE_FLOOR_M = 0.03
 # Escala da diferença de pontuação para a confiança: Δ=10 → 0.63, Δ=30 → 0.95.
 _CONFIDENCE_SCALE = 10.0
-# Retângulos com lados a menos de 10 % de diferença: hipped ≈ pyramidal.
-_SQUARE_TOLERANCE = 0.10
+# Grelha do comprimento relativo da cumeeira dos telhados hipped (meia cumeeira / a).
+# Abaixo de 0,10 o telhado é, na prática, uma pirâmide (hipótese própria).
+HIPPED_RIDGE_RATIOS = tuple(round(r, 2) for r in np.arange(0.10, 0.951, 0.05))
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class Hypothesis:
     shape: RoofShape
     frame: LocalFrame
     flip: bool = False  # skillion: água virada para -v em vez de +v
+    ridge_ratio: float | None = None  # hipped: meia cumeeira / a
 
     def basis(self, x: Array, y: Array) -> Array | None:
         """f(u, v) do modelo, ou ``None`` para telhado plano."""
@@ -71,7 +73,7 @@ class Hypothesis:
         if self.flip:
             v = -v
         a, b = self.frame.half_length, self.frame.half_width
-        return roof_surface(self.shape, u, v, a, b, z0=0.0, h=1.0)
+        return roof_surface(self.shape, u, v, a, b, z0=0.0, h=1.0, ridge_ratio=self.ridge_ratio)
 
     def slope_deg(self, h: float) -> float:
         a, b = self.frame.half_length, self.frame.half_width
@@ -125,7 +127,6 @@ class RoofFit:
 def hypotheses_for(geometry: BaseGeometry, candidates: tuple[RoofShape, ...]) -> list[Hypothesis]:
     frame = LocalFrame.from_geometry(geometry)
     across = frame.rotated()
-    near_square = (frame.half_length - frame.half_width) <= _SQUARE_TOLERANCE * frame.half_length
     hyps: list[Hypothesis] = []
     for shape in candidates:
         match shape:
@@ -134,9 +135,9 @@ def hypotheses_for(geometry: BaseGeometry, candidates: tuple[RoofShape, ...]) ->
             case RoofShape.GABLED:
                 hyps += [Hypothesis(shape, frame), Hypothesis(shape, across)]
             case RoofShape.HIPPED:
-                # Em plantas quase quadradas, hipped degenera em pyramidal.
-                if not (near_square and RoofShape.PYRAMIDAL in candidates):
-                    hyps.append(Hypothesis(shape, frame))
+                # Comprimento da cumeeira livre: as águas das pontas podem ter inclinação
+                # diferente das laterais (frequente em Portugal).
+                hyps += [Hypothesis(shape, frame, ridge_ratio=r) for r in HIPPED_RIDGE_RATIOS]
             case RoofShape.SKILLION:
                 hyps += [
                     Hypothesis(shape, f, flip) for f in (frame, across) for flip in (False, True)

@@ -43,6 +43,7 @@ def make_roof(
     noise_m: float = 0.04,
     vegetation_fraction: float = 0.0,
     chimney: bool = False,
+    ridge_ratio: float | None = None,
     seed: int = 0,
 ) -> SyntheticRoof:
     rng = np.random.default_rng(seed)
@@ -58,7 +59,8 @@ def make_roof(
     if flip:
         mv = -mv
     a, b = model_frame.half_length, model_frame.half_width
-    z = roof_surface(shape, mu, mv, a, b, eave_z, roof_height) + rng.normal(0, noise_m, n)
+    z = roof_surface(shape, mu, mv, a, b, eave_z, roof_height, ridge_ratio=ridge_ratio)
+    z = z + rng.normal(0, noise_m, n)
 
     if chimney:
         mask = (np.abs(u - frame.half_length / 2) < 0.4) & (np.abs(v - frame.half_width / 3) < 0.4)

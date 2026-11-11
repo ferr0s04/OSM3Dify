@@ -82,6 +82,54 @@ Conclusões:
   e de edifícios que não estão mapeados no OSM. Detetar estes edifícios em falta
   seria um subproduto possível, mas está fora do âmbito.
 
+## Primeiros resultados (quadrículas `155480` + `156480`, 2026-11-11)
+
+`osm3d run --from prepare --to qa` seguido de `osm3d evaluate`:
+
+- **Volume:** 509 edifícios dentro da cobertura, 504 reconstruídos, ~45 s.
+- **Por rever:** 11 % dos edifícios têm sinalizações.
+- **Co-registo:** deslocamento global de (0,00, −0,50) m em ambas as quadrículas.
+
+| `roof:shape` vs. OSM (n = 82) | v1 (águas iguais) | **v2 (cumeeira livre)** |
+| --- | ---: | ---: |
+| Exatidão — todos | 66 % | **79 %** |
+| Exatidão — plantas retangulares (n = 60) | 72 % | **80 %** |
+| Cobertura (forma exportável) | 89 % | 85 % |
+| `hipped` → `pyramidal` | 13 | 5 |
+
+**Lição da v1.** Nos `hipped` desta zona as águas das pontas são muitas vezes mais
+inclinadas do que as laterais, e por isso a cumeeira é mais curta do que `2·(a − b)`.
+Com todas as águas à mesma inclinação, a pirâmide ajustava melhor. A v2 procura o
+comprimento da cumeeira em grelha.
+
+**Erros restantes.**
+
+| Situação | Exatidão |
+| --- | ---: |
+| Edifícios isolados | **88 %** |
+| Edifícios encostados a vizinhos | 76 % |
+
+- 5 dos 6 erros "→ `skillion`" são casas geminadas ou em banda. O contorno OSM
+  cobre só uma parte de um telhado contínuo, e essa parte parece uma água só.
+  Próximo passo: ajustar o telhado sobre o grupo de edifícios encostados e
+  atribuir o resultado a cada um, ou tratar o caso na Fase 4 (partes).
+- Os `unknown` são sobretudo edifícios grandes e não retangulares
+  (retangularidade < 0,65), que precisam de partes.
+- **A referência OSM também tem erros.** A série `way/92165xxxx` tem tags que
+  parecem atribuídas por defeito. A exatidão real deve ser algo superior à medida.
+
+**Alturas.** Não há `height` no OSM. Comparando com `building:levels` (n = 391), a
+altura por piso implícita tem mediana de 3,33 m, P10 de 2,39 m e P90 de 5,18 m;
+64 % dos casos ficam entre 2,4 e 4,0 m. É coerente, mas a referência é fraca:
+`building:levels` costuma omitir caves, pisos recuados e pés-direitos altos.
+
+**Ver no QGIS:** abrir `data/processed/vilar-e-mosteiro/06_qa.gpkg`.
+
+- Camada `building_parts`: simbolizar por `roof_shape`. Na vista 3D, extrudir por
+  `height`.
+- Camada `buildings`: filtrar `needs_review = 1` para ver o que precisa de revisão.
+- Detalhe por edifício: `data/output/vilar-e-mosteiro_avaliacao.csv`.
+
 ## Área futura: concelho de Vila do Conde
 
 | | |

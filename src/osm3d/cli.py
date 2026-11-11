@@ -26,12 +26,31 @@ def _load(path: Path) -> Config:
 
 
 def _run(config: Config, stage: Stage, force: bool = False) -> None:
+    typer.echo(f"[{stage.value}] …")
     try:
-        out = run_stage(config, stage, force=force)
-    except NotImplementedError as exc:
+        out = run_stage(config, stage, force=force, progress=typer.echo)
+    except (NotImplementedError, FileNotFoundError) as exc:
         typer.secho(f"[{stage.value}] {exc}", fg=typer.colors.YELLOW, err=True)
         raise typer.Exit(code=2) from exc
     typer.secho(f"[{stage.value}] → {out}", fg=typer.colors.GREEN)
+
+
+@app.command()
+def evaluate(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Compara os resultados com as tags roof:shape / building:levels do OSM."""
+    from osm3d.evaluation.benchmark import evaluate as run_eval
+    from osm3d.evaluation.benchmark import format_report, write_csv
+    from osm3d.export.geopackage import read_buildings
+
+    cfg = _load(config)
+    src = next((p for s in (Stage.QA, Stage.ROOFS) if (p := artefact_path(cfg, s)).exists()), None)
+    if src is None:
+        raise typer.BadParameter("Correr primeiro: osm3d run --to qa")
+    report = run_eval(read_buildings(src), cfg.roofs.min_shape_confidence)
+    typer.echo(f"Fonte: {src}\n")
+    typer.echo(format_report(report))
+    csv_path = write_csv(report, cfg.paths.output / f"{cfg.area.name}_avaliacao.csv")
+    typer.echo(f"\nDetalhe por edifício: {csv_path}")
 
 
 @app.command()

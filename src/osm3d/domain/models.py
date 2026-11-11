@@ -104,6 +104,9 @@ class QAFlag(BaseModel):
     severity: Literal["info", "warning", "error"] = "warning"
 
 
+ReviewStatus = Literal["pending", "accepted", "rejected"]
+
+
 class Building(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -116,6 +119,17 @@ class Building(BaseModel):
     registration_offset_m: tuple[float, float] = (0.0, 0.0)
     parts: list[BuildingPart] = Field(default_factory=list)
     qa_flags: list[QAFlag] = Field(default_factory=list)
+    diagnostics: dict[str, float] = Field(
+        default_factory=dict, description="Métricas do processamento (n.º de pontos, etc.)."
+    )
+    # Revisão humana (ver docs/architecture/frontend-revisao.md §5). Só os edifícios
+    # "accepted" são exportados; correções manuais entram nas partes com source=manual.
+    review_status: ReviewStatus = "pending"
+    review_note: str | None = None
+
+    @property
+    def key(self) -> str:
+        return f"{self.osm_type}/{self.osm_id}"
 
     @property
     def is_single_part(self) -> bool:

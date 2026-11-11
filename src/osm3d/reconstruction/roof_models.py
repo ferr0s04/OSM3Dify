@@ -29,7 +29,7 @@ N_PARAMS: dict[RoofShape, int] = {
     RoofShape.FLAT: 1,
     RoofShape.SKILLION: 2,
     RoofShape.GABLED: 2,
-    RoofShape.HIPPED: 2,
+    RoofShape.HIPPED: 3,  # + comprimento da cumeeira (procurado em grelha)
     RoofShape.PYRAMIDAL: 2,
 }
 
@@ -77,9 +77,20 @@ class LocalFrame:
 
 
 def roof_surface(
-    shape: RoofShape, u: Array, v: Array, a: float, b: float, z0: float, h: float
+    shape: RoofShape,
+    u: Array,
+    v: Array,
+    a: float,
+    b: float,
+    z0: float,
+    h: float,
+    ridge_ratio: float | None = None,
 ) -> Array:
-    """Cota do telhado para cada ponto (u, v) do referencial local."""
+    """Cota do telhado para cada ponto (u, v) do referencial local.
+
+    ``ridge_ratio`` (só ``hipped``): meia cumeeira / ``a``, em [0, 1). Com ``None``,
+    todas as águas têm a mesma inclinação (cumeeira de comprimento 2·(a − b)).
+    """
     if a <= 0 or b <= 0:
         raise ValueError("Dimensões do referencial têm de ser positivas")
     au, av = np.abs(u), np.abs(v)
@@ -92,8 +103,11 @@ def roof_surface(
         case RoofShape.GABLED:
             rel = 1 - av / b
         case RoofShape.HIPPED:
-            # Águas com a mesma inclinação; cumeeira de comprimento 2(a - b) se a > b.
-            rel = np.minimum(1 - av / b, (a - au) / b)
+            # Cumeeira de meia-largura r; as águas das pontas sobem de |u| = a até |u| = r.
+            r = max(a - b, 0.0) if ridge_ratio is None else ridge_ratio * a
+            if not 0 <= r < a:
+                raise ValueError(f"ridge_ratio fora de [0, 1): {ridge_ratio}")
+            rel = np.minimum(1 - av / b, (a - au) / (a - r))
         case RoofShape.PYRAMIDAL:
             rel = np.minimum(1 - au / a, 1 - av / b)
         case _:
