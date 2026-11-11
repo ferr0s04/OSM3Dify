@@ -17,6 +17,10 @@ import numpy as np
 
 from osm3d.domain.models import Building, RoofShape
 
+# Previsões mais específicas do que a tag OSM, mas coerentes com ela: os mapeadores
+# marcam muitas vezes telhados de três águas (side_hipped) como hipped.
+COMPATIBLE = {("hipped", "side_hipped")}
+
 # Valores OSM equivalentes às formas suportadas.
 _SHAPE_ALIASES = {"lean_to": "skillion"}
 _SUPPORTED = {s.value for s in RoofShape} - {"unknown"}
@@ -44,7 +48,12 @@ class ShapeEvaluation:
     n_reference: int = 0
     n_predicted: int = 0  # previsões exportáveis (forma conhecida e confiança ≥ limiar)
     n_correct: int = 0
+    n_compatible: int = 0  # corretas + refinamentos coerentes (ver COMPATIBLE)
     confusion: Counter[tuple[str, str]] = field(default_factory=Counter)
+
+    @property
+    def accuracy_compatible(self) -> float | None:
+        return self.n_compatible / self.n_predicted if self.n_predicted else None
 
     @property
     def accuracy(self) -> float | None:
@@ -105,6 +114,7 @@ def evaluate(buildings: list[Building], min_shape_confidence: float) -> Evaluati
                 if pred != "unknown":
                     ev.n_predicted += 1
                     ev.n_correct += int(pred == ref)
+                    ev.n_compatible += int(pred == ref or (ref, pred) in COMPATIBLE)
 
         wall = part.height.value - (roof.height.value if roof.height else 0.0)
         levels_raw = b.existing_tags.get("building:levels")
@@ -162,10 +172,12 @@ def format_report(report: EvaluationReport) -> str:
     ):
         acc = f"{ev.accuracy:.0%}" if ev.accuracy is not None else "-"
         cov = f"{ev.coverage:.0%}" if ev.coverage is not None else "-"
+        acc_c = f"{ev.accuracy_compatible:.0%}" if ev.accuracy_compatible is not None else "-"
         lines += [
             "",
             f"{title}: n={ev.n_reference}, com previsão={ev.n_predicted} ({cov}), "
-            f"corretas={ev.n_correct} → exatidão {acc}",
+            f"corretas={ev.n_correct} → exatidão {acc} "
+            f"(compatível, side_hipped≈hipped: {acc_c})",
             f"  {'OSM \\ previsto':<14}" + "".join(f"{lbl[:9]:>10}" for lbl in SHAPE_LABELS),
         ]
         refs = sorted({r for r, _ in ev.confusion}, key=SHAPE_LABELS.index)

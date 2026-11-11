@@ -72,10 +72,21 @@ uv run osm3d dgt -t 155480             # descarregar LAZ + MDT (credenciais em .
 uv run osm3d run --from prepare --to qa  # reconstrução → GeoPackage
 uv run osm3d evaluate                  # comparar com as tags roof:shape/building:levels do OSM
 uv run osm3d stage export              # .osm para rever no JOSM (+ relatório de conflitos)
+uv run osm3d review                    # aplicação de revisão: mapa, 3D vs LiDAR, edição
 ```
 
-O `.osm` exportado tem `upload="never"`: o JOSM abre-o e valida-o, mas recusa o upload
-enquanto a licença DGT↔ODbL não estiver resolvida (`export.josm_upload` no config).
+A aplicação de revisão (`osm3d review`, em http://127.0.0.1:8765/) mostra os edifícios com as cores
+reais a aplicar e destaca os que já têm 3D no OSM. Para cada um, indica se a análise acrescenta tags
+ou diverge do que está mapeado. Permite aceitar, rejeitar ou corrigir. As revisões ficam em
+`data/processed/<área>/reviews.sqlite`, sobrevivem a novas corridas do pipeline e são aplicadas na
+exportação. Ver [frontend-revisao.md](docs/architecture/frontend-revisao.md).
+
+Só são exportados os edifícios **aceites** na aplicação de revisão, com as correções
+aplicadas (`export.include_pending: true` incluiria também os não revistos sem
+sinalizações). O `.osm` exportado preenche as alterações. A submissão é sempre manual: abre-se o ficheiro
+no JOSM, ajusta-se ou descarta-se o que for preciso e só então se faz o upload. O sistema
+nunca submete nada ao OSM. Para impedir o
+upload (por exemplo, numa área de teste), usar `export.josm_upload: never` no config.
 
 O download da DGT precisa de `DGT_USER` e `DGT_PASSWORD` num ficheiro `.env` na raiz
 do repositório, que não é versionado.
@@ -96,10 +107,10 @@ uma área de estudo própria, copiar para `config/local.yaml` (ignorado pelo git
 
 Os dados não são versionados (ver [.gitignore](.gitignore)).
 
-> ⚠️ **Licenciamento.** Os dados da DGT são CC BY 4.0, que **não** é automaticamente
-> compatível com a ODbL do OSM. Antes de publicar qualquer dado derivado no OSM é
-> necessária permissão explícita da DGT e cumprimento das
-> [Import Guidelines](https://wiki.openstreetmap.org/wiki/Import/Guidelines) e do
+> **Licenciamento.** Os dados da DGT são CC BY 4.0, que não é automaticamente
+> compatível com a ODbL do OSM. A autorização para uso no OSM está obtida (2026-11-11).
+> As edições continuam sujeitas às
+> [Import Guidelines](https://wiki.openstreetmap.org/wiki/Import/Guidelines) e ao
 > [Automated Edits code of conduct](https://wiki.openstreetmap.org/wiki/Automated_Edits_code_of_conduct).
 > Ver [revisão §8](docs/architecture/revisao-arquitetura.md#8-licenciamento--passa-a-fase-0).
 

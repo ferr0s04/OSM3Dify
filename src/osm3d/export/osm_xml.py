@@ -8,8 +8,8 @@ Regras:
 - As tags são juntas com :func:`osm3d.export.s3db_tags.merge_tags`: tags mapeadas por
   humanos não são sobrescritas (salvo opção explícita) e os conflitos vão para o
   relatório.
-- ``upload="never"`` por omissão: o JOSM recusa o upload até a licença DGT↔ODbL
-  estar resolvida (docs/architecture/revisao-arquitetura.md §8).
+- Upload permitido por omissão (sem atributo ``upload``). O upload é sempre feito
+  por uma pessoa, no JOSM. ``josm_upload: never`` no config volta a bloqueá-lo.
 - ``building:part`` (Fase 6) ainda não é exportado: só edifícios de uma parte.
 """
 
@@ -43,7 +43,7 @@ def plan_export(
     buildings: Iterable[Building],
     policy: TagPolicy,
     *,
-    include_pending: bool = True,
+    include_pending: bool = False,
     overwrite: bool = False,
 ) -> tuple[list[tuple[Building, dict[str, str]]], list[ExportRecord]]:
     """Decide o que exportar. Devolve ((edifício, tags finais), registos)."""
@@ -96,7 +96,7 @@ def write_josm_file(
     source_osm: Path,
     out: Path,
     *,
-    upload: UploadPolicy = "never",
+    upload: UploadPolicy = "true",
 ) -> Path:
     """Escreve os edifícios selecionados (com as tags finais) num ``.osm`` para o JOSM."""
     index = _index(ET.parse(source_osm).getroot())
@@ -130,7 +130,9 @@ def write_josm_file(
                 if m.attrib["type"] == "way" and int(m.attrib["ref"]) not in ways:
                     add_way(int(m.attrib["ref"]))
 
-    root = ET.Element("osm", version="0.6", generator="osm3d", upload=upload)
+    root = ET.Element("osm", version="0.6", generator="osm3d")
+    if upload != "true":  # "true" é o comportamento por omissão do JOSM: sem atributo
+        root.set("upload", upload)
     for group in (nodes, ways, relations):
         for key in sorted(group):
             root.append(group[key])

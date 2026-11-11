@@ -117,7 +117,7 @@ def roof_points_mask(b: Building, points: PointSet) -> npt.NDArray[np.bool_]:
     mask = (points.classification == BUILDING_CLASS) & shapely.contains_xy(inner, x, y)
     part = b.parts[0] if b.parts else None
     if part is not None and part.roof.model is not None:
-        surface = model_surface_z(part.roof.model, part.roof.shape.value, x, y, 0.0)
+        surface = model_surface_z(part.roof.model, part.roof.shape.value, x, y, 0.0, fp)
         mask &= np.abs(z - surface) < MAX_ROOF_DISTANCE_M
     return np.asarray(mask, dtype=bool)
 

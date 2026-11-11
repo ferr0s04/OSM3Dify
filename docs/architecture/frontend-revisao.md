@@ -1,6 +1,7 @@
 # Frontend: aplicação de revisão
 
-**Estado:** proposta, adiada até haver resultados reais aceitáveis (ver §6).
+**Estado:** Fase A em implementação (`uv run osm3d review`). Ver §8 para o que foi
+implementado e para as decisões tomadas pelo caminho.
 
 ## 1. Contexto
 
@@ -98,8 +99,8 @@ Uma alteração pequena, que serve já a exportação para JOSM e mais tarde a a
   cor), com `source=manual`
 - `reviewed_at`, `review_note`
 
-A exportação `.osm` passa a incluir **apenas edifícios `accepted`**, com as
-correções aplicadas.
+A exportação `.osm` inclui **apenas edifícios `accepted`**, com as correções
+aplicadas (`export.include_pending: false`, por omissão desde 2026-11-11).
 
 ## 6. Faseamento
 
@@ -108,6 +109,67 @@ correções aplicadas.
 | **Agora** | Pipeline com resultados reais: alturas, telhados, avaliação contra os `roof:shape` existentes. Inspeção via QGIS ou um relatório HTML estático por quadrícula (mapa + tabela + 3D, sem servidor). Estado de revisão no modelo (§5). | — |
 | **A. Aplicação de revisão** | Fila, mapa, 3D modelo vs. pontos, edição de tags, exportação dos aceites para `.osm` JOSM. | Ajuste de telhados com exatidão aceitável nos dados reais (a definir após a primeira avaliação). |
 | **B. Gestão de áreas e tarefas** | Seleção de área no mapa, estado por quadrícula (descarregada/processada/revista), lançamento de downloads e processamento em segundo plano. | Avançar para o concelho de Vila do Conde (~28 000 edifícios, ~170 quadrículas). |
+
+## 8. Implementação (Fase A, 2026-11-11)
+
+`uv run osm3d review` arranca a aplicação em `http://127.0.0.1:8765/`.
+
+### Componentes
+
+| Componente | Ficheiro | Notas |
+| --- | --- | --- |
+| API | `src/osm3d/app/server.py` | FastAPI; `/api/docs` com a especificação. |
+| Lógica | `src/osm3d/app/service.py` | Junta resultados (GeoPackage da fase QA), revisões, pontos e malhas. |
+| Revisões | `src/osm3d/review.py` | Decisões e correções num SQLite próprio (`reviews.sqlite`). |
+| Malha 3D | `src/osm3d/export/mesh.py` | Gerada no backend a partir do **mesmo** modelo paramétrico do ajuste (`Roof.model`). |
+| Pontos | `src/osm3d/app/points.py` | Cache `.npz` por quadrícula (~38 MB): classe 6 completa + 1/8 de solo/vegetação. LRU de 6 quadrículas em memória. A 1.ª leitura de cada quadrícula demora ~15 s. |
+| Frontend | `src/osm3d/app/static/` | Módulos ES sem build. MapLibre GL 4.7.1 e three.js 0.169.0 via CDN. |
+
+### Decisões tomadas na implementação
+
+- **Sem passo de build (sem React nem npm).** Arranca com um só comando Python. Se a
+  aplicação crescer, migra-se para React + TypeScript.
+- **Revisões fora do GeoPackage das fases** (diverge do §5). Voltar a correr o pipeline
+  substituiria o artefacto e apagaria o trabalho humano. As revisões aplicam-se por
+  cima dos resultados, na aplicação e em `osm3d stage export`. Uma revisão feita sobre
+  outra versão OSM do edifício fica marcada `review_stale` e volta a "por rever".
+- **Cores reais na visualização.** O mapa e a vista 3D usam `roof:colour` e
+  `building:colour` **finais**: o valor do OSM se existir, senão o estimado ou o
+  corrigido. Sem tag, usa-se a cor por omissão dos renderizadores (`#c8c8c8` no
+  telhado, `#e9e4da` nas fachadas). A forma do telhado continua disponível como
+  modo de análise no mapa.
+- **Relação com o OSM destacada.** Cada edifício é classificado em:
+  - **novo:** sem 3D no OSM;
+  - **complementa:** acrescenta tags em falta;
+  - **diverge:** propõe valores diferentes dos mapeados;
+  - **igual:** não acrescenta nada.
+
+  O mapa destaca a roxo o contorno dos que já têm 3D no OSM e tem um modo de cor
+  próprio para esta classificação. A lista tem filtro e um selo "OSM 3D ≠ / + / =",
+  e o detalhe mostra as tags OSM existentes e as divergências. Ver
+  `src/osm3d/export/osm_changes.py`.
+- **Edição:** forma (incluindo `side_hipped`), `height`, `roof:height`,
+  `roof:orientation`, `roof:direction`, `roof:colour`, `building:colour` e nota. A
+  pré-visualização é imediata, e o modelo 3D é regenerado a partir das correções.
+- **Atalhos:**
+
+  | Tecla | Ação |
+  | --- | --- |
+  | `J` / `K` | seguinte / anterior |
+  | `A` | aceitar |
+  | `R` | rejeitar |
+  | `U` | repor |
+
+  Botão "carregar no JOSM" via controlo remoto (`127.0.0.1:8111`).
+- **Separador "Resultados":**
+  - indicadores e matriz de confusão contra o OSM (exatidão estrita e "compatível");
+  - formas e cores, relação com o OSM, sinalizações e motivos de exportação.
+
+### Por fazer
+
+- Ortofoto como camada de fundo opcional (hoje: OSM raster).
+- Virtualizar a lista para dezenas de milhares de edifícios (hoje mostra até 2 000).
+- Servir o MapLibre e o three.js localmente (hoje dependem de CDN e de internet).
 
 ## 7. Questões em aberto
 

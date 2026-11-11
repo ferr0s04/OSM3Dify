@@ -39,6 +39,8 @@ def client(tmp_path: Path) -> TestClient:
 def test_lists_and_summary(client: TestClient) -> None:
     rows = client.get("/api/buildings").json()
     assert {r["key"] for r in rows} == {"way/10", "relation/30"}
+    # Alturas mostradas arredondadas a 0,5 m, como na exportação (8,3 → 8,5; 2,2 → 2).
+    assert {r["height"] for r in rows} == {8.5} and {r["roof_height"] for r in rows} == {2.0}
     gj = client.get("/api/buildings.geojson").json()
     assert len(gj["features"]) == 2
     lon, lat = gj["features"][0]["geometry"]["coordinates"][0][0]
@@ -54,6 +56,8 @@ def test_detail_mesh_points(client: TestClient) -> None:
     assert d["effective"]["roof_shape"] == "gabled"
     mesh = client.get("/api/buildings/way/10/mesh").json()
     assert mesh["roof"]["faces"] and mesh["walls"]["faces"] and mesh["footprint"]
+    # Topo da malha = altura arredondada (relativa ao chão).
+    assert max(mesh["roof"]["vertices"][2::3]) <= 8.5 + 1e-6
     pts = client.get("/api/buildings/way/10/points").json()
     assert pts["count"] == 0  # sem LAZ no teste
     assert client.get("/api/buildings/way/999").status_code == 404
@@ -92,6 +96,21 @@ def test_invalid_review_rejected(client: TestClient) -> None:
     assert bad.status_code == 422
     bad = client.post("/api/buildings/way/10/preview", json={"height": -3})
     assert bad.status_code == 422
+
+
+def test_osm_change_and_colours(client: TestClient) -> None:
+    from osm3d.app.service import display_colour
+
+    rows = {r["key"]: r for r in client.get("/api/buildings").json()}
+    # way/10 tem roof:shape=hipped no OSM e a proposta é gabled → diverge.
+    assert rows["way/10"]["osm3d"] and rows["way/10"]["change"] == "diverge"
+    assert not rows["relation/30"]["osm3d"] and rows["relation/30"]["change"] == "novo"
+    d = client.get("/api/buildings/way/10").json()
+    assert d["osm_change"]["existing_3d"] == {"roof:shape": "hipped"}
+    assert d["colours"]["walls_source"] == "omissão"
+    assert display_colour("red", "#000000") == "#ff0000"
+    assert display_colour("light_gray", "#000000") == "#d3d3d3"
+    assert display_colour("cor-inventada", "#123456") == "#123456"
 
 
 def test_frontend_served(client: TestClient) -> None:

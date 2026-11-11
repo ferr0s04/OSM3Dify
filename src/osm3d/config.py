@@ -100,9 +100,9 @@ class ExportConfig(BaseModel):
     export_parts_to_osm: bool = False
     # Incluir edifícios ainda não revistos (sem sinalizações). A revisão é então feita
     # no JOSM; com false, só os "accepted" (aplicação de revisão) são exportados.
-    include_pending: bool = True
-    # "never": o JOSM recusa o upload (até a licença DGT↔ODbL estar resolvida).
-    josm_upload: Literal["never", "false", "true"] = "never"
+    include_pending: bool = False
+    # "true": upload normal no JOSM; "false": JOSM avisa; "never": JOSM recusa o upload.
+    josm_upload: Literal["never", "false", "true"] = "true"
 
 
 class Config(BaseModel):

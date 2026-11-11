@@ -32,7 +32,7 @@ def test_plan_and_write(source: Path, tmp_path: Path) -> None:
         by_id[30].model_copy(update={"osm_id": 31}),
         qa_flags=[QAFlag(code="roof_shape_unknown", message="x")],
     )
-    selected, records = plan_export([house, courtyard, flagged], TagPolicy())
+    selected, records = plan_export([house, courtyard, flagged], TagPolicy(), include_pending=True)
 
     assert [b.key for b, _ in selected] == ["way/10", "relation/30"]
     rec = {r.key: r for r in records}
@@ -42,7 +42,9 @@ def test_plan_and_write(source: Path, tmp_path: Path) -> None:
 
     out = write_josm_file(selected, source, tmp_path / "out.osm")
     root = ET.parse(out).getroot()
-    assert root.attrib["upload"] == "never"
+    assert "upload" not in root.attrib  # upload permitido (omissão do JOSM)
+    blocked = write_josm_file(selected, source, tmp_path / "blocked.osm", upload="never")
+    assert ET.parse(blocked).getroot().attrib["upload"] == "never"
     way = root.find("way[@id='10']")
     assert way is not None and way.attrib["action"] == "modify" and way.attrib["version"] == "3"
     tags = {t.attrib["k"]: t.attrib["v"] for t in way.findall("tag")}
@@ -68,8 +70,12 @@ def test_rejected_and_accepted(source: Path) -> None:
     accepted_flagged = b.model_copy(
         update={"review_status": "accepted", "qa_flags": [QAFlag(code="x", message="y")]}
     )
-    sel, _ = plan_export([rejected], TagPolicy())
+    sel, _ = plan_export([rejected], TagPolicy(), include_pending=True)
     assert sel == []
+    sel, _ = plan_export([b], TagPolicy())  # por omissão: só aceites
+    assert sel == []
+    sel, _ = plan_export([b.model_copy(update={"review_status": "accepted"})], TagPolicy())
+    assert len(sel) == 1
     sel, _ = plan_export([accepted_flagged], TagPolicy(), include_pending=False)
     assert len(sel) == 1  # aceite por um humano: exporta mesmo com sinalizações
     sel, _ = plan_export([b], TagPolicy(), include_pending=False)

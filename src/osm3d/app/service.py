@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import shapely
+from PIL import ImageColor
 from pyproj import Transformer
 from shapely.geometry import mapping
 
@@ -31,6 +32,7 @@ from osm3d.pipeline import (
     review_store_path,
     tag_policy,
 )
+from osm3d.reconstruction.skeleton import has_skeleton, renders_as_skeleton
 from osm3d.review import (
     Overrides,
     Review,
@@ -43,6 +45,24 @@ from osm3d.review import (
 MAX_BUILDING_POINTS = 40_000
 MAX_CONTEXT_POINTS = 15_000
 CONTEXT_MARGIN_M = 4.0
+
+
+def round_to(value: float, step: float) -> float:
+    return round(round(value / step) * step, 2) if step > 0 else round(value, 2)
+
+
+def display_colour(value: str, default: str) -> str:
+    """Cor OSM (nome CSS, hex, ou variantes como ``light_gray``) → #rrggbb para mostrar.
+
+    Só para visualização: as tags não são alteradas.
+    """
+    for candidate in (value, value.replace("_", ""), value.replace("_", "").replace(" ", "")):
+        try:
+            r, g, b = ImageColor.getrgb(candidate.strip().lower())[:3]
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except ValueError:
+            continue
+    return default
 
 
 def _num(v: float | None, nd: int = 2) -> float | None:
@@ -72,6 +92,13 @@ class ReviewService:
         self._wgs84: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ básico
+
+    def _h(self, v: float) -> float:
+        """Altura arredondada como na exportação (0,5 m por omissão)."""
+        return round_to(v, self.cfg.export.height_rounding_m)
+
+    def _rh(self, v: float) -> float:
+        return round_to(v, self.cfg.export.roof_height_rounding_m)
 
     def building(self, key: str) -> Building:
         if key not in self.base:
@@ -122,8 +149,8 @@ class ReviewService:
             "info_flags": [f.code for f in b.qa_flags if f.severity == "info"],
             "shape": exportable if part else None,
             "shape_conf": _num(conf),
-            "height": _num(part.height.value) if part else None,
-            "roof_height": _num(part.roof.height.value) if part and part.roof.height else None,
+            "height": self._h(part.height.value) if part else None,
+            "roof_height": self._rh(part.roof.height.value) if part and part.roof.height else None,
             "osm_roof_shape": b.existing_tags.get("roof:shape"),
             "match": (osm_shape == exportable) if osm_shape and exportable != "unknown" else None,
             "edited": bool(review and not review.overrides.is_empty()),
@@ -207,11 +234,12 @@ class ReviewService:
             if value is None:
                 out[name], out[f"{name}_source"] = default, "omissão"
             elif tag in b.existing_tags and tag not in tags["added"]:
-                out[name], out[f"{name}_source"] = value, "OSM"
+                out[name], out[f"{name}_source"] = display_colour(value, default), "OSM"
+                out[f"{name}_tag"] = value
             else:
                 part = b.parts[0]
                 est = part.roof.colour if name == "roof" else part.facade_colour
-                out[name] = value
+                out[name] = display_colour(value, default)
                 out[f"{name}_source"] = (
                     "manual" if est and est.source.value == "manual" else "estimada"
                 )
@@ -229,10 +257,10 @@ class ReviewService:
             "roof_shape": r.shape.value.value,
             "roof_shape_conf": _num(r.shape.confidence),
             "roof_shape_source": r.shape.source.value,
-            "height": _num(p.height.value),
+            "height": self._h(p.height.value),
             "height_conf": _num(p.height.confidence),
             "height_source": p.height.source.value,
-            "roof_height": _num(r.height.value) if r.height else None,
+            "roof_height": self._rh(r.height.value) if r.height else None,
             "roof_orientation": orientation_of(b, p),
             "ridge_azimuth": _num(r.ridge_azimuth_deg, 1),
             "roof_direction": _num(r.facing_azimuth_deg, 0),
@@ -300,12 +328,28 @@ class ReviewService:
         p = b.parts[0]
         shape = p.roof.shape.value
         ground = b.ground_elevation_m
-        flat_z = ground + p.height.value
+        # O modelo mostrado usa as alturas arredondadas que vão ser exportadas.
+        height = self._h(p.height.value)
+        flat_z = ground + height
         model = p.roof.model
         if shape is RoofShape.UNKNOWN:
             model = None
-        out["roof"] = roof_mesh(fp, model, shape, flat_z).to_json(origin)
-        out["walls"] = wall_mesh(fp, model, shape, ground, flat_z).to_json(origin)
+        elif model is not None:
+            roof_h = 0.0 if shape is RoofShape.FLAT else self._rh(model.roof_height)
+            # Desenha-se o que os renderizadores (F4 Map, OSM2World) vão mostrar a partir
+            # das tags: em plantas não retangulares, gabled/hipped seguem o esqueleto,
+            # mesmo que o ajuste tenha usado outro modelo (p.ex. volume principal).
+            skeleton = renders_as_skeleton(fp, shape) and has_skeleton(fp, shape)
+            model = model.model_copy(
+                update={
+                    "roof_height": roof_h,
+                    "eave_z": ground + height - roof_h,
+                    "skeleton": skeleton,
+                }
+            )
+        resolution = 0.25 if model is not None and model.skeleton else 0.5
+        out["roof"] = roof_mesh(fp, model, shape, flat_z, resolution).to_json(origin)
+        out["walls"] = wall_mesh(fp, model, shape, ground, flat_z, resolution).to_json(origin)
         return out
 
     def mesh(self, key: str) -> dict[str, Any]:
@@ -418,6 +462,10 @@ class ReviewService:
                 "n_predicted": ev.n_predicted,
                 "n_correct": ev.n_correct,
                 "accuracy": _num(ev.accuracy, 3) if ev.accuracy is not None else None,
+                "n_compatible": ev.n_compatible,
+                "accuracy_compatible": _num(ev.accuracy_compatible, 3)
+                if ev.accuracy_compatible is not None
+                else None,
                 "coverage": _num(ev.coverage, 3) if ev.coverage is not None else None,
                 "labels": labels,
                 "confusion": [[ev.confusion[(r, p)] for p in labels] for r in labels],

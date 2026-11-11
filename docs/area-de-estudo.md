@@ -105,6 +105,75 @@ vão para revisão em vez de serem exportados com a forma errada. Troca-se cober
 precisão, que é o lado certo para edições no OSM. **O limite foi calibrado em apenas
 82 edifícios** e tem de ser confirmado noutras quadrículas.
 
+**v4 — três águas (`side_hipped`), volume principal e cores** (exemplo
+`way/330892659`, apontado na revisão):
+
+- **`roof:shape=side_hipped`** existe no OSM: metade de um telhado de quatro águas,
+  com hip numa ponta e empena na outra, e `roof:direction` a indicar a ponta em hip.
+  Passou a ser um modelo próprio. Os mapeadores locais marcam estes telhados como
+  `hipped`, por isso a avaliação reporta também uma exatidão **compatível**
+  (`side_hipped` ≈ `hipped`).
+- **Volume principal.** O exemplo dava `unknown` por causa de um alpendre 1,0–1,5 m
+  mais baixo dentro do mesmo contorno, que nenhum modelo explicava. Quando a planta
+  inteira falha, procura-se a maior zona, com ≥ 55 % da área, que um modelo explica.
+  O resultado é `side_hipped`, com RMSE de 0,09 m e a sinalização `secondary_volume`
+  (candidato a `building:part`).
+- **Cor do telhado** a partir do RGB do LiDAR. Os valores medianos estão desbotados
+  (telha ≈ (245, 205, 185)), por isso a classificação é feita por croma, tom e
+  luminosidade em CIELAB e devolve cores realistas: telha, telha escura, branco e
+  três cinzentos.
+
+| `roof:shape` vs. OSM (n = 82) | v3 | **v4** |
+| --- | ---: | ---: |
+| Cobertura | 67 % | **84 %** |
+| Exatidão estrita | 87 % | 70 % |
+| Exatidão compatível (`side_hipped` ≈ `hipped`) | 87 % | **90 %** |
+| `hipped` → `unknown` | 23 | 9 |
+| `hipped` → `side_hipped` | — | 14 |
+
+**v5 — edifícios compostos** (exemplo `way/330367625`, igreja: `gabled` no OSM e na
+nuvem de pontos, mas `unknown` no modelo):
+
+- **Vários volumes no mesmo contorno:** nave, capelas laterais ~1 m mais baixas e
+  uma zona ~2 m mais alta numa ponta (torre).
+- **O volume principal passou a combinar** um recorte numa ponta com um recorte num
+  lado. Antes só recortava um lado.
+- **Cumeeira em posição livre**, só nessa procura: as zonas recortadas não coincidem
+  com as paredes. Usá-la na planta inteira deixava um `gabled` assimétrico
+  "esconder" volumes secundários, e 7 `hipped` passaram a `gabled`. Foi revertido.
+- **Resultado:** a igreja dá `gabled` (nave, 59 % da planta, RMSE 0,125 m), com a
+  sinalização `secondary_volume`.
+
+| `roof:shape` vs. OSM (n = 82) | v4 | **v5** |
+| --- | ---: | ---: |
+| Cobertura | 84 % | **89 %** |
+| Exatidão compatível | 90 % | 86 % |
+| `gabled` certos | 11/15 | **13/15** |
+| Classificações compatíveis certas | 62 | **63** |
+
+**v6 — plantas em L, T e dobradas (straight skeleton).** Os renderizadores (F4 Map,
+OSM2World) desenham `gabled`/`hipped` em contornos não retangulares com a cumeeira a
+seguir o eixo do edifício nas dobras e com empenas nas pontas. Isto passou a ser:
+
+- uma **hipótese de ajuste** própria para plantas com retangularidade < 0,9;
+- **a forma como a vista 3D desenha** esses telhados, para mostrar o que vai aparecer
+  no mapa.
+
+Implementação: `reconstruction/skeleton.py`. A frente de onda é o `buffer` negativo
+com cantos em esquadria, e as pontas `gabled` são prolongadas.
+
+| `roof:shape` vs. OSM (n = 82) | v5 | **v6** |
+| --- | ---: | ---: |
+| Exatidão estrita | 66 % | **72 %** |
+| Exatidão compatível | 86 % | **88 %** |
+| `hipped` certos | 31 | **36** |
+| Edifícios a rever | 29 % | **24 %** |
+| Tempo `roofs` + `colours` | ~6,3 min | **~5 min** |
+
+O tempo de `roofs` + `colours` chegou a **~6,3 min** por 509 edifícios na v5. A procura
+do volume principal faz até 80 ajustes rápidos em cada edifício difícil. Para o concelho, a ~28 000 edifícios, seriam ~6 h: há que otimizar
+antes de escalar, por exemplo vetorizando os ajustes de todas as hipóteses de uma vez.
+
 **Telhados partilhados.** Para grupos de edifícios encostados cuja planta conjunta é
 retangular, ajusta-se também um telhado único ao grupo. Esse telhado é usado se
 explicar os pontos melhor do que os telhados individuais, pelo mesmo critério
@@ -159,8 +228,8 @@ altura por piso implícita tem mediana de 3,33 m, P10 de 2,39 m e P90 de 5,18 m;
 
 - **8 conflitos com tags existentes**, quase todos `roof:shape`. O valor OSM é
   mantido e o conflito fica registado em `data/output/vilar-e-mosteiro_export.csv`.
-- **O ficheiro `data/output/vilar-e-mosteiro_josm.osm` tem `upload="never"`.** O JOSM
-  abre-o e valida-o, mas recusa o upload até a licença estar resolvida.
+- **O ficheiro `data/output/vilar-e-mosteiro_josm.osm` permite upload no JOSM.** A
+  licença está resolvida; o upload é sempre feito à mão, depois da revisão.
 
 **Ver no QGIS:** abrir `data/processed/vilar-e-mosteiro/06_qa.gpkg`.
 

@@ -74,7 +74,7 @@ def roof_mesh(
         tri = Delaunay(xy)
         centres = xy[tri.simplices].mean(axis=1)
         keep = shapely.contains_xy(poly, centres[:, 0], centres[:, 1])
-        z = roof_z(model, shape, xy[:, 0], xy[:, 1], flat_z)
+        z = roof_z(model, shape, xy[:, 0], xy[:, 1], flat_z, footprint)
         verts.append(np.column_stack([xy, z]))
         faces.append(tri.simplices[keep] + offset)
         offset += len(xy)
@@ -97,7 +97,7 @@ def wall_mesh(
         dense = shapely.segmentize(poly, resolution_m)
         for ring in (dense.exterior, *dense.interiors):
             xy = np.asarray(ring.coords)
-            top = roof_z(model, shape, xy[:, 0], xy[:, 1], flat_z)
+            top = roof_z(model, shape, xy[:, 0], xy[:, 1], flat_z, footprint)
             base = sum(len(v) for v in verts)
             bottom = np.column_stack([xy, np.full(len(xy), ground_z)])
             upper = np.column_stack([xy, top])

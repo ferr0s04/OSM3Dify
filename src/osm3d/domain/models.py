@@ -83,6 +83,10 @@ class RoofModel(BaseModel):
     half_width: float
     flip: bool = False  # skillion: água virada para −v; side_hipped: hip em −u
     ridge_ratio: float | None = None  # hipped/side_hipped: cumeeira / comprimento
+    ridge_offset: float | None = None  # gabled: posição da cumeeira (fração de b)
+    # gabled/hipped em planta não retangular: telhado por straight skeleton sobre o
+    # footprint (como nos renderizadores); os parâmetros do retângulo não se usam.
+    skeleton: bool = False
     eave_z: float  # cota absoluta do beiral
     roof_height: float
 
@@ -127,6 +131,29 @@ class QAFlag(BaseModel):
 
 
 ReviewStatus = Literal["pending", "accepted", "rejected"]
+GroundChoice = Literal["low", "high"]
+# Origem da escolha: terreno plano; pisos; beiral (encaixado); sem evidência; manual.
+GroundBasis = Literal["flat", "levels", "eave", "none", "manual"]
+
+
+class GroundInfo(BaseModel):
+    """Cota do terreno à volta do edifício, com os dois candidatos em encosta.
+
+    - ``low``: ponto mais baixo em contacto com o terreno (convenção S3DB literal);
+    - ``high``: terreno dominante no pé das paredes (mediana; o "lote" num patamar).
+
+    Com desnível pequeno, os dois coincidem na prática e usa-se ``low``.
+    """
+
+    low_m: float
+    high_m: float
+    step_m: float = Field(description="Desnível no pé das paredes (P95 − P5 dos troços).")
+    choice: GroundChoice = "low"
+    basis: GroundBasis = "flat"
+    reason: str = ""
+
+    def elevation(self, choice: GroundChoice | None = None) -> float:
+        return self.high_m if (choice or self.choice) == "high" else self.low_m
 
 
 class Building(BaseModel):
@@ -141,6 +168,7 @@ class Building(BaseModel):
         default_factory=list, description="Ids das ways building:part já mapeadas no contorno."
     )
     ground_elevation_m: float | None = None
+    ground: GroundInfo | None = None
     registration_offset_m: tuple[float, float] = (0.0, 0.0)
     parts: list[BuildingPart] = Field(default_factory=list)
     qa_flags: list[QAFlag] = Field(default_factory=list)

@@ -32,6 +32,7 @@ export function renderResults(el, s) {
       <div class="card"><div class="v">${s.osm3d ?? "—"}</div><div class="l">já com 3D no OSM (${s.changes_osm3d?.diverge ?? 0} divergem)</div></div>
       <div class="card"><div class="v">${s.export.selected}</div><div class="l">prontos a exportar (${s.export.conflicts} com conflitos)</div></div>
       <div class="card"><div class="v">${pct(ev.accuracy)}</div><div class="l">exatidão roof:shape vs OSM (${ev.n_correct}/${ev.n_predicted})</div></div>
+      <div class="card"><div class="v">${pct(ev.accuracy_compatible)}</div><div class="l">compatível com OSM (três águas ≈ hipped)</div></div>
       <div class="card"><div class="v">${pct(ev.coverage)}</div><div class="l">cobertura (${ev.n_predicted}/${ev.n_reference} com referência)</div></div>
     </div>
     <div class="grid2">

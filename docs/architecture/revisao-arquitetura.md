@@ -212,6 +212,17 @@ com o eixo do edifício (o S3DB renderiza mal telhados inclinados em partes irre
   OSM (há um modelo de *waiver* da OSMF) e confirmar o estado na página
   *Contributors* / lista de fontes PT. Se não for obtida, o projeto continua útil para
   GeoPackage/GLB/visualização, mas não para publicar no OSM.
+- **Estado (2026-11-11): licença obtida.** A exportação `.osm` deixou de bloquear o
+  upload no JOSM (`export.josm_upload: "true"`).
+  - **Por fazer:** guardar o documento da autorização e confirmar a atribuição na
+    página *Contributors* do OSM.
+  - **Modelo de edição (decisão do projeto):** as alterações são preenchidas pela
+    importação do `.osm` gerado, mas a submissão é sempre manual, no JOSM. Antes de
+    submeter, qualquer edifício pode ser ajustado ou descartado. O sistema nunca faz
+    upload.
+  - **Ainda assim:** trazer dados externos para o OSM em quantidade conta como
+    importação nas regras da comunidade, mesmo com submissão manual. Convém documentar
+    o processo na wiki e anunciá-lo à comunidade portuguesa antes de submeter em volume.
 
 ## 9. Avaliação (em falta no plano original)
 

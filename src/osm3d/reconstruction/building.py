@@ -26,12 +26,14 @@ from shapely.geometry.base import BaseGeometry
 from osm3d.config import Config
 from osm3d.domain.models import Building, BuildingPart, Estimate, QAFlag, RoofShape, Source
 from osm3d.geospatial.point_clouds import PointSet, assign_points, read_points
-from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation
+from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation, wall_foot_profile
+from osm3d.reconstruction.ground import STEP_THRESHOLD_M, choose_ground, parse_levels
 from osm3d.geospatial.registration import estimate_tile_offset
 from osm3d.geospatial.tiling import TileKey, tile_of
 from osm3d.reconstruction.roof_fitting import (
     FitParams,
     RoofFit,
+    fit_main_volume,
     fit_roof,
     group_beats_individuals,
 )
@@ -139,15 +141,56 @@ def reconstruct_building(
         if len(points) < cfg.heights.min_points_per_building:
             return building.model_copy(update=update | {"qa_flags": flags, "parts": []}), None
 
-    fit = fit_roof(_shift(footprint, offset), points, ground, _fit_params(cfg))
+    params = _fit_params(cfg)
+    fit = fit_roof(_shift(footprint, offset), points, ground, params)
+    if fit.roof.shape.value is RoofShape.UNKNOWN:
+        # Nenhum modelo explica a planta inteira: há um volume secundário (anexo,
+        # alpendre) mais baixo? Ajusta-se o telhado do volume principal.
+        main = fit_main_volume(_shift(footprint, offset), points, ground, params)
+        if main is not None:
+            fit = main.fit
+            diagnostics["main_volume_fraction"] = main.fraction
+            flags.append(
+                _flag(
+                    "secondary_volume",
+                    f"Telhado {fit.roof.shape.value.value} no volume principal "
+                    f"({main.fraction:.0%} da planta); o resto é mais baixo: candidato a "
+                    "building:part",
+                )
+            )
     if fit.best is not None:
         diagnostics["rmse_m"] = fit.best.rmse_m
         diagnostics["inlier_ratio"] = fit.best.inlier_ratio
-    flags += _roof_flags(fit, cfg) + _height_flags(fit.height.value)
 
-    part = BuildingPart(
-        id=f"{building.key}#1", geometry=footprint, height=fit.height, roof=fit.roof
+    # Encosta/patamar: o chão baixo (estrada abaixo de um muro de suporte, p.ex.) pode
+    # não ser a base do edifício. Decide-se com o perfil do terreno no pé das paredes.
+    eave = fit.roof.model.eave_z if fit.roof.model is not None else None
+    ground_info = choose_ground(
+        ground,
+        wall_foot_profile(dtm, footprint),
+        eave,
+        parse_levels(building.existing_tags.get("building:levels")),
     )
+    height = fit.height
+    chosen = ground_info.elevation()
+    if chosen != ground:
+        height = height.model_copy(update={"value": height.value + ground - chosen})
+    diagnostics["terrain_step_m"] = ground_info.step_m
+    if ground_info.step_m > STEP_THRESHOLD_M:
+        alt = "high" if ground_info.choice == "low" else "low"
+        alt_height = height.value + chosen - ground_info.elevation(alt)
+        flags.append(
+            _flag(
+                "terrain_step",
+                f"Desnível de {ground_info.step_m:.1f} m no pé das paredes; "
+                f"{ground_info.reason}. Alternativa: {alt_height:.1f} m",
+                "info" if ground_info.basis in ("levels", "eave") else "warning",
+            )
+        )
+    flags += _roof_flags(fit, cfg) + _height_flags(height.value)
+
+    part = BuildingPart(id=f"{building.key}#1", geometry=footprint, height=height, roof=fit.roof)
+    update |= {"ground_elevation_m": chosen, "ground": ground_info}
     return building.model_copy(update=update | {"qa_flags": flags, "parts": [part]}), fit
 
 

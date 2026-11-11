@@ -224,9 +224,9 @@ function renderDetail() {
       <label class="${t("roof_shape")}">forma do telhado <span class="est">estimado: ${fmt(est.roof_shape)} (${fmt(est.roof_shape_conf)})</span>
         <select name="roof_shape">${shapeOpts(val("roof_shape", eff.roof_shape))}</select></label>
       <label class="${t("height")}">height (m) <span class="est">estimado: ${fmt(est.height)}</span>
-        <input name="height" type="number" step="0.1" min="0" value="${val("height", eff.height)}"></label>
+        <input name="height" type="number" step="0.5" min="0" value="${val("height", eff.height)}"></label>
       <label class="${t("roof_height")}">roof:height (m) <span class="est">estimado: ${fmt(est.roof_height)}</span>
-        <input name="roof_height" type="number" step="0.1" min="0" value="${val("roof_height", eff.roof_height)}"></label>
+        <input name="roof_height" type="number" step="0.5" min="0" value="${val("roof_height", eff.roof_height)}"></label>
       <label class="${t("roof_orientation")}">roof:orientation <span class="est">estimado: ${fmt(est.roof_orientation)}</span>
         <select name="roof_orientation">
           <option value="">—</option>

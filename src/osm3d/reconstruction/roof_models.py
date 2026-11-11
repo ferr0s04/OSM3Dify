@@ -28,7 +28,7 @@ Array = npt.NDArray[np.float64]
 N_PARAMS: dict[RoofShape, int] = {
     RoofShape.FLAT: 1,
     RoofShape.SKILLION: 2,
-    RoofShape.GABLED: 2,
+    RoofShape.GABLED: 3,  # + posição da cumeeira (procurada em grelha)
     RoofShape.HIPPED: 3,  # + comprimento da cumeeira (procurado em grelha)
     RoofShape.SIDE_HIPPED: 3,  # + comprimento da cumeeira (+ ponta, discreta)
     RoofShape.PYRAMIDAL: 2,
@@ -87,6 +87,7 @@ def roof_surface(
     h: float,
     ridge_ratio: float | None = None,
     flip: bool = False,
+    ridge_offset: float | None = None,
 ) -> Array:
     """Cota do telhado para cada ponto (u, v) do referencial local.
 
@@ -96,6 +97,9 @@ def roof_surface(
 
     ``flip``: ``skillion`` com a água virada para −v; ``side_hipped`` com a ponta em
     hip em −u (por omissão em +u).
+
+    ``ridge_offset`` (só ``gabled``): posição da cumeeira em v, como fração de ``b``
+    (0 = a meio). Os beirais ficam à mesma cota; as águas têm inclinações diferentes.
     """
     if a <= 0 or b <= 0:
         raise ValueError("Dimensões do referencial têm de ser positivas")
@@ -114,7 +118,11 @@ def roof_surface(
             # Sobe linearmente de v = +b (beiral) até v = -b (topo).
             rel = (b - v) / (2 * b)
         case RoofShape.GABLED:
-            rel = 1 - av / b
+            if not ridge_offset:
+                rel = 1 - av / b
+            else:
+                c = ridge_offset * b
+                rel = np.minimum((v + b) / (b + c), (b - v) / (b - c))
         case RoofShape.HIPPED:
             # Cumeeira de meia-largura r; as águas das pontas sobem de |u| = a até |u| = r.
             r = max(a - b, 0.0) if ridge_ratio is None else ridge_ratio * a
@@ -133,11 +141,24 @@ def roof_surface(
 
 
 def model_surface_z(
-    model: RoofModel | None, shape: RoofShape, x: Array, y: Array, flat_z: float
+    model: RoofModel | None,
+    shape: RoofShape,
+    x: Array,
+    y: Array,
+    flat_z: float,
+    footprint: BaseGeometry | None = None,
 ) -> Array:
-    """Cota do telhado ajustado em (x, y); sem modelo, telhado plano a ``flat_z``."""
+    """Cota do telhado ajustado em (x, y); sem modelo, telhado plano a ``flat_z``.
+
+    Modelos por esqueleto (``model.skeleton``) precisam do ``footprint`` (no mesmo
+    referencial dos pontos).
+    """
     if model is None or shape in (RoofShape.FLAT, RoofShape.UNKNOWN):
         return np.full_like(x, model.eave_z if model is not None else flat_z, dtype=float)
+    if model.skeleton and footprint is not None:
+        from osm3d.reconstruction.skeleton import skeleton_basis
+
+        return model.eave_z + model.roof_height * skeleton_basis(footprint, shape, x, y)
     frame = LocalFrame(model.cx, model.cy, model.azimuth_deg, model.half_length, model.half_width)
     u, v = frame.to_local(x, y)
     return roof_surface(
@@ -150,4 +171,5 @@ def model_surface_z(
         model.roof_height,
         ridge_ratio=model.ridge_ratio,
         flip=model.flip,
+        ridge_offset=model.ridge_offset,
     )

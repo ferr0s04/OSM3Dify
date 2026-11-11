@@ -33,6 +33,7 @@ from osm3d.domain.models import (
 )
 from osm3d.geometry import axis_difference_deg, direction_difference_deg
 from osm3d.reconstruction.roof_models import LocalFrame
+from osm3d.reconstruction.skeleton import has_skeleton, renders_as_skeleton
 
 DEFAULT_ROOF_HEIGHT_RATIO = 0.3  # telhado novo sem altura indicada: 30 % da altura total
 MAX_DEFAULT_ROOF_HEIGHT_M = 2.5
@@ -165,13 +166,14 @@ def apply_overrides(b: Building, part: BuildingPart, ov: Overrides) -> BuildingP
         and ov.roof_orientation is None
         and ov.roof_direction is None
     )
-    base = LocalFrame.from_geometry(_shifted_footprint(b))
-    flip, ridge_ratio = False, None
+    shifted = _shifted_footprint(b)
+    base = LocalFrame.from_geometry(shifted)
+    flip, ridge_ratio, ridge_offset = False, None, None
     if geometry_unchanged:
         assert roof.model is not None
         m = roof.model
         frame = LocalFrame(m.cx, m.cy, m.azimuth_deg, m.half_length, m.half_width)
-        flip, ridge_ratio = m.flip, m.ridge_ratio
+        flip, ridge_ratio, ridge_offset = m.flip, m.ridge_ratio, m.ridge_offset
     elif shape in (RoofShape.SKILLION, RoofShape.SIDE_HIPPED):
         facing = ov.roof_direction
         if facing is None:
@@ -196,6 +198,9 @@ def apply_overrides(b: Building, part: BuildingPart, ov: Overrides) -> BuildingP
             ridge_ratio=(
                 ridge_ratio if shape in (RoofShape.HIPPED, RoofShape.SIDE_HIPPED) else None
             ),
+            ridge_offset=ridge_offset if shape is RoofShape.GABLED else None,
+            # Planta não retangular: gabled/hipped seguem o esqueleto (como no renderizador).
+            skeleton=renders_as_skeleton(shifted, shape) and has_skeleton(shifted, shape),
             eave_z=ground + height - roof_h,
             roof_height=roof_h,
         )

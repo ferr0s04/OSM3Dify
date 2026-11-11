@@ -78,5 +78,5 @@ export:
   roof_height_rounding_m: 0.5
   overwrite_existing_tags: false   # nunca sobrescrever tags mapeadas por humanos por omissão
   export_parts_to_osm: false       # Fase 6
-  include_pending: true            # exportar não revistos sem sinalizações (revisão no JOSM)
-  josm_upload: never               # JOSM recusa upload até a licença DGT↔ODbL estar resolvida
+  include_pending: false           # só os edifícios aceites na aplicação de revisão
+  josm_upload: "true"              # "never" faz o JOSM recusar o upload; "false" só avisa
