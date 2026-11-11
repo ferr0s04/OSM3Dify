@@ -90,4 +90,15 @@ def test_tiles(osm_file: Path) -> None:
     assert sum(s.roof_shapes["hipped"] for s in summaries) == 1
     key = tile_of(-45_500.0, 179_250.0)
     assert key.bounds == (-46_000.0, 179_000.0, -45_000.0, 180_000.0)
+    assert key.dgt_name == "154480"
     assert str(key) == "-46000_179000"
+
+
+def test_dgt_tile_names() -> None:
+    # Valores da grelha oficial LiDAR2024_2025_Seccionamento.gpkg.
+    assert tile_of(-44_500, 179_500).dgt_name == "155480"  # (-45000, 179000)
+    assert tile_of(-43_500, 179_500).dgt_name == "156480"
+    assert tile_of(-42_500, 178_500).dgt_name == "157479"
+    assert tile_of(-47_500, 180_500).dgt_name == "152481"
+    key = tile_of(-44_500, 179_500)
+    assert type(key).from_dgt_name("155480") == key

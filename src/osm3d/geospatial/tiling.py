@@ -1,7 +1,9 @@
-"""Grelha de quadrículas de 1 km (EPSG:3763), alinhada com as quadrículas LiDAR da DGT.
+"""Grelha de quadrículas de 1 km (EPSG:3763), igual à grelha LiDAR 2024–2025 da DGT.
 
-Assume-se que as quadrículas DGT estão alinhadas a múltiplos de 1000 m em
-PT-TM06; confirmar com os metadados (bbox) dos ficheiros descarregados.
+Confirmado com a grelha oficial (``LiDAR2024_2025_Seccionamento.gpkg``, 91 196
+quadrículas): todas estão alinhadas a múltiplos de 1000 m em PT-TM06, e o
+identificador DGT (``NAME``, p.ex. ``155480`` em ``LO-155480-MM-AAAA.laz``) é
+``f"{x0/1000 + 200:03d}{y_topo/1000 + 300:03d}"`` (regra verificada em 100 % da grelha).
 """
 
 from __future__ import annotations
@@ -27,11 +29,26 @@ class TileKey:
         x0, y0 = self.ix * TILE_SIZE_M, self.iy * TILE_SIZE_M
         return (x0, y0, x0 + TILE_SIZE_M, y0 + TILE_SIZE_M)
 
-    def bounds_wgs84(self, crs: str = "EPSG:3763") -> tuple[float, float, float, float]:
+    def bounds_wgs84(
+        self, crs: str = "EPSG:3763", inset_m: float = 0.0
+    ) -> tuple[float, float, float, float]:
+        """Bbox WGS84; ``inset_m`` encolhe-a para não tocar nas quadrículas vizinhas."""
         t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
         x0, y0, x1, y1 = self.bounds
+        x0, y0, x1, y1 = x0 + inset_m, y0 + inset_m, x1 - inset_m, y1 - inset_m
         lons, lats = t.transform([x0, x0, x1, x1], [y0, y1, y0, y1])
         return (min(lons), min(lats), max(lons), max(lats))
+
+    @property
+    def dgt_name(self) -> str:
+        """Identificador da quadrícula na grelha LiDAR da DGT (campo ``NAME``)."""
+        return f"{self.ix + 200:03d}{self.iy + 1 + 300:03d}"
+
+    @classmethod
+    def from_dgt_name(cls, name: str) -> TileKey:
+        if len(name) != 6 or not name.isdigit():
+            raise ValueError(f"Identificador DGT inválido: {name!r}")
+        return cls(int(name[:3]) - 200, int(name[3:]) - 301)
 
     def __str__(self) -> str:
         x0, y0, _, _ = self.bounds
@@ -40,6 +57,17 @@ class TileKey:
 
 def tile_of(x: float, y: float) -> TileKey:
     return TileKey(math.floor(x / TILE_SIZE_M), math.floor(y / TILE_SIZE_M))
+
+
+def tiles_in_bbox(
+    bbox_wgs84: tuple[float, float, float, float], crs: str = "EPSG:3763"
+) -> list[TileKey]:
+    """Quadrículas que intersetam uma bbox WGS84 (min_lon, min_lat, max_lon, max_lat)."""
+    t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    w, s, e, n = bbox_wgs84
+    xs, ys = t.transform([w, w, e, e], [s, n, s, n])
+    lo, hi = tile_of(min(xs), min(ys)), tile_of(max(xs), max(ys))
+    return [TileKey(ix, iy) for ix in range(lo.ix, hi.ix + 1) for iy in range(lo.iy, hi.iy + 1)]
 
 
 @dataclass

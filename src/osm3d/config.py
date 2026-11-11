@@ -39,9 +39,22 @@ class SourcesConfig(BaseModel):
             "orthophoto": "ORTOS-2025",
         }
     )
+    dgt_delay_s: float = Field(default=2.0, ge=0.5, description="Pausa entre pedidos à DGT.")
     lidar_dir: Path = Path("data/raw/lidar")
     dtm_dir: Path = Path("data/raw/dtm")
+    dsm_dir: Path = Path("data/raw/dsm")
     orthophoto_dir: Path = Path("data/raw/orthophotos")
+
+    def product_dir(self, product: str) -> Path:
+        dirs = {
+            "lidar": self.lidar_dir,
+            "dtm": self.dtm_dir,
+            "dsm": self.dsm_dir,
+            "orthophoto": self.orthophoto_dir,
+        }
+        if product not in dirs:
+            raise ValueError(f"Produto desconhecido: {product} (opções: {', '.join(dirs)})")
+        return dirs[product]
 
 
 class FootprintsConfig(BaseModel):

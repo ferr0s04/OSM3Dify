@@ -26,6 +26,10 @@ OSM2World, Streets GL…) interpretam.
 - [Revisão crítica da arquitetura](docs/architecture/revisao-arquitetura.md) — decisões
   que prevalecem sobre o documento original (alvo S3DB, telhados model-driven,
   ferramentas, licenciamento, plano revisto).
+- [Frontend: aplicação de revisão](docs/architecture/frontend-revisao.md) — âmbito,
+  arquitetura e faseamento do futuro frontend (proposta adiada).
+- [Área de estudo](docs/area-de-estudo.md) — Vilar e Mosteiró (Vila do Conde),
+  quadrículas LiDAR, dados verificados e alinhamento com o OSM.
 
 ## Pipeline
 

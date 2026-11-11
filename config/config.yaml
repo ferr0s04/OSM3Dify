@@ -33,8 +33,10 @@ sources:
     dtm: MDT-50cm
     dsm: MDS-50cm
     orthophoto: ORTOS-2025
+  dgt_delay_s: 2.0                 # pausa entre pedidos ao portal (uso responsável)
   lidar_dir: data/raw/lidar        # ficheiros LAZ (quadrículas 1 km x 1 km)
   dtm_dir: data/raw/dtm            # MDT GeoTIFF do mesmo levantamento LiDAR
+  dsm_dir: data/raw/dsm            # MDS GeoTIFF (opcional)
   orthophoto_dir: data/raw/orthophotos
 
 footprints:
