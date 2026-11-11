@@ -1,0 +1,66 @@
+# Configuração por omissão do pipeline.
+# Para alterações locais, copiar para config/local.yaml (ignorado pelo git)
+# e usar `osm3d --config config/local.yaml ...`.
+
+area:
+  name: exemplo
+  # Caixa envolvente em WGS84: [min_lon, min_lat, max_lon, max_lat].
+  # Manter pequena no MVP (50–100 edifícios).
+  bbox: [-8.6150, 41.1440, -8.6100, 41.1475]
+
+# Todo o processamento é feito num CRS métrico; só a exportação OSM reprojeta para WGS84.
+processing_crs: "EPSG:3763"  # PT-TM06/ETRS89
+
+paths:
+  raw: data/raw
+  processed: data/processed
+  output: data/output
+  reference: data/reference
+
+sources:
+  overpass_url: https://overpass-api.de/api/interpreter
+  # API STAC do Centro de Dados da DGT (requer conta; credenciais em .env, nunca aqui).
+  # API não documentada oficialmente; endpoint e coleções retirados de clientes
+  # da comunidade (GMT.jl dgt_lidar, qgispt/dgtcd_downer).
+  dgt_stac_url: https://cdd.dgterritorio.gov.pt/dgt-be/v1/
+  dgt_collections:
+    lidar: LAZ
+    dtm: MDT-50cm
+    dsm: MDS-50cm
+    orthophoto: ORTOS-2025
+  lidar_dir: data/raw/lidar        # ficheiros LAZ (quadrículas 1 km x 1 km)
+  dtm_dir: data/raw/dtm            # MDT GeoTIFF do mesmo levantamento LiDAR
+  orthophoto_dir: data/raw/orthophotos
+
+footprints:
+  min_area_m2: 20.0
+  # Pesquisa de deslocamento footprint <-> LiDAR (co-registo).
+  registration_max_shift_m: 3.0
+  registration_step_m: 0.25
+
+heights:
+  building_classes: [6]            # ASPRS: 6 = edifício
+  excluded_classes: [3, 4, 5, 7]   # vegetação e ruído
+  roof_percentile: 95
+  ground_ring_buffer_m: 2.0
+  ground_percentile: 5
+  ndsm_resolution_m: 0.5
+  min_points_per_building: 50
+
+roofs:
+  candidate_shapes: [flat, skillion, gabled, hipped, pyramidal]
+  flat_max_slope_deg: 5.0
+  # Abaixo deste valor de confiança a forma é exportada como desconhecida (não é tag).
+  min_shape_confidence: 0.7
+  max_rmse_m: 0.35
+
+appearance:
+  enabled: false                   # Fase 5
+  colour_palette: [white, lightgrey, grey, darkgrey, black, red, darkred, brown, orange, beige]
+  min_colour_confidence: 0.6
+
+export:
+  height_rounding_m: 0.5
+  roof_height_rounding_m: 0.5
+  overwrite_existing_tags: false   # nunca sobrescrever tags mapeadas por humanos por omissão
+  export_parts_to_osm: false       # Fase 6

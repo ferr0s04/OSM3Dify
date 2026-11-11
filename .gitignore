@@ -1,0 +1,72 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-eggs/
+
+# Ferramentas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# --- Dados (nunca versionar dados de origem nem resultados) ---
+data/**
+!data/**/
+!data/**/.gitkeep
+# Referência anotada manualmente: versionar apenas os ficheiros pequenos explicitamente
+!data/reference/*.geojson
+!data/reference/*.csv
+!data/reference/*.png
+!data/reference/*.jpg
+!data/reference/README.md
+
+# Formatos geoespaciais pesados em qualquer sítio do repo
+*.las
+*.laz
+*.copc.laz
+*.tif
+*.tiff
+*.vrt
+*.gpkg
+*.gpkg-shm
+*.gpkg-wal
+*.pbf
+*.osm
+*.osc
+*.glb
+*.gltf
+*.obj
+*.ply
+# ...exceto fixtures pequenas de teste
+!tests/fixtures/**
+
+# QGIS / JOSM
+*.qgs~
+*.qgz~
+*.qgd
+*.aux.xml
+*.ovr
+
+# --- Configuração local e segredos (credenciais DGT, OSM) ---
+config/local.yaml
+config/*.local.yaml
+.env
+.env.*
+
+# --- IDE / SO ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
