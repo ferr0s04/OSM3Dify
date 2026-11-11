@@ -15,6 +15,10 @@ class AreaConfig(BaseModel):
     bbox: tuple[float, float, float, float] = Field(
         description="WGS84: (min_lon, min_lat, max_lon, max_lat)"
     )
+    osm_relation_id: int | None = Field(
+        default=None,
+        description="Relação OSM do limite administrativo; filtra edifícios pelo polígono.",
+    )
 
 
 class PathsConfig(BaseModel):

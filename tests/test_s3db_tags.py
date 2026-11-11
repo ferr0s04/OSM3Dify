@@ -3,14 +3,8 @@ from __future__ import annotations
 import pytest
 
 from osm3d.domain.models import Estimate, RoofShape, Source
-from osm3d.export.s3db_tags import (
-    TagPolicy,
-    axis_difference_deg,
-    format_metres,
-    longest_side_azimuth_deg,
-    merge_tags,
-    part_to_tags,
-)
+from osm3d.export.s3db_tags import TagPolicy, format_metres, merge_tags, part_to_tags
+from osm3d.geometry import axis_difference_deg, longest_side_azimuth_deg
 from tests.conftest import make_part
 
 

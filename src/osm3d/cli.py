@@ -25,9 +25,9 @@ def _load(path: Path) -> Config:
     return load_config(path)
 
 
-def _run(config: Config, stage: Stage) -> None:
+def _run(config: Config, stage: Stage, force: bool = False) -> None:
     try:
-        out = run_stage(config, stage)
+        out = run_stage(config, stage, force=force)
     except NotImplementedError as exc:
         typer.secho(f"[{stage.value}] {exc}", fg=typer.colors.YELLOW, err=True)
         raise typer.Exit(code=2) from exc
@@ -55,9 +55,43 @@ def info(config: ConfigOption = DEFAULT_CONFIG) -> None:
 def stage(
     name: Annotated[Stage, typer.Argument(help="Fase a executar.")],
     config: ConfigOption = DEFAULT_CONFIG,
+    force: Annotated[bool, typer.Option("--force", help="Ignorar cache e refazer.")] = False,
 ) -> None:
     """Executa uma única fase do pipeline."""
-    _run(_load(config), name)
+    _run(_load(config), name, force)
+
+
+@app.command()
+def tiles(
+    config: ConfigOption = DEFAULT_CONFIG,
+    top: Annotated[int, typer.Option(help="Número de quadrículas a mostrar.")] = 10,
+) -> None:
+    """Resume os edifícios OSM por quadrícula de 1 km (requer a fase fetch)."""
+    from osm3d.geospatial.footprints import load_footprints
+    from osm3d.geospatial.tiling import summarize_tiles
+
+    cfg = _load(config)
+    osm_file = artefact_path(cfg, Stage.FETCH)
+    if not osm_file.exists():
+        raise typer.BadParameter("Correr primeiro: osm3d stage fetch")
+    buildings = load_footprints(osm_file, cfg.processing_crs, cfg.footprints.min_area_m2)
+    summaries = summarize_tiles(buildings)
+    ranked = sorted(
+        summaries, key=lambda s: (s.n_distinct_shapes, s.n_roof_shape, s.n_buildings), reverse=True
+    )
+    typer.echo(f"{len(buildings)} edifícios em {len(summaries)} quadrículas de 1 km\n")
+    typer.echo(
+        f"{'quadrícula (x0_y0)':<20}{'edif.':>6}{'levels':>7}{'roof:shape':>11}"
+        f"{'atrav.':>7}  formas / bbox WGS84"
+    )
+    for s in ranked[:top]:
+        shapes = ", ".join(f"{k}={v}" for k, v in s.roof_shapes.most_common())
+        w, so, e, n = s.key.bounds_wgs84(cfg.processing_crs)
+        typer.echo(
+            f"{s.key!s:<20}{s.n_buildings:>6}{s.n_levels:>7}{s.n_roof_shape:>11}"
+            f"{s.n_crossing:>7}  {shapes or '-'}"
+        )
+        typer.echo(f"{'':<51}  [{w:.5f}, {so:.5f}, {e:.5f}, {n:.5f}]")
 
 
 @app.command()

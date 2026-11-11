@@ -17,8 +17,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
+from shapely.geometry.base import BaseGeometry
 
 from osm3d.domain.models import RoofShape
+from osm3d.geometry import oriented_rectangle
 
 Array = npt.NDArray[np.float64]
 
@@ -50,6 +52,28 @@ class LocalFrame:
         u = dx * ux + dy * uy
         v = -dx * uy + dy * ux
         return u, v
+
+    def to_world(self, u: Array, v: Array) -> tuple[Array, Array]:
+        theta = np.radians(self.azimuth_deg)
+        ux, uy = np.sin(theta), np.cos(theta)
+        return self.cx + u * ux - v * uy, self.cy + u * uy + v * ux
+
+    @property
+    def v_azimuth_deg(self) -> float:
+        """Azimute do sentido +v (90° à esquerda de +u)."""
+        return (self.azimuth_deg - 90.0) % 360.0
+
+    def rotated(self) -> LocalFrame:
+        """O mesmo retângulo com o eixo u rodado 90° (troca comprimento e largura)."""
+        return LocalFrame(
+            self.cx, self.cy, (self.azimuth_deg + 90.0) % 180.0, self.half_width, self.half_length
+        )
+
+    @classmethod
+    def from_geometry(cls, geometry: BaseGeometry) -> LocalFrame:
+        """Referencial com u ao longo do lado maior do retângulo mínimo orientado."""
+        r = oriented_rectangle(geometry)
+        return cls(r.cx, r.cy, r.azimuth_deg, r.half_length, r.half_width)
 
 
 def roof_surface(

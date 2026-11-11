@@ -3,10 +3,15 @@
 # e usar `osm3d --config config/local.yaml ...`.
 
 area:
-  name: exemplo
+  # União das Freguesias de Vilar e Mosteiró (Vila do Conde). Ver docs/area-de-estudo.md.
+  # Futuro — concelho de Vila do Conde: osm_relation_id 3892769,
+  # bbox [-8.76805, 41.25549, -8.61062, 41.42571].
+  name: vilar-e-mosteiro
+  # Limite administrativo OSM (boundary=administrative, admin_level=8).
+  # Quando definido, os edifícios são filtrados pelo polígono e não só pela bbox.
+  osm_relation_id: 5989576
   # Caixa envolvente em WGS84: [min_lon, min_lat, max_lon, max_lat].
-  # Manter pequena no MVP (50–100 edifícios).
-  bbox: [-8.6150, 41.1440, -8.6100, 41.1475]
+  bbox: [-8.69911, 41.27348, -8.63541, 41.29553]
 
 # Todo o processamento é feito num CRS métrico; só a exportação OSM reprojeta para WGS84.
 processing_crs: "EPSG:3763"  # PT-TM06/ETRS89

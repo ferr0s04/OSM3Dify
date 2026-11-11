@@ -9,9 +9,16 @@ O resultado não é um modelo fotorealista nem uma malha 3D: são **tags
 `building:part`…) em edifícios OSM existentes, que é o que os mapas 3D (F4 Map,
 OSM2World, Streets GL…) interpretam.
 
-> **Estado:** esqueleto inicial. O modelo de domínio, a configuração, o mapeamento
-> para tags S3DB e os modelos paramétricos de telhado estão implementados e testados;
-> as fases de aquisição e reconstrução são stubs.
+> **Estado:** em desenvolvimento (Fases 1 e 3).
+>
+> Implementado e testado:
+> - modelo de domínio e configuração;
+> - download OSM (Overpass) e leitura de footprints;
+> - resumo por quadrícula;
+> - ajuste de telhados por modelos paramétricos (validado em dados sintéticos);
+> - mapeamento para tags S3DB.
+>
+> Por fazer: leitura LiDAR, co-registo, alturas sobre dados reais, exportação.
 
 ## Documentação
 

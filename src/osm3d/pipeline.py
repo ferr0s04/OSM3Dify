@@ -40,6 +40,19 @@ def artefact_path(config: Config, stage: Stage) -> Path:
     return base / f"{index:02d}_{stage.value}{suffix}"
 
 
-def run_stage(config: Config, stage: Stage) -> Path:
+def run_stage(config: Config, stage: Stage, *, force: bool = False) -> Path:
     """Executa uma fase e devolve o caminho do artefacto produzido."""
-    raise NotImplementedError(f"Fase '{stage.value}' ainda não implementada")
+    out = artefact_path(config, stage)
+    match stage:
+        case Stage.FETCH:
+            from osm3d.acquisition.osm import fetch_buildings
+
+            return fetch_buildings(
+                config.area.bbox,
+                config.sources.overpass_url,
+                out,
+                config.area.osm_relation_id,
+                force=force,
+            )
+        case _:
+            raise NotImplementedError(f"Fase '{stage.value}' ainda não implementada")

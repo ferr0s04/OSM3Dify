@@ -6,12 +6,10 @@ Referência: https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
-from shapely.geometry.base import BaseGeometry
-
 from osm3d.domain.models import BuildingPart, RoofShape
+from osm3d.geometry import axis_difference_deg, longest_side_azimuth_deg
 
 # Formas com cumeeira cuja direção se exprime via roof:orientation (along/across).
 _RIDGED_SHAPES = {RoofShape.GABLED, RoofShape.HIPPED}
@@ -44,30 +42,6 @@ def format_metres(value: float, step: float) -> str:
     rounded = round(value / step) * step if step > 0 else value
     text = f"{rounded:.2f}".rstrip("0").rstrip(".")
     return "0" if text in ("", "-0") else text
-
-
-def axis_difference_deg(a: float, b: float) -> float:
-    """Diferença entre dois eixos (não direções), em [0, 90]."""
-    d = abs(a - b) % 180.0
-    return min(d, 180.0 - d)
-
-
-def longest_side_azimuth_deg(geometry: BaseGeometry) -> float:
-    """Azimute (eixo, [0, 180)) do lado maior do retângulo mínimo orientado.
-
-    É a referência que os renderizadores S3DB usam para ``roof:orientation``.
-    Assume CRS métrico com x = este e y = norte.
-    """
-    rect = geometry.minimum_rotated_rectangle
-    coords = list(rect.exterior.coords)[:4]
-    best_len, best_az = -1.0, 0.0
-    for (x0, y0), (x1, y1) in zip(coords, coords[1:] + coords[:1], strict=True):
-        dx, dy = x1 - x0, y1 - y0
-        length = math.hypot(dx, dy)
-        if length > best_len:
-            best_len = length
-            best_az = math.degrees(math.atan2(dx, dy)) % 180.0
-    return best_az
 
 
 def part_to_tags(part: BuildingPart, policy: TagPolicy | None = None) -> dict[str, str]:
