@@ -124,6 +124,26 @@ class BuildingPart(BaseModel):
     facade_colour: Estimate[str] | None = None
 
 
+class PartsLayout(BaseModel):
+    """Divisão de um edifício em partes (``building:part``) com vértices partilhados.
+
+    Coordenadas no CRS de processamento, no referencial do **OSM** (sem o deslocamento
+    de co-registo). Cada parte é um anel de índices em ``vertices`` (sem repetir o
+    primeiro). Partes vizinhas usam os mesmos índices nos vértices comuns, que serão
+    os mesmos nós OSM. Os vértices sobre o contorno do edifício são os seus nós, ou
+    nós novos inseridos nos lados do contorno.
+    """
+
+    vertices: list[tuple[float, float]]
+    parts: list[list[int]]
+    # Resultado do ajuste de cada parte (mesma ordem de ``parts``); vazio se não ajustado.
+    fitted: list[BuildingPart] = Field(default_factory=list)
+    source: Literal["suggested", "manual"] = "suggested"
+
+    def polygon(self, i: int) -> Polygon:
+        return Polygon([self.vertices[k] for k in self.parts[i]])
+
+
 class QAFlag(BaseModel):
     code: str
     message: str
@@ -171,6 +191,10 @@ class Building(BaseModel):
     ground: GroundInfo | None = None
     registration_offset_m: tuple[float, float] = (0.0, 0.0)
     parts: list[BuildingPart] = Field(default_factory=list)
+    # Divisão em partes ativa (vinda da revisão): ``parts`` corresponde a ``layout.parts``.
+    layout: PartsLayout | None = None
+    # Divisão sugerida pelo pipeline (volume secundário); só é usada se a revisão a aceitar.
+    suggested_layout: PartsLayout | None = None
     qa_flags: list[QAFlag] = Field(default_factory=list)
     diagnostics: dict[str, float] = Field(
         default_factory=dict, description="Métricas do processamento (n.º de pontos, etc.)."

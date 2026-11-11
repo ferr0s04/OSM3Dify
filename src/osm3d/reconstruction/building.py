@@ -37,7 +37,9 @@ from osm3d.geospatial.point_clouds import PointSet, assign_points, read_points
 from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation, wall_foot_profile
 from osm3d.geospatial.registration import estimate_tile_offset
 from osm3d.geospatial.tiling import TileKey, tile_of
+from osm3d.parts import suggest_layout, validate_layout
 from osm3d.reconstruction.ground import STEP_THRESHOLD_M, choose_ground, parse_levels
+from osm3d.reconstruction.parts import fit_layout
 from osm3d.reconstruction.roof_fitting import (
     FitParams,
     RoofFit,
@@ -75,7 +77,7 @@ def _shift(geom, offset: tuple[float, float]):  # type: ignore[no-untyped-def]
     return shapely.transform(geom, lambda c: c + np.array([dx, dy]))
 
 
-def _fit_params(cfg: Config) -> FitParams:
+def fit_params(cfg: Config) -> FitParams:
     return FitParams(
         candidates=tuple(cfg.roofs.candidate_shapes),
         max_rmse_m=cfg.roofs.max_rmse_m,
@@ -149,8 +151,9 @@ def reconstruct_building(
         if len(points) < cfg.heights.min_points_per_building:
             return building.model_copy(update=update | {"qa_flags": flags, "parts": []}), None
 
-    params = _fit_params(cfg)
+    params = fit_params(cfg)
     fit = fit_roof(_shift(footprint, offset), points, ground, params)
+    main = None
     if fit.roof.shape.value is RoofShape.UNKNOWN:
         # Nenhum modelo explica a planta inteira: há um volume secundário (anexo,
         # alpendre) mais baixo? Ajusta-se o telhado do volume principal.
@@ -199,6 +202,14 @@ def reconstruct_building(
 
     part = BuildingPart(id=f"{building.key}#1", geometry=footprint, height=height, roof=fit.roof)
     update |= {"ground_elevation_m": chosen, "ground": ground_info}
+    if main is not None and building.osm_type == "way" and not building.osm_parts:
+        # Sugestão de partes: volume principal + volumes secundários, cada um ajustado.
+        region = _shift(main.region, (-offset[0], -offset[1]))
+        layout = suggest_layout(footprint, region)
+        # Só se sugerem divisões topologicamente válidas (senão, a revisão faz à mão).
+        if layout is not None and not validate_layout(layout, footprint):
+            probe = building.model_copy(update=update | {"parts": [part]})
+            update["suggested_layout"] = fit_layout(probe, layout, points, params)
     return building.model_copy(update=update | {"qa_flags": flags, "parts": [part]}), fit
 
 
@@ -239,7 +250,7 @@ def apply_shared_roofs(
     altura de telhado e orientação do conjunto. Devolve o n.º de edifícios alterados.
     """
     changed = 0
-    params = _fit_params(cfg)
+    params = fit_params(cfg)
     for cluster in attached_clusters([b.footprint for b in results]):
         members = [
             i

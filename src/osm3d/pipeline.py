@@ -185,5 +185,12 @@ def export_area(config: Config, buildings: list[Building]) -> tuple[Path, int, l
     )
     write_report(records, out.with_name(f"{config.area.name}_export.csv"))
     source = _require(artefact_path(config, Stage.FETCH), Stage.FETCH)
-    write_josm_file(selected, source, out, upload=config.export.josm_upload)
+    write_josm_file(
+        selected,
+        source,
+        out,
+        upload=config.export.josm_upload,
+        policy=tag_policy(config),
+        crs=config.processing_crs,
+    )
     return out, len(selected), records

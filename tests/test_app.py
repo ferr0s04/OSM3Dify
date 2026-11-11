@@ -31,7 +31,10 @@ def client(tmp_path: Path) -> TestClient:
     buildings = []
     for b in load_footprints(fetch, cfg.processing_crs, 20):
         part = make_part(RoofShape.GABLED).model_copy(update={"geometry": b.footprint})
-        buildings.append(b.model_copy(update={"parts": [part], "ground_elevation_m": 50.0}))
+        # A way 40 do ficheiro de teste é uma building:part dentro de way/10; aqui
+        # ignora-se para testar a divisão (o bloqueio tem teste próprio).
+        update = {"parts": [part], "ground_elevation_m": 50.0, "osm_parts": []}
+        buildings.append(b.model_copy(update=update))
     write_buildings(buildings, artefact_path(cfg, Stage.QA), cfg.processing_crs)
     return TestClient(create_app(cfg))
 
@@ -147,6 +150,97 @@ def test_store_migrates_old_schema(tmp_path: Path) -> None:
     assert store.all()["way/1"].archived
 
 
+def test_parts_workflow(client: TestClient) -> None:
+    base = "/api/buildings/way/10"
+    view = client.get(f"{base}/parts").json()
+    assert view["editable"] and len(view["outline"]) == 4 and view["layout"] is None
+    # Começar manualmente (contorno = 1 parte) e dividir ao meio, de lado a lado.
+    layout = client.post(f"{base}/parts/start").json()["layout"]
+    assert len(layout["parts"]) == 1
+    xs = [p[0] for p in view["outline"]]
+    ys = [p[1] for p in view["outline"]]
+    mid = (min(xs) + max(xs)) / 2
+    split = client.post(
+        f"{base}/parts/split",
+        json={"layout": layout, "part": 0, "a": [mid, min(ys)], "b": [mid, max(ys)]},
+    ).json()["layout"]
+    assert len(split["parts"]) == 2 and len(split["vertices"]) == 6
+
+    prev = client.post(
+        f"{base}/parts/preview",
+        json={"layout": split, "overrides": [{"roof_shape": "flat", "height": 3.0}, {}]},
+    ).json()
+    assert prev["problems"] == []
+    assert len(prev["parts"]) == 2 and prev["parts"][0]["tags"]["building:part"] == "yes"
+    assert prev["parts"][0]["tags"]["roof:shape"] == "flat"
+    assert len(prev["mesh"]["parts"]) == 2
+
+    saved = client.put(
+        f"{base}/review",
+        json={
+            "status": "accepted",
+            "parts": {"layout": split, "overrides": [{"roof_shape": "flat", "height": 3.0}, {}]},
+        },
+    ).json()
+    assert saved["has_layout"] and saved["n_parts"] == 2
+    assert client.get(f"{base}/parts").json()["layout"] is not None
+
+    out = client.post("/api/export").json()
+    assert out["exported"] == 1
+    root = ET.parse(out["path"]).getroot()
+    new_ways = [w for w in root.findall("way") if int(w.attrib["id"]) < 0]
+    assert len(new_ways) == 2
+    outline = root.find("way[@id='10']")
+    assert outline is not None and len(outline.findall("nd")) == 7  # 2 nós do corte inseridos
+
+    merged = client.post(f"{base}/parts/merge", json={"layout": split, "part": 0}).json()["layout"]
+    assert len(merged["parts"]) == 1
+
+
+def test_scene_for_map(client: TestClient) -> None:
+    scene = client.get("/api/scene").json()
+    lon, lat = scene["origin"]
+    assert -9 < lon < -8 and 41 < lat < 42
+    keys = {b["key"] for b in scene["buildings"]}
+    assert keys == {"way/10", "relation/30"}
+    part = scene["buildings"][0]["parts"][0]
+    assert part["roof"]["f"] and part["walls"]["f"] and part["roof_colour"].startswith("#")
+    zs = part["roof"]["v"][2::3]
+    assert 0 < max(zs) <= 8.5 + 1e-6  # alturas acima do terreno, arredondadas
+    one = client.get("/api/buildings/way/10/scene").json()
+    assert one["key"] == "way/10"
+
+
+def test_parts_validation_errors(client: TestClient) -> None:
+    base = "/api/buildings/way/10"
+    bad = {"vertices": [[0, 0], [1, 0]], "parts": [[0, 1, 5]]}
+    assert client.post(f"{base}/parts/preview", json={"layout": bad}).status_code == 422
+    # Uma só parte não é uma divisão: guardar falha com explicação.
+    one = client.post(f"{base}/parts/start").json()["layout"]
+    r = client.put(f"{base}/review", json={"status": "accepted", "parts": {"layout": one}})
+    assert r.status_code == 422 and "pelo menos 2 partes" in r.json()["detail"]
+    # Multipolígonos não são divisíveis.
+    assert client.post("/api/buildings/relation/30/parts/start").status_code == 422
+
+
+def test_existing_osm_parts_block_editing() -> None:
+    from shapely.geometry import box
+
+    from osm3d.app.service import ReviewService
+    from osm3d.domain.models import Building
+
+    b = Building(
+        osm_type="way",
+        osm_id=1,
+        osm_version=1,
+        footprint=box(0, 0, 10, 10),
+        ground_elevation_m=0.0,
+        osm_parts=[40],
+    )
+    why = ReviewService._editable(None, b)  # type: ignore[arg-type]
+    assert why is not None and "building:part" in why
+
+
 def test_invalid_review_rejected(client: TestClient) -> None:
     bad = client.put("/api/buildings/way/10/review", json={"status": "talvez"})
     assert bad.status_code == 422
@@ -172,4 +266,9 @@ def test_osm_change_and_colours(client: TestClient) -> None:
 def test_frontend_served(client: TestClient) -> None:
     html = client.get("/").text
     assert "osm3d" in html and "/static/app.js" in html
-    assert client.get("/static/app.js").status_code == 200
+    js = client.get("/static/app.js")
+    assert js.status_code == 200
+    # Frontend sempre revalidado: evita misturar módulos antigos e novos após atualizações.
+    assert js.headers["cache-control"] == "no-cache"
+    assert client.get("/").headers["cache-control"] == "no-cache"
+    assert "cache-control" not in client.get("/api/summary").headers

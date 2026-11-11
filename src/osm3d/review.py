@@ -19,12 +19,14 @@ from typing import Literal
 import numpy as np
 import shapely
 from pydantic import BaseModel, Field
+from shapely.geometry.base import BaseGeometry
 
 from osm3d.domain.models import (
     Building,
     BuildingPart,
     Estimate,
     GroundChoice,
+    PartsLayout,
     QAFlag,
     ReviewStatus,
     Roof,
@@ -52,6 +54,8 @@ class Overrides(BaseModel):
     building_colour: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
     # Encosta: medir height a partir do chão baixo ou do terreno do lote.
     ground: GroundChoice | None = None
+    # Só para partes: base da parte acima do terreno (volumes suspensos/sobrepostos).
+    min_height: float | None = Field(default=None, ge=0, le=200)
 
     def is_empty(self) -> bool:
         return all(v is None for v in self.model_dump().values())
@@ -67,13 +71,34 @@ class Review(BaseModel):
     # Arquivada: aceite já submetido ao OSM, ou rejeitado que não se quer voltar a ver.
     # Sai da lista/mapa e das exportações; a decisão mantém-se.
     archived_at: datetime | None = None
+    # Divisão em partes (com o ajuste de cada parte) e correções por parte.
+    parts: PartsLayout | None = None
+    part_overrides: list[Overrides] = Field(default_factory=list)
 
     @property
     def archived(self) -> bool:
         return self.archived_at is not None
 
 
-_COLUMNS = "osm_key, osm_version, status, note, overrides, reviewed_at, archived_at"
+_COLUMNS = "osm_key, osm_version, status, note, overrides, reviewed_at, archived_at, parts"
+
+
+class _PartsRecord(BaseModel):
+    layout: PartsLayout
+    overrides: list[Overrides] = Field(default_factory=list)
+
+
+def _parts_to_json(review: Review) -> str | None:
+    if review.parts is None:
+        return None
+    return _PartsRecord(layout=review.parts, overrides=review.part_overrides).model_dump_json()
+
+
+def _parts_from_json(raw: str | None) -> tuple[PartsLayout | None, list[Overrides]]:
+    if not raw:
+        return None, []
+    rec = _PartsRecord.model_validate_json(raw)
+    return rec.layout, rec.overrides
 
 
 class ReviewStore:
@@ -85,11 +110,12 @@ class ReviewStore:
                 "CREATE TABLE IF NOT EXISTS reviews ("
                 " osm_key TEXT PRIMARY KEY, osm_version INTEGER NOT NULL,"
                 " status TEXT NOT NULL, note TEXT, overrides TEXT NOT NULL,"
-                " reviewed_at TEXT NOT NULL, archived_at TEXT)"
+                " reviewed_at TEXT NOT NULL, archived_at TEXT, parts TEXT)"
             )
             cols = {r[1] for r in c.execute("PRAGMA table_info(reviews)")}
-            if "archived_at" not in cols:  # bases de dados anteriores ao arquivo
-                c.execute("ALTER TABLE reviews ADD COLUMN archived_at TEXT")
+            for col in ("archived_at", "parts"):  # bases de dados de versões anteriores
+                if col not in cols:
+                    c.execute(f"ALTER TABLE reviews ADD COLUMN {col} TEXT")
 
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path)
@@ -97,8 +123,10 @@ class ReviewStore:
     def all(self) -> dict[str, Review]:
         with self._conn() as c:
             rows = c.execute(f"SELECT {_COLUMNS} FROM reviews").fetchall()
-        return {
-            r[0]: Review(
+        out: dict[str, Review] = {}
+        for r in rows:
+            layout, part_overrides = _parts_from_json(r[7])
+            out[r[0]] = Review(
                 osm_key=r[0],
                 osm_version=r[1],
                 status=r[2],
@@ -106,14 +134,15 @@ class ReviewStore:
                 overrides=Overrides.model_validate_json(r[4]),
                 reviewed_at=datetime.fromisoformat(r[5]),
                 archived_at=datetime.fromisoformat(r[6]) if r[6] else None,
+                parts=layout,
+                part_overrides=part_overrides,
             )
-            for r in rows
-        }
+        return out
 
     def save(self, review: Review) -> None:
         with self._conn() as c:
             c.execute(
-                f"INSERT OR REPLACE INTO reviews ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT OR REPLACE INTO reviews ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     review.osm_key,
                     review.osm_version,
@@ -122,6 +151,7 @@ class ReviewStore:
                     review.overrides.model_dump_json(),
                     review.reviewed_at.isoformat(),
                     review.archived_at.isoformat() if review.archived_at else None,
+                    _parts_to_json(review),
                 ),
             )
 
@@ -167,8 +197,14 @@ def _directed_frame(shape: RoofShape, base: LocalFrame, facing: float) -> tuple[
     )
 
 
-def apply_overrides(b: Building, part: BuildingPart, ov: Overrides) -> BuildingPart:
-    """Nova parte com as correções aplicadas (e o modelo 3D coerente com elas)."""
+def apply_overrides(
+    b: Building, part: BuildingPart, ov: Overrides, geometry: BaseGeometry | None = None
+) -> BuildingPart:
+    """Nova parte com as correções aplicadas (e o modelo 3D coerente com elas).
+
+    ``geometry``: planta da parte no referencial do LiDAR (por omissão, o contorno do
+    edifício deslocado pelo co-registo; para partes, a planta da parte).
+    """
     if ov.is_empty():
         return part
     manual = Source.MANUAL
@@ -192,7 +228,7 @@ def apply_overrides(b: Building, part: BuildingPart, ov: Overrides) -> BuildingP
         and ov.roof_orientation is None
         and ov.roof_direction is None
     )
-    shifted = _shifted_footprint(b)
+    shifted = geometry if geometry is not None else _shifted_footprint(b)
     base = LocalFrame.from_geometry(shifted)
     flip, ridge_ratio, ridge_offset = False, None, None
     if geometry_unchanged:
@@ -268,6 +304,7 @@ def apply_overrides(b: Building, part: BuildingPart, ov: Overrides) -> BuildingP
     return part.model_copy(
         update={
             "height": est(height, part.height, ov.height is not None),
+            "min_height": ov.min_height if ov.min_height is not None else part.min_height,
             "roof": new_roof,
             "facade_colour": facade,
         }
@@ -281,7 +318,10 @@ def apply_review(b: Building, review: Review | None) -> Building:
     if review.archived:
         # Arquivado: a decisão está fechada. Depois de submeter, a versão OSM muda por
         # causa da própria edição; isso não torna a revisão desatualizada.
-        return apply_corrections(b, review.overrides).model_copy(
+        b = apply_corrections(b, review.overrides)
+        if review.parts is not None:
+            b = apply_parts(b, review.parts, review.part_overrides)
+        return b.model_copy(
             update={
                 "review_status": review.status,
                 "review_note": review.note,
@@ -295,6 +335,8 @@ def apply_review(b: Building, review: Review | None) -> Building:
         )
         return b.model_copy(update={"qa_flags": [*b.qa_flags, flag]})
     b = apply_corrections(b, review.overrides)
+    if review.parts is not None:
+        b = apply_parts(b, review.parts, review.part_overrides)
     return b.model_copy(update={"review_status": review.status, "review_note": review.note})
 
 
@@ -326,6 +368,19 @@ def apply_ground(b: Building, choice: GroundChoice) -> Building:
             "qa_flags": flags,
         }
     )
+
+
+def apply_parts(b: Building, layout: PartsLayout, overrides: list[Overrides]) -> Building:
+    """Edifício dividido em partes: cada parte com o seu ajuste e as suas correções."""
+    if not layout.fitted or len(layout.fitted) != len(layout.parts):
+        return b
+    dx, dy = b.registration_offset_m
+    parts = []
+    for i, part in enumerate(layout.fitted):
+        ov = overrides[i] if i < len(overrides) else Overrides()
+        geom = shapely.transform(layout.polygon(i), lambda c: c + np.array([dx, dy]))
+        parts.append(apply_overrides(b, part, ov, geometry=geom))
+    return b.model_copy(update={"parts": parts, "layout": layout})
 
 
 def apply_corrections(b: Building, ov: Overrides) -> Building:

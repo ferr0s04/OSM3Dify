@@ -1,9 +1,10 @@
-// Aplicação de revisão: lista + mapa + 3D + edição de tags.
+// Aplicação de revisão: mapa (com filtros) + 3D + edição de tags e partes.
 import { api } from "./api.js";
 import { CHANGE_COLORS, CHANGE_LABELS, SHAPE_LABELS } from "./colors.js";
 import { BuildingMap } from "./map.js";
 import { renderResults } from "./results.js";
 import { Viewer } from "./viewer.js";
+import { PART_COLORS, PartsEditor } from "./parts-editor.js";
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -27,6 +28,9 @@ const state = {
   detail: null,
   touched: new Set(),
   token: 0,
+  // Divisão em partes: vista do editor, divisão ativa e correções por parte.
+  parts: { view: null, active: false, layout: null, overrides: [], info: null, selected: null },
+  viewMode: "3d",
 };
 
 const viewer = new Viewer($("#viewer"));
@@ -48,58 +52,29 @@ function priority(r) {
   return reviewed + (r.needs_review ? 0 : 2) + (r.shape_conf ?? 0);
 }
 
-function applyFilters() {
-  const q = $("#f-search").value.trim();
-  const status = $("#f-status").value;
-  const shape = $("#f-shape").value;
-  const flagged = $("#f-flagged").checked;
-  const mismatch = $("#f-mismatch").checked;
-  const showArchived = $("#f-archived").checked;
-  const osm = $("#f-osm").value;
-  const sort = $("#f-sort").value;
-  let rows = state.rows.filter(
-    (r) =>
-      (!q || r.key.includes(q)) &&
-      (!status || r.status === status) &&
-      (!shape || (r.shape ?? "unknown") === shape) &&
-      (!flagged || r.needs_review) &&
-      (!mismatch || r.match === false) &&
-      (!osm || (osm === "osm3d" ? r.osm3d : r.change === osm)) &&
-      (showArchived || !r.archived),
-  );
-  const by = {
-    priority: (a, b) => priority(a) - priority(b),
-    conf: (a, b) => (a.shape_conf ?? -1) - (b.shape_conf ?? -1),
-    height: (a, b) => (b.height ?? 0) - (a.height ?? 0),
-    area: (a, b) => (b.area ?? 0) - (a.area ?? 0),
-    key: (a, b) => a.key.localeCompare(b.key, undefined, { numeric: true }),
-  }[sort];
-  rows = rows.sort(by);
-  state.filtered = rows;
-  renderList();
+function chosen(group) {
+  // Botões ativos de um grupo de filtros (nenhum ativo = todos).
+  return new Set([...document.querySelectorAll(`.fgroup[data-group="${group}"] button.on`)].map((b) => b.dataset.v));
 }
 
-function renderList() {
-  const MAX = 2000;
-  const rows = state.filtered.slice(0, MAX);
-  $("#list-count").textContent =
-    `${state.filtered.length} de ${state.rows.length} edifícios` + (state.filtered.length > MAX ? ` (a mostrar ${MAX})` : "");
-  $("#list").innerHTML = rows
-    .map((r) => {
-      const shape = r.shape ?? "unknown";
-      const flags = r.flags.length ? `<span class="chip warn">${r.flags.length} ⚑</span>` : "";
-      const osmBadge = r.osm3d
-        ? `<span class="chip osm" title="Já tem 3D no OSM: ${CHANGE_LABELS[r.change]}">OSM 3D ${{ diverge: "≠", complementa: "+", igual: "=" }[r.change] ?? ""}</span>`
-        : "";
-      const osm = r.osm_roof_shape ? ` · OSM ${esc(r.osm_roof_shape)}${r.match === false ? " ≠" : ""}` : "";
-      return `<li data-key="${r.key}" class="${r.key === state.selected ? "sel" : ""}">
-        <span class="dot ${r.status}"></span>
-        <div><div class="key">${r.key}${r.edited ? " ✎" : ""}</div>
-          <div class="meta"><span class="sw" style="background:${r.roof_colour}" title="roof:colour ${esc(r.roof_colour)}"></span> ${SHAPE_LABELS[shape]}
-          ${r.shape_conf !== null ? `(${Math.round(r.shape_conf * 100)}%)` : ""} · ${fmt(r.height, " m")}${osm}</div></div>
-        <div class="badges">${osmBadge}${flags}</div></li>`;
-    })
-    .join("");
+function applyFilters() {
+  const q = $("#f-search").value.trim();
+  const change = chosen("change");
+  const status = chosen("status");
+  const flagged = $("#f-flagged").checked;
+  const showArchived = $("#f-archived").checked;
+  const rows = state.rows.filter(
+    (r) =>
+      (!q || r.key.includes(q)) &&
+      (!change.size || change.has(r.change)) &&
+      (!status.size || status.has(r.status)) &&
+      (!flagged || r.needs_review) &&
+      (showArchived || !r.archived),
+  );
+  // Ordem de navegação (J/K): sinalizados e de baixa confiança primeiro.
+  state.filtered = rows.sort((a, b) => priority(a) - priority(b));
+  $("#f-count").textContent = `${rows.length} de ${state.rows.length}`;
+  map.setVisibleKeys(new Set(rows.map((r) => r.key)));
 }
 
 function renderProgress() {
@@ -126,8 +101,6 @@ async function select(key) {
   if (!key) return;
   const token = ++state.token;
   state.selected = key;
-  document.querySelectorAll("#list li").forEach((li) => li.classList.toggle("sel", li.dataset.key === key));
-  document.querySelector(`#list li[data-key="${CSS.escape(key)}"]`)?.scrollIntoView({ block: "nearest" });
   $("#viewer-status").textContent = "a carregar…";
   viewer.clearAll();
   try {
@@ -135,8 +108,10 @@ async function select(key) {
     if (token !== state.token) return;
     state.detail = detail;
     state.touched = new Set(OVERRIDE_FIELDS.filter((f) => detail.overrides[f] !== null));
+    state.parts = { view: null, active: false, layout: null, overrides: [], info: null, selected: null };
     map.select(key, detail.bbox);
     renderDetail();
+    if (detail.has_layout || state.viewMode === "plan") loadParts(key, token);
     viewer.setModel(mesh);
     viewer.frame(mesh);
     $("#viewer-status").textContent = "a carregar pontos LiDAR… (a 1.ª vez por quadrícula demora)";
@@ -263,6 +238,9 @@ function renderDetail() {
       <label class="full">nota<textarea name="note" rows="2">${esc(d.note ?? "")}</textarea></label>
     </form>
 
+    <h3>Partes (building:part)</h3>
+    <div id="parts-section"></div>
+
     <h3>Tags</h3>
     <div id="tags">${renderTags(d.tags, d.existing_tags)}</div>
 
@@ -328,8 +306,10 @@ async function afterReviewChange(detail, advance) {
   renderProgress();
   const current = state.selected;
   const idx = state.filtered.findIndex((r) => r.key === current);
-  applyFilters();
   map.setData(await api.geojson());
+  applyFilters();
+  // Atualiza os telhados 3D deste edifício no mapa (forma/cores podem ter mudado).
+  if (map.roofs) map.updateBuilding(await api.sceneOne(current));
   if (advance) {
     // Avança para o próximo da lista filtrada (o atual pode ter saído do filtro).
     const next = state.filtered[Math.min(idx, state.filtered.length - 1)];
@@ -343,7 +323,10 @@ async function review(status) {
   if (!state.detail) return;
   const note = document.querySelector('[name="note"]')?.value ?? null;
   try {
-    const detail = await api.saveReview(state.selected, status, note, overrides());
+    const parts = state.parts.active
+      ? { layout: state.parts.layout, overrides: state.parts.overrides.map((o) => o ?? {}) }
+      : null;
+    const detail = await api.saveReview(state.selected, status, note, overrides(), parts);
     toast(`${detail.key}: ${status === "accepted" ? "aceite" : "rejeitado"}`, 1500);
     await afterReviewChange(detail, true);
   } catch (e) {
@@ -361,25 +344,38 @@ async function resetReview() {
 // ------------------------------------------------------------- arranque
 
 function wire() {
-  $("#f-archived").addEventListener("input", (e) => {
-    map.setShowArchived(e.target.checked);
-    applyFilters();
-  });
+  $("#f-archived").addEventListener("input", applyFilters);
+  document.querySelectorAll(".fgroup button").forEach((b) =>
+    b.addEventListener("click", () => {
+      b.classList.toggle("on");
+      applyFilters();
+    }),
+  );
   $("#archive-action").addEventListener("input", (e) => archiveAction(e.target));
-  ["#f-search", "#f-status", "#f-shape", "#f-osm", "#f-flagged", "#f-mismatch", "#f-sort"].forEach((s) =>
+  ["#f-search", "#f-flagged"].forEach((s) =>
     $(s).addEventListener("input", applyFilters),
   );
-  $("#list").addEventListener("click", (e) => {
-    const li = e.target.closest("li");
-    if (li) select(li.dataset.key);
-  });
   $("#m-color").addEventListener("input", (e) => map.setColorMode(e.target.value));
-  $("#m-3d").addEventListener("input", (e) => map.set3D(e.target.checked));
+  $("#m-3d").addEventListener("input", async (e) => {
+    const on = e.target.checked;
+    if (on) toast("A preparar os telhados 3D de toda a área…", 2500);
+    try {
+      await map.set3D(on, () => api.scene());
+    } catch (err) {
+      toast(`3D: ${err.message}`);
+    }
+  });
   $("#v-color").addEventListener("input", (e) => viewer.setColorMode(e.target.value));
   $("#v-points").addEventListener("input", (e) => viewer.setVisible("points", e.target.checked));
   $("#v-context").addEventListener("input", (e) => viewer.setVisible("context", e.target.checked));
   $("#v-model").addEventListener("input", (e) => viewer.setVisible("model", e.target.checked));
   $("#v-transparent").addEventListener("input", (e) => viewer.setTransparent(e.target.checked));
+  $("#vt-3d").addEventListener("click", () => setViewMode("3d"));
+  $("#vt-plan").addEventListener("click", () => setViewMode("plan"));
+  $("#pe-split").addEventListener("click", () => editor.startSplit());
+  $("#pe-merge").addEventListener("click", () => mergeSelectedPart());
+  $("#pe-square").addEventListener("click", () => editor.squarePart(editor.selectedPart));
+  $("#pe-undo").addEventListener("click", () => editor.undo());
 
   document.querySelectorAll(".tab").forEach((tab) =>
     tab.addEventListener("click", async () => {
@@ -414,6 +410,206 @@ function wire() {
     else if (k === "a") review("accepted");
     else if (k === "r") review("rejected");
     else if (k === "u") resetReview();
+  });
+}
+
+// --------------------------------------------------------------- partes
+
+const editor = new PartsEditor($("#planner"), {
+  onChange: (layout) => {
+    state.parts.layout = layout;
+    schedulePartsPreview();
+  },
+  onSelectPart: (i) => {
+    state.parts.selected = i;
+    document.querySelectorAll(".part-card").forEach((c) => c.classList.toggle("sel", Number(c.dataset.part) === i));
+  },
+  onSplit: (i, a, b) => partsOp(() => api.partsSplit(state.selected, state.parts.layout, i, a, b)),
+  onStatus: (msg) => toast(msg),
+});
+
+function setViewMode(mode) {
+  state.viewMode = mode;
+  const plan = mode === "plan";
+  $("#viewer").classList.toggle("hidden", plan);
+  $("#planner").classList.toggle("hidden", !plan);
+  $("#controls-3d").classList.toggle("hidden", plan);
+  $("#controls-plan").classList.toggle("hidden", !plan);
+  $("#vt-3d").classList.toggle("active", !plan);
+  $("#vt-plan").classList.toggle("active", plan);
+  if (plan && state.selected && !state.parts.view) loadParts(state.selected, state.token);
+  if (plan) requestAnimationFrame(() => editor.render());
+}
+
+async function loadParts(key, token) {
+  try {
+    const view = await api.parts(key);
+    if (token !== state.token) return;
+    state.parts.view = view;
+    if (view.layout) {
+      state.parts.active = true;
+      state.parts.layout = view.layout;
+      state.parts.overrides = view.overrides ?? [];
+    }
+    editor.load({ outline: view.outline, points: view.points, layout: state.parts.active ? state.parts.layout : null });
+    renderPartsSection();
+    if (state.parts.active) schedulePartsPreview(0);
+  } catch (e) {
+    toast(`Partes: ${e.message}`);
+  }
+}
+
+function activateParts(layout) {
+  state.parts.active = true;
+  state.parts.layout = layout;
+  state.parts.overrides = [];
+  state.parts.info = null;
+  editor.load({ outline: state.parts.view.outline, layout }, true);
+  setViewMode("plan");
+  renderPartsSection();
+  schedulePartsPreview(0);
+}
+
+async function startParts(kind) {
+  if (!state.parts.view) await loadParts(state.selected, state.token);
+  if (kind === "suggested" && state.parts.view?.suggested) return activateParts(state.parts.view.suggested);
+  try {
+    const { layout } = await api.partsStart(state.selected);
+    activateParts(layout);
+    editor.selectPart(0);
+    editor.startSplit();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function deactivateParts() {
+  state.parts.active = false;
+  state.parts.layout = null;
+  state.parts.overrides = [];
+  state.parts.info = null;
+  editor.load({ outline: state.parts.view.outline, layout: null }, true);
+  renderPartsSection();
+  viewer.setModel(await api.mesh(state.selected));
+  toast("Divisão descartada (fica em vigor ao aceitar/rejeitar).");
+}
+
+async function partsOp(fn) {
+  try {
+    const { layout } = await fn();
+    state.parts.layout = layout;
+    state.parts.overrides = []; // a numeração das partes mudou
+    editor.setLayout(layout);
+    renderPartsSection();
+    schedulePartsPreview(0);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+function mergeSelectedPart() {
+  const i = editor.selectedPart;
+  if (i === null || !state.parts.active) return toast("Seleciona a parte a juntar à vizinha.");
+  partsOp(() => api.partsMerge(state.selected, state.parts.layout, i));
+}
+
+function schedulePartsPreview(delay = 300) {
+  clearTimeout(schedulePartsPreview.t);
+  schedulePartsPreview.t = setTimeout(async () => {
+    if (!state.parts.active) return;
+    const key = state.selected, token = state.token;
+    try {
+      const res = await api.partsPreview(key, state.parts.layout, state.parts.overrides.map((o) => o ?? {}));
+      if (token !== state.token || !state.parts.active) return;
+      state.parts.info = res;
+      if (res.mesh) viewer.setModel(res.mesh);
+      updatePartsInfo();
+      if (res.tags) $("#tags").innerHTML = renderTags(res.tags, state.detail.existing_tags) + renderPartTags(res.parts);
+    } catch (e) {
+      toast(`Partes: ${e.message}`);
+    }
+  }, delay);
+}
+
+function renderPartTags(parts) {
+  if (!parts?.length) return "";
+  return parts
+    .map((p, i) => `<div class="small" style="margin-top:6px"><b style="color:${PART_COLORS[i % PART_COLORS.length]}">building:part ${i + 1}</b> ${Object.entries(p.tags)
+      .map(([k, v]) => `<code>${esc(k)}=${esc(v)}</code>`).join(" ")}</div>`)
+    .join("");
+}
+
+const PART_FIELDS = ["roof_shape", "height", "min_height", "roof_height", "roof_direction", "roof_colour"];
+
+function renderPartsSection() {
+  const el = $("#parts-section");
+  if (!el) return;
+  const d = state.detail;
+  if (!d.parts_editable) {
+    el.innerHTML = `<p class="muted small">Divisão em partes indisponível para este edifício.</p>`;
+    return;
+  }
+  if (!state.parts.active) {
+    el.innerHTML = `<div class="actions">
+        ${d.has_suggestion ? `<button class="btn" id="p-suggested" title="Volume principal + volumes secundários detetados no LiDAR">Dividir em partes (sugerido)</button>` : ""}
+        <button class="btn" id="p-manual">Dividir manualmente</button>
+      </div>
+      ${d.has_suggestion ? `<p class="small muted">A análise encontrou volumes com alturas diferentes neste contorno.</p>` : ""}`;
+    $("#p-suggested")?.addEventListener("click", () => startParts("suggested"));
+    $("#p-manual").addEventListener("click", () => startParts("manual"));
+    return;
+  }
+  const n = state.parts.layout.parts.length;
+  const ov = (i, f) => state.parts.overrides[i]?.[f] ?? "";
+  const shapeOpts = (i) => ["", "flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal"]
+    .map((s) => `<option value="${s}" ${ov(i, "roof_shape") === s ? "selected" : ""}>${s ? SHAPE_LABELS[s] : "— estimado —"}</option>`).join("");
+  el.innerHTML = `
+    <div id="parts-problems" class="problems"></div>
+    <div class="parts-list">
+      ${Array.from({ length: n }, (_, i) => `
+        <div class="part-card ${i === state.parts.selected ? "sel" : ""}" data-part="${i}" style="border-left-color:${PART_COLORS[i % PART_COLORS.length]}">
+          <h4><span>Parte ${i + 1}</span><span class="est small muted" data-est="${i}"></span></h4>
+          <div class="form">
+            <label>forma<select data-f="roof_shape" data-i="${i}">${shapeOpts(i)}</select></label>
+            <label>height (m)<input data-f="height" data-i="${i}" type="number" step="0.5" min="0" value="${ov(i, "height")}"></label>
+            <label>min_height (m)<input data-f="min_height" data-i="${i}" type="number" step="0.5" min="0" value="${ov(i, "min_height")}"></label>
+            <label>roof:height (m)<input data-f="roof_height" data-i="${i}" type="number" step="0.5" min="0" value="${ov(i, "roof_height")}"></label>
+            <label>roof:direction (°)<input data-f="roof_direction" data-i="${i}" type="number" step="1" min="0" max="359" value="${ov(i, "roof_direction")}"></label>
+            <label>roof:colour<input data-f="roof_colour" data-i="${i}" type="color" list="palette" value="${ov(i, "roof_colour") || "#b5533c"}"></label>
+          </div>
+        </div>`).join("")}
+    </div>
+    <p class="small muted">Campos vazios = valor estimado (indicado ao lado do título). Edita a geometria na vista <b>Planta</b>.</p>
+    <div class="actions"><button class="btn" id="p-single">Voltar a edifício único</button></div>`;
+  el.querySelectorAll("[data-f]").forEach((input) =>
+    input.addEventListener("input", (e) => {
+      const i = Number(e.target.dataset.i), f = e.target.dataset.f;
+      const o = (state.parts.overrides[i] = { ...(state.parts.overrides[i] ?? {}) });
+      const v = e.target.value;
+      o[f] = v === "" ? null : ["height", "min_height", "roof_height", "roof_direction"].includes(f) ? Number(v) : v;
+      schedulePartsPreview();
+    }),
+  );
+  el.querySelectorAll(".part-card").forEach((c) =>
+    c.addEventListener("click", (e) => {
+      if (!e.target.closest("input, select")) editor.selectPart(Number(c.dataset.part));
+    }),
+  );
+  $("#p-single").addEventListener("click", deactivateParts);
+  updatePartsInfo();
+}
+
+function updatePartsInfo() {
+  const info = state.parts.info;
+  if (!info) return;
+  const probs = $("#parts-problems");
+  if (probs) probs.innerHTML = (info.problems ?? []).map((p) => `<div>⚠ ${esc(p)}</div>`).join("");
+  (info.parts ?? []).forEach((p, i) => {
+    const span = document.querySelector(`[data-est="${i}"]`);
+    if (span) {
+      span.textContent = `${SHAPE_LABELS[p.roof_shape] ?? p.roof_shape} · ${fmt(p.height, " m")}` +
+        (p.min_height ? ` (base ${p.min_height} m)` : "") + ` · ${fmt(p.area, " m²")}`;
+    }
   });
 }
 

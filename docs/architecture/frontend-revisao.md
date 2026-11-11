@@ -174,6 +174,56 @@ aplicadas (`export.include_pending: false`, por omissão desde 2026-11-11).
   quando a versão OSM muda, porque essa mudança é a própria submissão. O filtro
   "arquivados" volta a mostrá-los, e o menu permite desarquivar.
 
+- **Layout sem lista lateral:** o mapa ocupa a área principal e o detalhe fica à
+  direita. A linha de filtros sobre o mapa tem:
+  - id OSM;
+  - relação com o OSM (novo / complementa / diverge / igual);
+  - estado (por rever / aceites / rejeitados);
+  - sinalizados e arquivados.
+
+  Os filtros mostram e escondem os edifícios no próprio mapa, em 2D e em 3D. `J`/`K`
+  percorrem os edifícios visíveis, sinalizados e de baixa confiança primeiro.
+- **Mapa em 3D:** telhados e paredes de todos os edifícios com a **forma e as cores
+  inferidas**, numa camada three.js dentro do MapLibre (`/api/scene`):
+  - malhas geradas no backend a partir dos mesmos modelos da vista de detalhe;
+  - plantas em L com esqueleto, partes com as suas cores;
+  - Vilar e Mosteiró: ~300 mil triângulos, 7 MB, ~3 s na primeira vez, depois em cache;
+  - cada edifício é atualizado quando a sua revisão muda.
+- **Partes (`building:part`).**
+  - **Sugestão:** quando o pipeline encontra um volume secundário, guarda uma divisão
+    sugerida (volume principal + resto), já com o telhado de cada parte ajustado
+    (`Building.suggested_layout`). Na revisão: "Dividir em partes (sugerido)" ou
+    "Dividir manualmente".
+  - **Editor 2D (vista "Planta", estilo iD)**, sobre os pontos LiDAR coloridos por
+    altura (o degrau entre volumes vê-se pela cor):
+
+    | Ação | Como |
+    | --- | --- |
+    | Mover vértice | arrastar |
+    | Criar vértice | `+` a meio de um lado |
+    | Remover vértice | `Delete` |
+    | Esquadrar a parte selecionada | `Q` (lados a < 13° de 90°) |
+    | Dividir com dois cliques | `S` |
+    | Juntar à vizinha | botão |
+    | Desfazer | `Ctrl+Z` |
+    | Zoom / mover vista | roda / arrastar o fundo |
+
+  - **Topologia** (`src/osm3d/parts.py`):
+    - as partes partilham vértices e não há junções em T;
+    - os nós do contorno são fixos (o contorno edita-se no JOSM);
+    - os vértices sobre um lado do contorno só deslizam ao longo dele.
+  - **Cada parte** tem forma, `height`, `min_height`, `roof:height`, `roof:direction`
+    e `roof:colour` próprios, ajustados ao LiDAR e corrigíveis. A vista 3D mostra as
+    partes com as suas cores.
+  - **Exportação:**
+    - cada parte é uma way nova `building:part=yes`;
+    - os vértices sobre o contorno reutilizam os nós existentes, ou são **inseridos
+      no lado do contorno** (o contorno fica `action=modify`);
+    - os vértices interiores são nós novos partilhados entre as partes;
+    - o contorno recebe `height` = parte mais alta;
+    - só para contornos simples (way), e só se o edifício ainda não tiver
+      `building:part` no OSM.
+
 ### Por fazer
 
 - Ortofoto como camada de fundo opcional (hoje: OSM raster).

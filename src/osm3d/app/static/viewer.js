@@ -131,8 +131,20 @@ export class Viewer {
       });
       this.groups.model.add(new THREE.Mesh(g, material));
     };
-    add(mesh.roof, mesh.colours?.roof ?? "#c8c8c8", 0.6);
-    add(mesh.walls, mesh.colours?.walls ?? "#e9e4da", 0.35);
+    // Uma malha por parte (building:part), cada uma com as suas cores.
+    const parts = mesh.parts ?? [{ roof: mesh.roof, walls: mesh.walls, colours: mesh.colours }];
+    for (const p of parts) {
+      add(p.roof, p.colours?.roof ?? "#c8c8c8", 0.6);
+      add(p.walls, p.colours?.walls ?? "#e9e4da", 0.35);
+      if (parts.length > 1) {
+        // Contorno de cada parte, para se ver a divisão.
+        for (const ring of p.outline ?? []) {
+          const pts = [...ring, ring[0]].map(([x, y]) => new THREE.Vector3(x, 0.08, -y));
+          const g = new THREE.BufferGeometry().setFromPoints(pts);
+          this.groups.model.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0x60a5fa })));
+        }
+      }
+    }
     // Contorno do footprint ao nível do chão.
     for (const ring of mesh.footprint ?? []) {
       const pts = ring.map(([x, y]) => new THREE.Vector3(x, 0.05, -y));
@@ -146,8 +158,10 @@ export class Viewer {
     let r = 8;
     let top = 6;
     for (const ring of mesh?.footprint ?? []) for (const [x, y] of ring) r = Math.max(r, Math.hypot(x, y));
-    const v = mesh?.roof?.vertices ?? [];
-    for (let i = 2; i < v.length; i += 3) top = Math.max(top, v[i]);
+    for (const p of mesh?.parts ?? [mesh ?? {}]) {
+      const v = p?.roof?.vertices ?? [];
+      for (let i = 2; i < v.length; i += 3) top = Math.max(top, v[i]);
+    }
     this.controls.target.set(0, top / 2, 0);
     const dist = Math.max(r, top) * 2.6;
     this.camera.position.set(dist * 0.6, dist * 0.55, dist * 0.75);

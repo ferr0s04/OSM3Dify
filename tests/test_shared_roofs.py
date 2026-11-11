@@ -6,7 +6,7 @@ from shapely.geometry import box
 
 from osm3d.config import load_config
 from osm3d.domain.models import Building, BuildingPart, RoofShape
-from osm3d.reconstruction.building import _fit_params, apply_shared_roofs, attached_clusters
+from osm3d.reconstruction.building import apply_shared_roofs, attached_clusters, fit_params
 from osm3d.reconstruction.roof_fitting import fit_roof
 from tests.synthetic import CX, CY, make_roof
 
@@ -25,7 +25,7 @@ def _halves(shape: RoofShape) -> tuple[list[Building], list, list]:  # type: ign
     results, fits, point_sets = [], [], []
     for i, (fp, mask) in enumerate(halves):
         pts = syn.points.subset(mask)
-        fit = fit_roof(fp, pts, syn.ground_z, _fit_params(CFG))
+        fit = fit_roof(fp, pts, syn.ground_z, fit_params(CFG))
         part = BuildingPart(id=f"way/{i}#1", geometry=fp, height=fit.height, roof=fit.roof)
         results.append(
             Building(
@@ -69,5 +69,5 @@ def test_independent_roofs_stay_separate() -> None:
     results, fits, point_sets = _halves(RoofShape.GABLED)
     north = point_sets[0]
     north.xyz[:, 2] += 2.0  # metade norte 2 m mais alta: não é um telhado contínuo
-    fits[0] = fit_roof(results[0].footprint, north, 100.0, _fit_params(CFG))
+    fits[0] = fit_roof(results[0].footprint, north, 100.0, fit_params(CFG))
     assert apply_shared_roofs(results, fits, point_sets, (0.0, 0.0), CFG) == 0

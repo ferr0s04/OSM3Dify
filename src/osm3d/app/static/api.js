@@ -24,9 +24,16 @@ export const api = {
   mesh: (key) => request("GET", `${path(key)}/mesh`),
   points: (key) => request("GET", `${path(key)}/points`),
   preview: (key, overrides) => request("POST", `${path(key)}/preview`, overrides),
-  saveReview: (key, status, note, overrides) =>
-    request("PUT", `${path(key)}/review`, { status, note, overrides }),
+  saveReview: (key, status, note, overrides, parts = null) =>
+    request("PUT", `${path(key)}/review`, { status, note, overrides, parts }),
   resetReview: (key) => request("DELETE", `${path(key)}/review`),
   export: () => request("POST", "/api/export"),
   archive: (status, archived = true) => request("POST", "/api/reviews/archive", { status, archived }),
+  scene: () => request("GET", "/api/scene"),
+  sceneOne: (key) => request("GET", `${path(key)}/scene`),
+  parts: (key) => request("GET", `${path(key)}/parts`),
+  partsStart: (key) => request("POST", `${path(key)}/parts/start`),
+  partsPreview: (key, layout, overrides) => request("POST", `${path(key)}/parts/preview`, { layout, overrides }),
+  partsSplit: (key, layout, part, a, b) => request("POST", `${path(key)}/parts/split`, { layout, part, a, b }),
+  partsMerge: (key, layout, part) => request("POST", `${path(key)}/parts/merge`, { layout, part }),
 };

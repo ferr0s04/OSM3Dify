@@ -23,8 +23,12 @@ from pathlib import Path
 from typing import Literal
 from xml.etree import ElementTree as ET
 
-from osm3d.domain.models import Building
-from osm3d.export.s3db_tags import TagPolicy, merge_tags, part_to_tags
+import numpy as np
+from pyproj import Transformer
+
+from osm3d.domain.models import Building, BuildingPart
+from osm3d.export.s3db_tags import TagPolicy, format_metres, merge_tags, part_to_tags
+from osm3d.parts import SNAP_M, on_segment
 
 UploadPolicy = Literal["never", "false", "true"]
 
@@ -60,24 +64,137 @@ def plan_export(
             reason = "por rever"
         elif not accepted and b.needs_review:
             reason = "sinalizado: " + ",".join(f.code for f in b.qa_flags if f.severity != "info")
-        elif len(b.parts) != 1:
-            reason = "sem partes" if not b.parts else "várias partes (Fase 6)"
+        elif not b.parts:
+            reason = "sem partes"
+        elif has_parts(b) and b.osm_type != "way":
+            reason = "partes só em contornos simples (way), não em multipolígonos"
+        elif len(b.parts) > 1 and not has_parts(b):
+            reason = "várias partes sem divisão definida"
         if reason:
             records.append(ExportRecord(b.key, False, reason))
             continue
-        merge = merge_tags(b.existing_tags, part_to_tags(b.parts[0], policy), overwrite=overwrite)
+        merge = merge_tags(b.existing_tags, outline_tags(b, policy), overwrite=overwrite)
+        changed = merge.has_changes or has_parts(b)  # partes novas são sempre alteração
+        ok = f"ok ({len(b.parts)} partes)" if has_parts(b) else "ok"
         record = ExportRecord(
             b.key,
-            merge.has_changes,
-            "ok" if merge.has_changes else "sem alterações",
+            changed,
+            ok if changed else "sem alterações",
             merge.added,
             merge.changed,
             merge.conflicts,
         )
         records.append(record)
-        if merge.has_changes:
+        if changed:
             selected.append((b, merge.tags))
     return selected, records
+
+
+def has_parts(b: Building) -> bool:
+    return b.layout is not None and len(b.parts) == len(b.layout.parts) and len(b.parts) > 1
+
+
+def outline_tags(b: Building, policy: TagPolicy) -> dict[str, str]:
+    """Tags propostas para o contorno.
+
+    Com partes, o contorno leva só a altura total (a da parte mais alta). A forma
+    e as cores ficam em cada ``building:part``.
+    """
+    if not has_parts(b):
+        return part_to_tags(b.parts[0], policy)
+    top = max(p.height.value for p in b.parts)
+    return {"height": format_metres(top, policy.height_rounding_m)}
+
+
+def part_way_tags(part: BuildingPart, policy: TagPolicy) -> dict[str, str]:
+    return {"building:part": "yes", **part_to_tags(part, policy)}
+
+
+class _NodeIds:
+    """Ids negativos (elementos novos no JOSM), únicos no ficheiro."""
+
+    def __init__(self) -> None:
+        self.next = -1
+
+    def new(self) -> int:
+        nid = self.next
+        self.next -= 1
+        return nid
+
+
+def _attach_parts(
+    way: ET.Element,
+    b: Building,
+    index: dict[tuple[str, int], ET.Element],
+    nodes: dict[int, ET.Element],
+    new_ways: list[ET.Element],
+    ids: _NodeIds,
+    policy: TagPolicy,
+    crs: str,
+) -> None:
+    """Acrescenta as ``building:part`` de ``b`` ligadas topologicamente ao contorno.
+
+    - vértice que coincide com um nó do contorno → esse nó;
+    - vértice sobre um lado do contorno → nó novo, **inserido nesse lado do contorno**;
+    - vértice interior → nó novo, partilhado pelas partes que o usam.
+    """
+    assert b.layout is not None
+    to_crs = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    to_wgs = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    refs = [int(nd.attrib["ref"]) for nd in way.findall("nd")]
+    ring = refs[:-1] if len(refs) > 1 and refs[0] == refs[-1] else refs
+    lonlat = np.array(
+        [
+            [float(index[("node", r)].attrib["lon"]), float(index[("node", r)].attrib["lat"])]
+            for r in ring
+        ]
+    )
+    ox, oy = to_crs.transform(lonlat[:, 0], lonlat[:, 1])
+    outline = np.column_stack([ox, oy])
+
+    vertex_node: list[int] = []
+    inserts: dict[int, list[tuple[float, int]]] = {}
+    for v in b.layout.vertices:
+        p = np.asarray(v, float)
+        dist = np.linalg.norm(outline - p, axis=1)
+        if float(dist.min()) <= SNAP_M:
+            vertex_node.append(ring[int(dist.argmin())])
+            continue
+        nid = ids.new()
+        lon, lat = to_wgs.transform(p[0], p[1])
+        nodes[nid] = ET.Element(
+            "node", id=str(nid), action="modify", visible="true", lat=f"{lat:.9f}", lon=f"{lon:.9f}"
+        )
+        vertex_node.append(nid)
+        for i in range(len(ring)):
+            t = on_segment(p, outline[i], outline[(i + 1) % len(ring)], SNAP_M)
+            if t is not None:
+                inserts.setdefault(i, []).append((t, nid))
+                break
+
+    if inserts:
+        for nd in way.findall("nd"):
+            way.remove(nd)
+        new_ring: list[int] = []
+        for i, ref in enumerate(ring):
+            new_ring.append(ref)
+            new_ring += [nid for _, nid in sorted(inserts.get(i, []))]
+        for ref in [*new_ring, new_ring[0]]:
+            ET.SubElement(way, "nd", ref=str(ref))
+        # As tags ficam depois dos nós, como no formato OSM.
+        for tag in way.findall("tag"):
+            way.remove(tag)
+            way.append(tag)
+        way.set("action", "modify")
+
+    for k, part in enumerate(b.parts):
+        el = ET.Element("way", id=str(ids.new()), action="modify", visible="true")
+        part_ring = [vertex_node[i] for i in b.layout.parts[k]]
+        for ref in [*part_ring, part_ring[0]]:
+            ET.SubElement(el, "nd", ref=str(ref))
+        for key, value in sorted(part_way_tags(part, policy).items()):
+            ET.SubElement(el, "tag", k=key, v=value)
+        new_ways.append(el)
 
 
 def _index(root: ET.Element) -> dict[tuple[str, int], ET.Element]:
@@ -99,12 +216,17 @@ def write_josm_file(
     out: Path,
     *,
     upload: UploadPolicy = "true",
+    policy: TagPolicy | None = None,
+    crs: str = "EPSG:3763",
 ) -> Path:
     """Escreve os edifícios selecionados (com as tags finais) num ``.osm`` para o JOSM."""
+    policy = policy or TagPolicy()
     index = _index(ET.parse(source_osm).getroot())
     nodes: dict[int, ET.Element] = {}
     ways: dict[int, ET.Element] = {}
     relations: dict[int, ET.Element] = {}
+    new_ways: list[ET.Element] = []
+    ids = _NodeIds()
 
     def add_way(way_id: int, tags: dict[str, str] | None = None) -> None:
         src = index.get(("way", way_id))
@@ -123,6 +245,8 @@ def write_josm_file(
     for b, tags in selected:
         if b.osm_type == "way":
             add_way(b.osm_id, tags)
+            if has_parts(b):
+                _attach_parts(ways[b.osm_id], b, index, nodes, new_ways, ids, policy, crs)
         else:
             rel = copy.deepcopy(index[("relation", b.osm_id)])
             _set_tags(rel, tags)
@@ -135,9 +259,17 @@ def write_josm_file(
     root = ET.Element("osm", version="0.6", generator="osm3d")
     if upload != "true":  # "true" é o comportamento por omissão do JOSM: sem atributo
         root.set("upload", upload)
-    for group in (nodes, ways, relations):
-        for key in sorted(group):
-            root.append(group[key])
+    # Nós: existentes por id crescente, depois os novos (−1, −2, …).
+    for key in sorted(k for k in nodes if k > 0):
+        root.append(nodes[key])
+    for key in sorted((k for k in nodes if k < 0), reverse=True):
+        root.append(nodes[key])
+    for key in sorted(ways):
+        root.append(ways[key])
+    for el in new_ways:
+        root.append(el)
+    for key in sorted(relations):
+        root.append(relations[key])
     ET.indent(root)
     out.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(out, encoding="UTF-8", xml_declaration=True)
