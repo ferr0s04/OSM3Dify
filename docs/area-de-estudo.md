@@ -90,12 +90,33 @@ Conclusões:
 - **Por rever:** 11 % dos edifícios têm sinalizações.
 - **Co-registo:** deslocamento global de (0,00, −0,50) m em ambas as quadrículas.
 
-| `roof:shape` vs. OSM (n = 82) | v1 (águas iguais) | **v2 (cumeeira livre)** |
-| --- | ---: | ---: |
-| Exatidão — todos | 66 % | **79 %** |
-| Exatidão — plantas retangulares (n = 60) | 72 % | **80 %** |
-| Cobertura (forma exportável) | 89 % | 85 % |
-| `hipped` → `pyramidal` | 13 | 5 |
+| `roof:shape` vs. OSM (n = 82) | v1 (águas iguais) | v2 (cumeeira livre) | **v3 (RMSE ≤ 0,20 m)** |
+| --- | ---: | ---: | ---: |
+| Exatidão — todos | 66 % | 79 % | **87 %** |
+| Exatidão — plantas retangulares (n = 60) | 72 % | 80 % | **87 %** |
+| Cobertura (forma exportável) | 89 % | 85 % | 67 % |
+| `hipped` → `pyramidal` | 13 | 5 | 3 |
+| Edifícios a rever | 8 % | 11 % | 26 % |
+
+**v3: limite de RMSE.** Os erros concentravam-se em RMSE entre 0,24 e 0,27 m: telhados
+complexos (mansardas, vários níveis, cumeeira descentrada) para os quais `skillion`
+era só o modelo "menos mau". Com `max_rmse_m: 0.20` esses casos passam a `unknown` e
+vão para revisão em vez de serem exportados com a forma errada. Troca-se cobertura por
+precisão, que é o lado certo para edições no OSM. **O limite foi calibrado em apenas
+82 edifícios** e tem de ser confirmado noutras quadrículas.
+
+**Telhados partilhados.** Para grupos de edifícios encostados cuja planta conjunta é
+retangular, ajusta-se também um telhado único ao grupo. Esse telhado é usado se
+explicar os pontos melhor do que os telhados individuais, pelo mesmo critério
+penalizado. Funciona no caso clássico (casa geminada dividida ao longo da cumeeira,
+ver testes), mas aqui só mudou 2 edifícios. Os erros "→ `skillion`" que motivaram
+a ideia não eram telhados contínuos: eram conjuntos com planta não retangular
+(retangularidade da união 0,40–0,54) ou telhados realmente diferentes.
+
+**Formas por validar.** A referência OSM tem só 3 `skillion` e **nenhum `flat`**. As
+previsões destas formas (110 e 112 edifícios exportáveis) são sobretudo anexos baixos:
+mediana de ~50 m² e 3–4 m de altura. É plausível, mas não está validado. Precisa de
+amostragem manual.
 
 **Lição da v1.** Nos `hipped` desta zona as águas das pontas são muitas vezes mais
 inclinadas do que as laterais, e por isso a cumeeira é mais curta do que `2·(a − b)`.
@@ -122,6 +143,24 @@ comprimento da cumeeira em grelha.
 altura por piso implícita tem mediana de 3,33 m, P10 de 2,39 m e P90 de 5,18 m;
 64 % dos casos ficam entre 2,4 e 4,0 m. É coerente, mas a referência é fraca:
 `building:levels` costuma omitir caves, pisos recuados e pés-direitos altos.
+
+**Exportação JOSM** (`osm3d stage export`):
+
+- **377 de 509 edifícios exportados**; os 132 sinalizados ficam de fora.
+- **Tags acrescentadas:**
+
+  | Tag | Edifícios |
+  | --- | ---: |
+  | `height` | 377 |
+  | `roof:shape` | 322 |
+  | `roof:height` | 265 |
+  | `roof:direction` | 110 |
+  | `roof:orientation` | 29 |
+
+- **8 conflitos com tags existentes**, quase todos `roof:shape`. O valor OSM é
+  mantido e o conflito fica registado em `data/output/vilar-e-mosteiro_export.csv`.
+- **O ficheiro `data/output/vilar-e-mosteiro_josm.osm` tem `upload="never"`.** O JOSM
+  abre-o e valida-o, mas recusa o upload até a licença estar resolvida.
 
 **Ver no QGIS:** abrir `data/processed/vilar-e-mosteiro/06_qa.gpkg`.
 

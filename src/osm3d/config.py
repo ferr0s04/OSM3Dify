@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -83,7 +84,7 @@ class RoofsConfig(BaseModel):
     ]
     flat_max_slope_deg: float = 5.0
     min_shape_confidence: float = Field(default=0.7, ge=0, le=1)
-    max_rmse_m: float = 0.35
+    max_rmse_m: float = 0.20
 
 
 class AppearanceConfig(BaseModel):
@@ -97,6 +98,11 @@ class ExportConfig(BaseModel):
     roof_height_rounding_m: float = 0.5
     overwrite_existing_tags: bool = False
     export_parts_to_osm: bool = False
+    # Incluir edifícios ainda não revistos (sem sinalizações). A revisão é então feita
+    # no JOSM; com false, só os "accepted" (aplicação de revisão) são exportados.
+    include_pending: bool = True
+    # "never": o JOSM recusa o upload (até a licença DGT↔ODbL estar resolvida).
+    josm_upload: Literal["never", "false", "true"] = "never"
 
 
 class Config(BaseModel):

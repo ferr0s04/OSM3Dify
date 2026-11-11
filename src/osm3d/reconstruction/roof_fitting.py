@@ -106,10 +106,16 @@ class FitResult:
     rmse_m: float  # sobre os inliers
     inlier_ratio: float
     score: float  # menor é melhor
+    rss: float = 0.0  # Σ min(r², t²) — perda truncada
+    n: int = 0
 
     @property
     def shape(self) -> RoofShape:
         return self.hypothesis.shape
+
+    @property
+    def n_params(self) -> int:
+        return N_PARAMS[self.shape]
 
     @property
     def top_z(self) -> float:
@@ -182,9 +188,27 @@ def _evaluate(hyp: Hypothesis, xyz: Array, params: FitParams) -> FitResult | Non
     n = len(r)
     inliers = np.abs(r) <= params.truncation_m
     rho = float(np.minimum(r**2, params.truncation_m**2).sum())
-    score = n * math.log(rho / n + _NOISE_FLOOR_M**2) + N_PARAMS[hyp.shape] * math.log(n)
+    score = penalized_score(rho, n, N_PARAMS[hyp.shape])
     rmse = float(np.sqrt(np.mean(r[inliers] ** 2))) if inliers.any() else float("inf")
-    return FitResult(hyp, z0, h, rmse, float(inliers.mean()), score)
+    return FitResult(hyp, z0, h, rmse, float(inliers.mean()), score, rho, n)
+
+
+def penalized_score(rss: float, n: int, n_params: int) -> float:
+    """Pontuação tipo BIC com perda truncada (menor é melhor)."""
+    return n * math.log(rss / n + _NOISE_FLOOR_M**2) + n_params * math.log(n)
+
+
+def group_beats_individuals(group: FitResult, members: list[FitResult]) -> bool:
+    """Um só telhado para o grupo explica os pontos melhor do que um por edifício?
+
+    Compara, sobre os mesmos pontos, um modelo único com a soma dos modelos
+    individuais (cada um com os seus parâmetros), pelo mesmo critério penalizado.
+    """
+    n = sum(m.n for m in members)
+    if n == 0 or group.n != n:
+        return False
+    individual = penalized_score(sum(m.rss for m in members), n, sum(m.n_params for m in members))
+    return penalized_score(group.rss, n, group.n_params) < individual
 
 
 def _unknown(

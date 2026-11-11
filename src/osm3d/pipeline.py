@@ -12,6 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from osm3d.config import Config
+from osm3d.export.s3db_tags import TagPolicy
 
 
 class Stage(StrEnum):
@@ -35,10 +36,20 @@ def area_dir(config: Config) -> Path:
 
 
 def artefact_path(config: Config, stage: Stage) -> Path:
+    if stage is Stage.EXPORT:
+        return config.paths.output / f"{config.area.name}_josm.osm"
     index = STAGE_ORDER.index(stage)
     suffix = _ARTEFACT_SUFFIX.get(stage, ".gpkg")
-    base = config.paths.output if stage is Stage.EXPORT else area_dir(config)
-    return base / f"{index:02d}_{stage.value}{suffix}"
+    return area_dir(config) / f"{index:02d}_{stage.value}{suffix}"
+
+
+def tag_policy(config: Config) -> TagPolicy:
+    return TagPolicy(
+        min_shape_confidence=config.roofs.min_shape_confidence,
+        min_colour_confidence=config.appearance.min_colour_confidence,
+        height_rounding_m=config.export.height_rounding_m,
+        roof_height_rounding_m=config.export.roof_height_rounding_m,
+    )
 
 
 # Fases ainda sem processamento próprio: passam o artefacto anterior adiante.
@@ -116,5 +127,25 @@ def run_stage(
                 extra = [f for f in check_building(b) if f.code not in known]
                 checked.append(b.model_copy(update={"qa_flags": [*b.qa_flags, *extra]}))
             return write_buildings(checked, out, config.processing_crs)
+        case Stage.EXPORT:
+            from osm3d.export.geopackage import read_buildings
+            from osm3d.export.osm_xml import plan_export, write_josm_file, write_report
+
+            buildings = read_buildings(_input_of(config, stage))
+            selected, records = plan_export(
+                buildings,
+                tag_policy(config),
+                include_pending=config.export.include_pending,
+                overwrite=config.export.overwrite_existing_tags,
+            )
+            report = write_report(records, out.with_name(f"{config.area.name}_export.csv"))
+            if progress:
+                n_conf = sum(bool(r.conflicts) for r in records)
+                progress(
+                    f"  {len(selected)} de {len(buildings)} edifícios exportados, "
+                    f"{n_conf} com conflitos de tags (mantido o valor OSM) → {report}"
+                )
+            source = _require(artefact_path(config, Stage.FETCH), Stage.FETCH)
+            return write_josm_file(selected, source, out, upload=config.export.josm_upload)
         case _:
             raise NotImplementedError(f"Fase '{stage.value}' ainda não implementada")

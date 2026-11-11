@@ -83,6 +83,20 @@ def part_to_tags(part: BuildingPart, policy: TagPolicy | None = None) -> dict[st
     return tags
 
 
+# Valores OSM sinónimos: o valor existente mantém-se e não é conflito.
+_SYNONYMS: dict[str, dict[str, str]] = {"roof:shape": {"lean_to": "skillion"}}
+
+
+def equivalent(key: str, a: str, b: str) -> bool:
+    syn = _SYNONYMS.get(key, {})
+
+    def norm(v: str) -> str:
+        v = v.strip().lower()
+        return syn.get(v, v)
+
+    return norm(a) == norm(b)
+
+
 def merge_tags(
     existing: dict[str, str], proposed: dict[str, str], *, overwrite: bool = False
 ) -> TagMerge:
@@ -97,7 +111,7 @@ def merge_tags(
         if old is None:
             result.tags[key] = new
             result.added[key] = new
-        elif old != new:
+        elif not equivalent(key, old, new):
             if overwrite:
                 result.tags[key] = new
                 result.changed[key] = (old, new)

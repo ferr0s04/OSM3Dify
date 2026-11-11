@@ -20,15 +20,21 @@ from pathlib import Path
 
 import numpy as np
 import shapely
-from shapely.geometry import box
+from shapely.geometry import Polygon, box
+from shapely.geometry.base import BaseGeometry
 
 from osm3d.config import Config
-from osm3d.domain.models import Building, BuildingPart, QAFlag, RoofShape
+from osm3d.domain.models import Building, BuildingPart, Estimate, QAFlag, RoofShape, Source
 from osm3d.geospatial.point_clouds import PointSet, assign_points, read_points
 from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation
 from osm3d.geospatial.registration import estimate_tile_offset
 from osm3d.geospatial.tiling import TileKey, tile_of
-from osm3d.reconstruction.roof_fitting import FitParams, fit_roof
+from osm3d.reconstruction.roof_fitting import (
+    FitParams,
+    RoofFit,
+    fit_roof,
+    group_beats_individuals,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,13 +65,43 @@ def _shift(geom, offset: tuple[float, float]):  # type: ignore[no-untyped-def]
     return shapely.transform(geom, lambda c: c + np.array([dx, dy]))
 
 
+def _fit_params(cfg: Config) -> FitParams:
+    return FitParams(
+        candidates=tuple(cfg.roofs.candidate_shapes),
+        max_rmse_m=cfg.roofs.max_rmse_m,
+        flat_max_slope_deg=cfg.roofs.flat_max_slope_deg,
+        min_points=cfg.heights.min_points_per_building,
+        height_percentile=cfg.heights.roof_percentile,
+    )
+
+
+def _roof_flags(fit: RoofFit, cfg: Config) -> list[QAFlag]:
+    flags: list[QAFlag] = []
+    if fit.roof.shape.value is RoofShape.UNKNOWN:
+        flags.append(_flag("roof_shape_unknown", "Nenhum modelo de telhado se ajusta bem"))
+    elif fit.roof.shape.confidence < cfg.roofs.min_shape_confidence:
+        flags.append(
+            _flag("roof_shape_low_confidence", f"Confiança {fit.roof.shape.confidence:.2f}")
+        )
+    return flags
+
+
+def _height_flags(height: float) -> list[QAFlag]:
+    if 2.0 <= height <= 60.0:
+        return []
+    return [_flag("height_outlier", f"Altura {height:.1f} m implausível")]
+
+
+_ROOF_FLAG_CODES = {"roof_shape_unknown", "roof_shape_low_confidence", "height_outlier"}
+
+
 def reconstruct_building(
     building: Building,
     points: PointSet,
     dtm: DtmMosaic,
     offset: tuple[float, float],
     cfg: Config,
-) -> Building:
+) -> tuple[Building, RoofFit | None]:
     footprint = building.footprint
     area = float(footprint.area)
     rect_area = float(footprint.minimum_rotated_rectangle.area) or area
@@ -91,7 +127,7 @@ def reconstruct_building(
     }
     if ground is None:
         flags.append(_flag("no_ground", "Sem MDT à volta do edifício", "error"))
-        return building.model_copy(update=update | {"qa_flags": flags, "parts": []})
+        return building.model_copy(update=update | {"qa_flags": flags, "parts": []}), None
     if len(points) == 0 or diagnostics["point_density"] < MIN_POINT_DENSITY:
         flags.append(
             _flag(
@@ -101,32 +137,111 @@ def reconstruct_building(
             )
         )
         if len(points) < cfg.heights.min_points_per_building:
-            return building.model_copy(update=update | {"qa_flags": flags, "parts": []})
+            return building.model_copy(update=update | {"qa_flags": flags, "parts": []}), None
 
-    params = FitParams(
-        candidates=tuple(cfg.roofs.candidate_shapes),
-        max_rmse_m=cfg.roofs.max_rmse_m,
-        flat_max_slope_deg=cfg.roofs.flat_max_slope_deg,
-        min_points=cfg.heights.min_points_per_building,
-        height_percentile=cfg.heights.roof_percentile,
-    )
-    fit = fit_roof(_shift(footprint, offset), points, ground, params)
+    fit = fit_roof(_shift(footprint, offset), points, ground, _fit_params(cfg))
     if fit.best is not None:
         diagnostics["rmse_m"] = fit.best.rmse_m
         diagnostics["inlier_ratio"] = fit.best.inlier_ratio
-    if fit.roof.shape.value is RoofShape.UNKNOWN:
-        flags.append(_flag("roof_shape_unknown", "Nenhum modelo de telhado se ajusta bem"))
-    elif fit.roof.shape.confidence < cfg.roofs.min_shape_confidence:
-        flags.append(
-            _flag("roof_shape_low_confidence", f"Confiança {fit.roof.shape.confidence:.2f}")
-        )
-    if not 2.0 <= fit.height.value <= 60.0:
-        flags.append(_flag("height_outlier", f"Altura {fit.height.value:.1f} m implausível"))
+    flags += _roof_flags(fit, cfg) + _height_flags(fit.height.value)
 
     part = BuildingPart(
         id=f"{building.key}#1", geometry=footprint, height=fit.height, roof=fit.roof
     )
-    return building.model_copy(update=update | {"qa_flags": flags, "parts": [part]})
+    return building.model_copy(update=update | {"qa_flags": flags, "parts": [part]}), fit
+
+
+def attached_clusters(footprints: list[BaseGeometry], gap_m: float = 0.3) -> list[list[int]]:
+    """Grupos (≥ 2) de footprints encostados entre si, a menos de ``gap_m``."""
+    parent = list(range(len(footprints)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    tree = shapely.STRtree(footprints)
+    src, dst = tree.query([f.buffer(gap_m) for f in footprints], predicate="intersects")
+    for i, j in zip(src.tolist(), dst.tolist(), strict=True):
+        if i != j:
+            parent[find(i)] = find(j)
+    groups: dict[int, list[int]] = defaultdict(list)
+    for i in range(len(footprints)):
+        groups[find(i)].append(i)
+    return [g for g in groups.values() if len(g) >= 2]
+
+
+def apply_shared_roofs(
+    results: list[Building],
+    fits: list[RoofFit | None],
+    point_sets: list[PointSet],
+    offset: tuple[float, float],
+    cfg: Config,
+    max_group: int = 12,
+) -> int:
+    """Telhados contínuos sobre edifícios encostados (casas geminadas/em banda).
+
+    Para cada grupo de edifícios encostados com planta conjunta retangular, ajusta um
+    único telhado ao conjunto. Se esse telhado explicar os pontos melhor do que os
+    telhados individuais (mesmo critério penalizado), cada edifício recebe a forma,
+    altura de telhado e orientação do conjunto. Devolve o n.º de edifícios alterados.
+    """
+    changed = 0
+    params = _fit_params(cfg)
+    for cluster in attached_clusters([b.footprint for b in results]):
+        members = [
+            i
+            for i in cluster
+            if (f := fits[i]) is not None
+            and f.best is not None
+            and results[i].ground_elevation_m is not None
+        ]
+        if not 2 <= len(members) <= max_group:
+            continue
+        # Fecha as pequenas folgas entre paredes antes de medir a planta conjunta.
+        union = shapely.union_all(
+            [results[i].footprint.buffer(0.3, join_style="mitre") for i in members]
+        ).buffer(-0.3, join_style="mitre")
+        if not isinstance(union, Polygon) or union.is_empty:
+            continue
+        if union.area / union.minimum_rotated_rectangle.area < MIN_RECTANGULARITY:
+            continue
+
+        grounds = [results[i].ground_elevation_m for i in members]
+        pts = PointSet.concat(point_sets[i] for i in members)
+        group_fit = fit_roof(
+            _shift(union, offset), pts, min(g for g in grounds if g is not None), params
+        )
+        if (
+            group_fit.best is None
+            or group_fit.roof.shape.value is RoofShape.UNKNOWN
+            or group_fit.roof.shape.confidence < cfg.roofs.min_shape_confidence
+            or not group_beats_individuals(group_fit.best, [fits[i].best for i in members])  # type: ignore[union-attr,misc]
+        ):
+            continue
+
+        group_keys = ",".join(results[i].key for i in members)
+        for i in members:
+            b = results[i]
+            assert b.ground_elevation_m is not None
+            height = Estimate[float](
+                value=group_fit.best.top_z - b.ground_elevation_m,
+                confidence=group_fit.height.confidence,
+                source=Source.LIDAR,
+            )
+            part = BuildingPart(
+                id=f"{b.key}#1", geometry=b.footprint, height=height, roof=group_fit.roof
+            )
+            flags = [f for f in b.qa_flags if f.code not in _ROOF_FLAG_CODES]
+            flags += _height_flags(height.value)
+            flags.append(_flag("shared_roof", f"Telhado contínuo com: {group_keys}", "info"))
+            diagnostics = dict(b.diagnostics, roof_group_size=float(len(members)))
+            results[i] = b.model_copy(
+                update={"parts": [part], "qa_flags": flags, "diagnostics": diagnostics}
+            )
+            changed += 1
+    return changed
 
 
 def reconstruct_area(
@@ -173,6 +288,15 @@ def reconstruct_area(
                     f"desloc. ({offset[0]:+.2f}, {offset[1]:+.2f}) m, IoU {iou0:.3f}→{iou1:.3f}"
                 )
             indices = assign_points(points, [b.footprint for b in group], offset)
-            for b, idx in zip(group, indices, strict=True):
-                results.append(reconstruct_building(b, points.subset(idx), dtm, offset, cfg))
+            point_sets = [points.subset(idx) for idx in indices]
+            tile_results: list[Building] = []
+            fits: list[RoofFit | None] = []
+            for b, pts in zip(group, point_sets, strict=True):
+                built, fit = reconstruct_building(b, pts, dtm, offset, cfg)
+                tile_results.append(built)
+                fits.append(fit)
+            shared = apply_shared_roofs(tile_results, fits, point_sets, offset, cfg)
+            if progress and shared:
+                progress(f"  quadrícula {tile}: {shared} edifícios com telhado partilhado")
+            results.extend(tile_results)
     return results, reports

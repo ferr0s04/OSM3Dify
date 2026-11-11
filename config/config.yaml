@@ -59,7 +59,11 @@ roofs:
   flat_max_slope_deg: 5.0
   # Abaixo deste valor de confiança a forma é exportada como desconhecida (não é tag).
   min_shape_confidence: 0.7
-  max_rmse_m: 0.35
+  # RMSE máximo do melhor modelo; acima disto a forma fica "unknown" (vai para revisão).
+  # Calibrado em Vila do Conde (82 edifícios com roof:shape): 0.20 → exatidão 87 %,
+  # cobertura 67 %; 0.35 → 79 % / 85 %. Os erros concentram-se em RMSE 0.24–0.27 m
+  # (telhados complexos para os quais "skillion" era só o modelo menos mau).
+  max_rmse_m: 0.20
 
 appearance:
   enabled: false                   # Fase 5
@@ -71,3 +75,5 @@ export:
   roof_height_rounding_m: 0.5
   overwrite_existing_tags: false   # nunca sobrescrever tags mapeadas por humanos por omissão
   export_parts_to_osm: false       # Fase 6
+  include_pending: true            # exportar não revistos sem sinalizações (revisão no JOSM)
+  josm_upload: never               # JOSM recusa upload até a licença DGT↔ODbL estar resolvida

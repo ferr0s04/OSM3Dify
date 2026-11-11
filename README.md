@@ -9,19 +9,18 @@ O resultado não é um modelo fotorealista nem uma malha 3D: são **tags
 `building:part`…) em edifícios OSM existentes, que é o que os mapas 3D (F4 Map,
 OSM2World, Streets GL…) interpretam.
 
-> **Estado:** em desenvolvimento. O pipeline já corre de ponta a ponta até QA
-> sobre dados reais de Vila do Conde.
+> **Estado:** em desenvolvimento. O pipeline corre de ponta a ponta sobre dados
+> reais de Vila do Conde, até à exportação `.osm` para o JOSM.
 >
-> - Exatidão de `roof:shape` face às tags do OSM: **79 %**.
-> - Edifícios isolados: **88 %**.
+> - Exatidão de `roof:shape` face às tags do OSM: **87 %**, com 67 % de cobertura.
+>   Os casos incertos ficam para revisão.
 >
 > Ver [resultados](docs/area-de-estudo.md#primeiros-resultados-quadrículas-155480--156480-2026-11-11).
 >
 > Por fazer:
-> - telhados partilhados por edifícios encostados;
+> - validação manual de `flat` e `skillion`;
 > - partes (`building:part`);
-> - cores;
-> - exportação `.osm` para o JOSM.
+> - cores.
 
 ## Documentação
 
@@ -72,7 +71,11 @@ uv run osm3d dgt -t 155480 --dry-run   # verificar disponibilidade no Centro de 
 uv run osm3d dgt -t 155480             # descarregar LAZ + MDT (credenciais em .env)
 uv run osm3d run --from prepare --to qa  # reconstrução → GeoPackage
 uv run osm3d evaluate                  # comparar com as tags roof:shape/building:levels do OSM
+uv run osm3d stage export              # .osm para rever no JOSM (+ relatório de conflitos)
 ```
+
+O `.osm` exportado tem `upload="never"`: o JOSM abre-o e valida-o, mas recusa o upload
+enquanto a licença DGT↔ODbL não estiver resolvida (`export.josm_upload` no config).
 
 O download da DGT precisa de `DGT_USER` e `DGT_PASSWORD` num ficheiro `.env` na raiz
 do repositório, que não é versionado.

@@ -82,6 +82,12 @@ def test_merge_with_overwrite() -> None:
     assert result.changed == {"height": ("9", "8.5")}
 
 
+def test_merge_synonyms_are_not_conflicts() -> None:
+    result = merge_tags({"roof:shape": "lean_to"}, {"roof:shape": "skillion"})
+    assert result.tags["roof:shape"] == "lean_to"
+    assert not result.conflicts and not result.has_changes
+
+
 def test_merge_identical_is_noop() -> None:
     result = merge_tags({"height": "8.5"}, {"height": "8.5"})
     assert not result.has_changes
