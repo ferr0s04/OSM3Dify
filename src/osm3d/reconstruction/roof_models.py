@@ -32,6 +32,8 @@ N_PARAMS: dict[RoofShape, int] = {
     RoofShape.HIPPED: 3,  # + comprimento da cumeeira (procurado em grelha)
     RoofShape.SIDE_HIPPED: 3,  # + comprimento da cumeeira (+ ponta, discreta)
     RoofShape.PYRAMIDAL: 2,
+    # Como o gabled (eixo ao longo/através): mesma penalização, decide o ajuste.
+    RoofShape.ROUND: 3,
 }
 
 
@@ -135,6 +137,11 @@ def roof_surface(
             rel = np.minimum(1 - av / b, (a - u) / hip_length)
         case RoofShape.PYRAMIDAL:
             rel = np.minimum(1 - au / a, 1 - av / b)
+        case RoofShape.ROUND:
+            # Abóbada com o eixo em u: secção em arco (semi-elipse de flecha h sobre a
+            # meia-largura b). Sobe a pique junto aos beirais e é quase plana no topo,
+            # o que a distingue do gabled (águas retas).
+            rel = np.sqrt(np.clip(1 - (av / b) ** 2, 0.0, 1.0))
         case _:
             raise ValueError(f"Forma sem modelo paramétrico: {shape}")
     return z0 + h * np.clip(rel, 0.0, 1.0)

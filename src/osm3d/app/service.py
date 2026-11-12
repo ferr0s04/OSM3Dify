@@ -111,6 +111,11 @@ class ReviewService:
         if self.source is None:
             raise FileNotFoundError("Sem resultados: correr primeiro `osm3d run --to qa`")
         self.base: dict[str, Building] = {b.key: b for b in read_buildings(self.source)}
+        # Edifícios em falta no OSM (fase candidates, opcional): revistos como os outros,
+        # com a chave "new/<id>".
+        candidates = artefact_path(cfg, Stage.CANDIDATES)
+        if candidates.exists():
+            self.base |= {b.key: b for b in read_buildings(candidates)}
         self.store = ReviewStore(review_store_path(cfg))
         self.reviews: dict[str, Review] = self.store.all()
         self.points = TilePointCache(
@@ -179,6 +184,7 @@ class ReviewService:
             "n_conflicts": len(change.conflicts),
             "osm_parts": change.osm_parts,
             "key": b.key,
+            "candidate": b.osm_type == "new",  # em falta no OSM, detetado no LiDAR
             "status": b.review_status,
             "archived": b.review_archived,
             "needs_review": b.needs_review,
@@ -223,6 +229,7 @@ class ReviewService:
                             "osm3d",
                             "change",
                             "archived",
+                            "candidate",
                         )
                     }
                     | {"flags": ",".join(row["flags"])},
@@ -328,7 +335,11 @@ class ReviewService:
             "osm_type": b.osm_type,
             "osm_id": b.osm_id,
             "osm_version": b.osm_version,
-            "osm_url": f"https://www.openstreetmap.org/{b.osm_type}/{b.osm_id}",
+            "osm_url": (
+                None
+                if b.osm_type == "new"
+                else f"https://www.openstreetmap.org/{b.osm_type}/{b.osm_id}"
+            ),
             "note": b.review_note,
             "overrides": review.overrides.model_dump() if review else Overrides().model_dump(),
             "reviewed_at": review.reviewed_at.isoformat() if review else None,
@@ -595,6 +606,8 @@ class ReviewService:
         )
 
     def _editable(self, b: Building) -> str | None:
+        if b.osm_type == "new":
+            return "Edifício novo (em falta no OSM): dividir em partes depois de criado no OSM"
         if b.osm_type != "way":
             return "Divisão em partes só para contornos simples (way), não multipolígonos"
         if b.osm_parts:

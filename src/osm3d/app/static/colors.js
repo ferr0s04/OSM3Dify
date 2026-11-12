@@ -7,6 +7,7 @@ export const SHAPE_COLORS = {
   hipped: "#f59e0b",
   side_hipped: "#d946ef",
   pyramidal: "#0ea5a4",
+  round: "#16a34a",
   unknown: "#c4c9d1",
 };
 
@@ -29,6 +30,7 @@ export const SHAPE_LABELS = {
   hipped: "quatro águas",
   side_hipped: "três águas",
   pyramidal: "pirâmide",
+  round: "abóbada (meia-lua)",
   unknown: "desconhecido",
 };
 

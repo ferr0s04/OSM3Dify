@@ -2,7 +2,7 @@
 import { api } from "./api.js";
 import { CHANGE_COLORS, CHANGE_LABELS, SHAPE_LABELS } from "./colors.js";
 import { DataView } from "./data.js";
-import { BuildingMap } from "./map.js";
+import { BuildingMap, basemapOptions } from "./map.js";
 import { renderResults } from "./results.js";
 import { Viewer } from "./viewer.js";
 import { PART_COLORS, PartsEditor } from "./parts-editor.js";
@@ -10,7 +10,7 @@ import { PART_COLORS, PartsEditor } from "./parts-editor.js";
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const fmt = (v, unit = "") => (v === null || v === undefined ? "—" : `${v}${unit}`);
-const SHAPES = ["flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "unknown"];
+const SHAPES = ["flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "round", "unknown"];
 const OVERRIDE_FIELDS = ["ground", "roof_shape", "height", "roof_height", "roof_orientation", "roof_direction", "roof_colour", "building_colour"];
 const COLOUR_SOURCE = { "omissão": "sem tag: cor por omissão", OSM: "já no OSM", estimada: "estimada (LiDAR)", manual: "corrigida" };
 
@@ -36,7 +36,7 @@ const state = {
 
 const viewer = new Viewer($("#viewer"));
 const map = new BuildingMap("map", $("#legend"), (key) => select(key));
-const dataView = new DataView({ mapEl: $("#data-map"), panelEl: $("#data-panel"), hoverEl: $("#data-hover"), toast: (m, ms) => toast(m, ms) });
+const dataView = new DataView({ mapEl: $("#data-map"), panelEl: $("#data-panel"), hoverEl: $("#data-hover"), baseEl: $("#d-base"), toast: (m, ms) => toast(m, ms) });
 
 function toast(msg, ms = 3500) {
   const el = $("#toast");
@@ -55,19 +55,37 @@ function priority(r) {
 }
 
 function chosen(group) {
-  // Botões ativos de um grupo de filtros (nenhum ativo = todos).
-  return new Set([...document.querySelectorAll(`.fgroup[data-group="${group}"] button.on`)].map((b) => b.dataset.v));
+  // Opções marcadas num dropdown de filtros (nenhuma = todos).
+  return new Set([...document.querySelectorAll(`.msel[data-group="${group}"] input:checked`)].map((i) => i.value));
+}
+
+function renderFilterLabels() {
+  // Texto de cada dropdown: "estado: todos", "estado: aceites", "estado: 2 de 3".
+  document.querySelectorAll(".msel").forEach((d) => {
+    const boxes = [...d.querySelectorAll("input")];
+    const on = boxes.filter((b) => b.checked);
+    const names = on.map((b) => b.parentElement.textContent.trim());
+    const value = !on.length ? (d.dataset.group === "extra" ? "—" : "todos") : on.length === 1 ? names[0] : `${on.length} de ${boxes.length}`;
+    d.querySelector("summary").innerHTML = `<span class="flabel">${d.dataset.label}</span> ${value}`;
+    d.classList.toggle("on", on.length > 0);
+    d.dataset.hint ??= d.title;
+    d.title = on.length ? `${d.dataset.label}: ${names.join(", ")}` : d.dataset.hint;
+  });
 }
 
 function applyFilters() {
+  renderFilterLabels();
   const q = $("#f-search").value.trim();
   const change = chosen("change");
   const status = chosen("status");
-  const flagged = $("#f-flagged").checked;
-  const showArchived = $("#f-archived").checked;
+  const origin = chosen("origin");
+  const extra = chosen("extra");
+  const flagged = extra.has("flagged");
+  const showArchived = extra.has("archived");
   const rows = state.rows.filter(
     (r) =>
       (!q || r.key.includes(q)) &&
+      (!origin.size || origin.has(r.candidate ? "new" : "osm")) &&
       (!change.size || change.has(r.change)) &&
       (!status.size || status.has(r.status)) &&
       (!flagged || r.needs_review) &&
@@ -154,7 +172,7 @@ function renderGround(d, val, t) {
 function renderOsmChange(d) {
   // Destaque da relação com o OSM: já há 3D mapeado? a análise acrescenta ou diverge?
   const c = d.osm_change;
-  if (!c) return "";
+  if (!c || d.candidate) return ""; // edifício novo: não há nada no OSM para comparar
   const kind = c.kind;
   const existing = Object.entries(c.existing_3d);
   const conflicts = Object.entries(d.tags.conflicts);
@@ -205,9 +223,12 @@ function renderDetail() {
       ${d.archived ? '<span class="chip" title="Arquivado: fora da lista e das exportações">arquivado</span>' : ""}
       ${d.edited ? '<span class="chip">corrigido</span>' : ""}</h2>
     <div class="links">
-      <a href="${d.osm_url}" target="_blank" rel="noopener">abrir no OSM ↗</a>
-      <a href="#" id="josm-link" data-obj="${josmType}${d.osm_id}">carregar no JOSM</a>
-      <span class="muted">v${d.osm_version} · ${esc(d.existing_tags.building ?? "")} · ${fmt(d.area, " m²")}</span>
+      ${d.osm_url
+        ? `<a href="${d.osm_url}" target="_blank" rel="noopener">abrir no OSM ↗</a>
+           <a href="#" id="josm-link" data-obj="${josmType}${d.osm_id}">carregar no JOSM</a>
+           <span class="muted">v${d.osm_version} · ${esc(d.existing_tags.building ?? "")} · ${fmt(d.area, " m²")}</span>`
+        : `<span class="chip candidate" title="Pontos de edifício no LiDAR sem contorno no OSM">em falta no OSM</span>
+           <span class="muted">contorno do LiDAR (inclui beirais) · ${fmt(d.area, " m²")} · ao aceitar, é exportado como edifício novo</span>`}
     </div>
     ${renderOsmChange(d)}
     <div class="actions">
@@ -261,7 +282,7 @@ function renderDetail() {
   $("#b-accept").onclick = () => review("accepted");
   $("#b-reject").onclick = () => review("rejected");
   $("#b-reset").onclick = () => resetReview();
-  $("#josm-link").onclick = (e) => {
+  if ($("#josm-link")) $("#josm-link").onclick = (e) => {
     e.preventDefault();
     const obj = e.target.dataset.obj;
     fetch(`http://127.0.0.1:8111/load_object?objects=${obj}&relation_members=true`, { mode: "no-cors" })
@@ -346,18 +367,26 @@ async function resetReview() {
 // ------------------------------------------------------------- arranque
 
 function wire() {
-  $("#f-archived").addEventListener("input", applyFilters);
-  document.querySelectorAll(".fgroup button").forEach((b) =>
-    b.addEventListener("click", () => {
-      b.classList.toggle("on");
-      applyFilters();
+  document.querySelectorAll(".msel input").forEach((i) => i.addEventListener("input", applyFilters));
+  document.querySelectorAll(".msel").forEach((d) =>
+    d.addEventListener("toggle", () => {
+      // Só um menu aberto de cada vez.
+      if (d.open) document.querySelectorAll(".msel[open]").forEach((o) => o !== d && (o.open = false));
     }),
   );
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".msel")) document.querySelectorAll(".msel[open]").forEach((o) => (o.open = false));
+  });
+  $("#f-clear").addEventListener("click", () => {
+    document.querySelectorAll(".msel input").forEach((i) => (i.checked = false));
+    $("#f-search").value = "";
+    applyFilters();
+  });
   $("#archive-action").addEventListener("input", (e) => archiveAction(e.target));
-  ["#f-search", "#f-flagged"].forEach((s) =>
-    $(s).addEventListener("input", applyFilters),
-  );
+  $("#f-search").addEventListener("input", applyFilters);
   $("#m-color").addEventListener("input", (e) => map.setColorMode(e.target.value));
+  basemapOptions($("#m-base")).then((kind) => map.setBasemap(kind));
+  $("#m-base").addEventListener("input", (e) => map.setBasemap(e.target.value));
   $("#m-3d").addEventListener("input", async (e) => {
     const on = e.target.checked;
     if (on) toast("A preparar os telhados 3D de toda a área…", 2500);
@@ -588,7 +617,7 @@ function renderPartsSection() {
   }
   const n = state.parts.layout.parts.length;
   const ov = (i, f) => state.parts.overrides[i]?.[f] ?? "";
-  const shapeOpts = (i) => ["", "flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal"]
+  const shapeOpts = (i) => ["", "flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "round"]
     .map((s) => `<option value="${s}" ${ov(i, "roof_shape") === s ? "selected" : ""}>${s ? SHAPE_LABELS[s] : "— estimado —"}</option>`).join("");
   el.innerHTML = `
     <div id="parts-problems" class="problems"></div>

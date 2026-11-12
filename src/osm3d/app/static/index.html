@@ -39,18 +39,43 @@
 
     <section class="map-pane">
       <div id="map"></div>
+      <!-- Filtros e controlos do mapa numa só coluna: nunca se sobrepõem. -->
+      <div class="map-toolbar">
       <div class="filterbar" id="filterbar">
         <input id="f-search" type="search" placeholder="id OSM…" title="Procurar por id OSM">
-        <span class="fgroup" data-group="change" title="Relação com o OSM (nenhum = todos)">
-          <span class="flabel">OSM</span>
-          <button data-v="novo">novo</button><button data-v="complementa">complementa</button><button data-v="diverge">diverge</button><button data-v="igual">igual</button>
-        </span>
-        <span class="fgroup" data-group="status" title="Estado da revisão (nenhum = todos)">
-          <span class="flabel">estado</span>
-          <button data-v="pending">por rever</button><button data-v="accepted">aceites</button><button data-v="rejected">rejeitados</button>
-        </span>
-        <label class="check" title="Só edifícios com sinalizações (rever primeiro)"><input id="f-flagged" type="checkbox"> sinalizados</label>
-        <label class="check" title="Mostrar aceites já submetidos e rejeitados arquivados"><input id="f-archived" type="checkbox"> arquivados</label>
+        <!-- Dropdowns multi-seleção (nada marcado = todos). -->
+        <details class="msel" data-group="origin" data-label="origem" title="Edifícios do OSM ou em falta no OSM (detetados no LiDAR)">
+          <summary></summary>
+          <div class="msel-menu">
+            <label><input type="checkbox" value="osm"> do OSM</label>
+            <label><input type="checkbox" value="new"> em falta no OSM</label>
+          </div>
+        </details>
+        <details class="msel" data-group="change" data-label="relação OSM" title="O que a análise muda no OSM">
+          <summary></summary>
+          <div class="msel-menu">
+            <label><input type="checkbox" value="novo"> novo (sem 3D)</label>
+            <label><input type="checkbox" value="complementa"> complementa</label>
+            <label><input type="checkbox" value="diverge"> diverge</label>
+            <label><input type="checkbox" value="igual"> igual</label>
+          </div>
+        </details>
+        <details class="msel" data-group="status" data-label="estado" title="Estado da revisão">
+          <summary></summary>
+          <div class="msel-menu">
+            <label><input type="checkbox" value="pending"> por rever</label>
+            <label><input type="checkbox" value="accepted"> aceites</label>
+            <label><input type="checkbox" value="rejected"> rejeitados</label>
+          </div>
+        </details>
+        <details class="msel" data-group="extra" data-label="mais" title="Sinalizados e arquivados">
+          <summary></summary>
+          <div class="msel-menu">
+            <label title="Só edifícios com sinalizações (rever primeiro)"><input type="checkbox" value="flagged"> só sinalizados</label>
+            <label title="Mostrar aceites já submetidos e rejeitados arquivados"><input type="checkbox" value="archived"> incluir arquivados</label>
+          </div>
+        </details>
+        <button class="btn mini-light" id="f-clear" title="Limpar todos os filtros">✕</button>
         <span id="f-count" class="muted small"></span>
         <span class="hint small muted" title="J/K seguinte/anterior · A aceitar · R rejeitar · U repor"><kbd>J</kbd>/<kbd>K</kbd></span>
       </div>
@@ -63,6 +88,8 @@
           <option value="shape">Cor: forma do telhado (análise)</option>
         </select>
         <label class="check"><input id="m-3d" type="checkbox"> 3D</label>
+        <select id="m-base" title="Fundo do mapa"><option value="osm">Fundo: mapa OSM</option></select>
+      </div>
       </div>
       <div id="legend" class="legend"></div>
     </section>
@@ -104,6 +131,7 @@
   <main id="view-data" class="view data-layout hidden">
     <section class="map-pane">
       <div id="data-map"></div>
+      <div class="map-controls data-base"><select id="d-base" title="Fundo do mapa"><option value="osm">Fundo: mapa OSM</option></select></div>
       <div id="data-hover" class="legend data-legend"></div>
     </section>
     <section id="data-panel" class="data-panel detail"></section>

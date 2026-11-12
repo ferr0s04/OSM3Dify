@@ -31,6 +31,7 @@ SHAPE_LABELS = [
     "hipped",
     "side_hipped",
     "pyramidal",
+    "round",
     "outra",
     "unknown",
 ]

@@ -33,6 +33,39 @@ def test_gabled(azimuth: float, across: bool) -> None:
 
 
 @pytest.mark.parametrize("azimuth", AZIMUTHS)
+@pytest.mark.parametrize("across", [False, True])
+def test_round(azimuth: float, across: bool) -> None:
+    # Estufa / pavilhão em abóbada: 30 × 8 m, flecha de 2,5 m.
+    syn = make_roof(
+        RoofShape.ROUND,
+        length=30,
+        width=8,
+        azimuth_deg=azimuth,
+        across=across,
+        eave_z=102.0,
+        roof_height=2.5,
+        seed=11,
+    )
+    fit = fit_roof(syn.footprint, syn.points, syn.ground_z)
+    _check_common(fit, syn, RoofShape.ROUND)
+    expected_axis = azimuth + (90.0 if across else 0.0)
+    assert axis_difference_deg(fit.roof.ridge_azimuth_deg, expected_axis) < 1.0
+    tags = part_to_tags(
+        BuildingPart(id="p", geometry=syn.footprint, height=fit.height, roof=fit.roof)
+    )
+    assert tags["roof:shape"] == "round" and tags["roof:height"] == "2.5"
+    assert ("roof:orientation" in tags) is across  # "along" é o valor por omissão
+
+
+@pytest.mark.parametrize("roof_height", [1.5, 3.0, 5.0])
+def test_gabled_is_not_mistaken_for_round(roof_height: float) -> None:
+    # Duas águas, de baixa a alta inclinação: o arco não deve ganhar ao telhado reto.
+    syn = make_roof(RoofShape.GABLED, roof_height=roof_height, seed=5)
+    fit = fit_roof(syn.footprint, syn.points, syn.ground_z)
+    assert fit.roof.shape.value is RoofShape.GABLED
+
+
+@pytest.mark.parametrize("azimuth", AZIMUTHS)
 def test_hipped(azimuth: float) -> None:
     syn = make_roof(RoofShape.HIPPED, azimuth_deg=azimuth)
     fit = fit_roof(syn.footprint, syn.points, syn.ground_z)

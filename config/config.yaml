@@ -63,7 +63,8 @@ heights:
 
 roofs:
   # side_hipped = "três águas": hip numa ponta, empena na outra (roof:direction = ponta em hip).
-  candidate_shapes: [flat, skillion, gabled, hipped, side_hipped, pyramidal]
+  # round = abóbada / meia-lua (estufas, pavilhões); eixo via roof:orientation.
+  candidate_shapes: [flat, skillion, gabled, hipped, side_hipped, pyramidal, round]
   flat_max_slope_deg: 5.0
   # Abaixo deste valor de confiança a forma é exportada como desconhecida (não é tag).
   min_shape_confidence: 0.7

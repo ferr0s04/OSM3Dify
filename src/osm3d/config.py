@@ -139,6 +139,7 @@ class RoofsConfig(BaseModel):
         RoofShape.HIPPED,
         RoofShape.SIDE_HIPPED,
         RoofShape.PYRAMIDAL,
+        RoofShape.ROUND,
     ]
     flat_max_slope_deg: float = 5.0
     min_shape_confidence: float = Field(default=0.7, ge=0, le=1)

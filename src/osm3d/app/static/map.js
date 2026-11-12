@@ -12,6 +12,8 @@ import {
 
 // Contorno dos edifícios que já têm informação 3D no OSM (destacados em todos os modos).
 const OSM3D_LINE = "#7c3aed";
+// Contorno dos edifícios em falta no OSM (detetados no LiDAR).
+const CANDIDATE_LINE = "#ea580c";
 
 const EARTH_CIRCUMFERENCE = 2 * Math.PI * 6378137;
 
@@ -142,9 +144,59 @@ export const BASEMAP = {
       maxzoom: 19,
       attribution: "© contribuidores OpenStreetMap",
     },
+    // Ortofotos descarregadas (separador Dados), servidas pela própria aplicação.
+    ortho: {
+      type: "raster",
+      tiles: [`${location.origin}/api/ortho/{z}/{x}/{y}.png`],
+      tileSize: 256,
+      minzoom: 10,
+      maxzoom: 19,
+      attribution: "Ortofotos © DGT",
+    },
   },
-  layers: [{ id: "osm", type: "raster", source: "osm", paint: { "raster-saturation": -0.6, "raster-opacity": 0.85 } }],
+  layers: [
+    { id: "osm", type: "raster", source: "osm", paint: { "raster-saturation": -0.6, "raster-opacity": 0.85 } },
+    { id: "ortho", type: "raster", source: "ortho", layout: { visibility: "none" } },
+  ],
 };
+
+// Fundo do mapa: "osm" (mapa) ou "ortho" (ortofotos locais; o mapa fica por baixo, onde
+// não houver ortofoto). A escolha fica guardada no browser.
+const BASEMAP_KEY = "osm3d.basemap";
+
+export function savedBasemap() {
+  try {
+    return localStorage.getItem(BASEMAP_KEY) === "ortho" ? "ortho" : "osm";
+  } catch {
+    return "osm";
+  }
+}
+
+export function applyBasemap(map, kind) {
+  try { localStorage.setItem(BASEMAP_KEY, kind); } catch { /* sem armazenamento */ }
+  if (!map.getLayer("ortho")) return;
+  const ortho = kind === "ortho";
+  map.setLayoutProperty("ortho", "visibility", ortho ? "visible" : "none");
+  map.setPaintProperty("osm", "raster-opacity", ortho ? 0.55 : 0.85);
+}
+
+// Opções do seletor de fundo; sem ortofotos descarregadas, a opção fica desativada.
+export async function basemapOptions(select) {
+  let info = { available: false, files: [] };
+  try {
+    info = await (await fetch("/api/ortho/info")).json();
+  } catch { /* sem ortofotos */ }
+  const years = [...new Set(info.files.map((f) => f.year).filter(Boolean))].sort().join(", ");
+  select.innerHTML =
+    `<option value="osm">Fundo: mapa OSM</option>` +
+    `<option value="ortho" ${info.available ? "" : "disabled"}>Fundo: ortofoto${years ? ` ${years}` : " (sem ficheiros)"}</option>`;
+  select.title = info.available
+    ? `${info.files.length} ortofoto(s) descarregada(s); fora delas vê-se o mapa`
+    : "Sem ortofotos descarregadas: descarregar no separador Dados (produto ortofotos)";
+  const kind = info.available ? savedBasemap() : "osm";
+  select.value = kind;
+  return kind;
+}
 
 function matchExpr(prop, palette, fallback) {
   const expr = ["match", ["to-string", ["get", prop]]];
@@ -197,14 +249,14 @@ export class BuildingMap {
     const color = COLOR_MODES[this.mode].expr;
     this.map.addLayer({
       id: "b-fill", type: "fill", source: "buildings",
-      paint: { "fill-color": color, "fill-opacity": 0.7 },
+      paint: { "fill-color": color, "fill-opacity": this.fillOpacity() },
     });
 
     this.map.addLayer({
       id: "b-line", type: "line", source: "buildings",
       paint: {
-        "line-color": ["case", ["boolean", ["feature-state", "selected"], false], "#1d4ed8", ["get", "osm3d"], OSM3D_LINE, ["get", "needs_review"], "#b45309", "#374151"],
-        "line-width": ["case", ["boolean", ["feature-state", "selected"], false], 3.5, ["get", "osm3d"], 2.4, ["get", "needs_review"], 1.4, 0.6],
+        "line-color": ["case", ["boolean", ["feature-state", "selected"], false], "#1d4ed8", ["get", "candidate"], CANDIDATE_LINE, ["get", "osm3d"], OSM3D_LINE, ["get", "needs_review"], "#b45309", "#374151"],
+        "line-width": ["case", ["boolean", ["feature-state", "selected"], false], 3.5, ["get", "candidate"], 2.4, ["get", "osm3d"], 2.4, ["get", "needs_review"], 1.4, 0.6],
       },
     });
     this.applyFilter();
@@ -247,9 +299,22 @@ export class BuildingMap {
     this.renderLegend();
   }
 
+  fillOpacity() {
+    // Sobre a ortofoto, o preenchimento fica mais leve para se verem os telhados reais.
+    return this.is3d ? 0 : this.basemap === "ortho" ? 0.3 : 0.7;
+  }
+
+  async setBasemap(kind) {
+    await this.ready;
+    this.basemap = kind;
+    applyBasemap(this.map, kind);
+    if (this.map.getLayer("b-fill")) this.map.setPaintProperty("b-fill", "fill-opacity", this.fillOpacity());
+  }
+
   async set3D(on, loadScene) {
     // 3D: telhados com forma e cores inferidas; o polígono 2D fica invisível mas clicável.
-    this.map.setPaintProperty("b-fill", "fill-opacity", on ? 0 : 0.7);
+    this.is3d = on;
+    this.map.setPaintProperty("b-fill", "fill-opacity", this.fillOpacity());
     this.map.easeTo({ pitch: on ? 55 : 0, duration: 600 });
     if (on && !this.roofs) {
       const scene = await loadScene();
@@ -288,6 +353,7 @@ export class BuildingMap {
     this.legendEl.innerHTML = Object.entries(legend)
       .map(([k, c]) => `<div><span class="sw" style="background:${c}"></span>${labels[k] ?? k}</div>`)
       .join("") +
-      `<div><span class="sw" style="background:none;border:2.5px solid ${OSM3D_LINE}"></span>já com 3D no OSM</div>`;
+      `<div><span class="sw" style="background:none;border:2.5px solid ${OSM3D_LINE}"></span>já com 3D no OSM</div>` +
+      `<div><span class="sw" style="background:none;border:2.5px solid ${CANDIDATE_LINE}"></span>em falta no OSM (LiDAR)</div>`;
   }
 }

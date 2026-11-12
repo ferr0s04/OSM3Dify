@@ -132,7 +132,7 @@ def test_osm_cache_follows_the_tiles(tmp_path: Path, monkeypatch: pytest.MonkeyP
     cfg = make_cfg(tmp_path)
     fetched: list[bool] = []
 
-    def fake_fetch(bbox: Any, url: str, out: Path, *a: Any, force: bool = False) -> Path:
+    def fake_fetch(bbox: Any, url: str, out: Path, *a: Any, force: bool = False, **kw: Any) -> Path:
         fetched.append(force)
         if force or not out.exists():
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -246,7 +246,7 @@ def test_pipeline_job_runs_stages_and_reports_errors(tmp_path: Path) -> None:
         return Path(f"{stage.value}.out")
 
     job = PipelineJob(on_done=lambda c, ok: done.append(ok), runner=runner)
-    job.start(cfg, refresh_osm=True)
+    job.start(cfg, redo_from=Stage.FETCH)
     assert job.wait(10)
     s = job.state()
     assert s["ok"] and [x["status"] for x in s["stages"]] == ["done"] * 7
@@ -261,6 +261,74 @@ def test_pipeline_job_runs_stages_and_reports_errors(tmp_path: Path) -> None:
     status = {x["stage"]: x["status"] for x in s["stages"]}
     assert status["roofs"] == "error" and status["qa"] == "skipped"
     assert done == [True, False]
+
+
+def test_pipeline_job_only_runs_missing_stages(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path)
+    ran: list[tuple[str, bool]] = []
+    states = {"fetch": "done", "prepare": "done", "roofs": "stale", "colours": "done",
+              "qa": "done", "candidates": "done"}  # fmt: skip
+
+    def runner(c: Config, stage: Stage, *, force: bool, progress: Any) -> Path:
+        ran.append((stage.value, force))
+        return Path("x")
+
+    def state_of(c: Config, stage: Stage) -> tuple[str, str]:
+        return states.get(stage.value, "done"), ""
+
+    job = PipelineJob(runner=runner, state_of=state_of)  # type: ignore[arg-type]
+    job.start(cfg, candidates=True)
+    assert job.wait(10)
+    # roofs desatualizada → corre, e as seguintes da cadeia também; candidatos feitos.
+    assert [s for s, _ in ran] == ["roofs", "colours", "qa"]
+    status = {s["stage"]: s["status"] for s in job.state()["stages"]}
+    assert status["fetch"] == status["prepare"] == status["candidates"] == "cached"
+
+    # Tudo feito: nada corre. Refazer a partir de telhados: roofs e seguintes, sem
+    # voltar ao Overpass; a partir de fetch: o OSM é pedido de novo (force).
+    states["roofs"] = "done"
+    ran.clear()
+    job.start(cfg)
+    assert job.wait(10) and ran == []
+    job.start(cfg, redo_from=Stage.ROOFS)
+    assert job.wait(10)
+    assert ran == [("roofs", False), ("colours", False), ("qa", False)]
+    ran.clear()
+    job.start(cfg, candidates=True, redo_from=Stage.FETCH)
+    assert job.wait(10)
+    assert ran[0] == ("fetch", True) and ran[-1] == ("candidates", True)
+    with pytest.raises(ValueError):
+        job.start(cfg, redo_from=Stage.CANDIDATES)  # candidatos não incluídos
+
+
+def test_stage_state_follows_files(tmp_path: Path) -> None:
+    import os
+
+    from osm3d.pipeline import stage_state
+
+    cfg = make_cfg(tmp_path)
+    assert stage_state(cfg, Stage.PREPARE) == ("missing", "ainda não processada")
+    fetch = artefact_path(cfg, Stage.FETCH)
+    fetch.parent.mkdir(parents=True)
+    fetch.write_text("<osm/>", encoding="utf-8")
+    assert stage_state(cfg, Stage.FETCH)[0] == "stale"  # sem registo das quadrículas
+    mark_cache(fetch, cfg.area.tiles)
+    assert stage_state(cfg, Stage.FETCH)[0] == "done"
+    prepare = artefact_path(cfg, Stage.PREPARE)
+    prepare.write_bytes(b"x")
+    assert stage_state(cfg, Stage.PREPARE)[0] == "done"
+    os.utime(fetch, (prepare.stat().st_mtime + 10,) * 2)  # OSM obtido depois
+    assert stage_state(cfg, Stage.PREPARE) == ("stale", "a fase 'fetch' é mais recente")
+    assert stage_state(cfg, Stage.HEIGHTS)[0] == "done"  # fase de passagem
+    # LAZ mais recente do que os telhados → telhados desatualizados.
+    roofs = artefact_path(cfg, Stage.ROOFS)
+    roofs.write_bytes(b"x")
+    os.utime(prepare, (roofs.stat().st_mtime - 10,) * 2)
+    laz = cfg.sources.lidar_dir / f"LO-{cfg.area.tiles[0]}-07-2025_v05.laz"
+    laz.parent.mkdir(parents=True)
+    laz.write_bytes(b"x")
+    os.utime(laz, (roofs.stat().st_mtime + 10,) * 2)
+    assert stage_state(cfg, Stage.ROOFS) == ("stale", "há LAZ/MDT mais recentes")
 
 
 def test_pipeline_job_cancel_between_stages(tmp_path: Path) -> None:

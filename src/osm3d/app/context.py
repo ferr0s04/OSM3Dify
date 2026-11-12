@@ -16,12 +16,12 @@ from osm3d.acquisition.inventory import REQUIRED_PRODUCTS, by_tile, has_product,
 from osm3d.acquisition.osm import relation_boundary
 from osm3d.app.data import DataService
 from osm3d.app.downloads import DownloadManager
-from osm3d.app.processing import PipelineJob
+from osm3d.app.processing import DEFAULT_STAGES, PipelineJob
 from osm3d.app.service import ReviewService
 from osm3d.areas import area_store, with_area
 from osm3d.config import AreaConfig, Config
 from osm3d.geospatial.tiling import tiles_in_geometry
-from osm3d.pipeline import Stage, artefact_path
+from osm3d.pipeline import Stage, artefact_path, stage_state
 
 # relation_id → (nome, polígono GeoJSON WGS84)
 RelationLookup = Callable[[int], tuple[str | None, Any]]
@@ -114,6 +114,7 @@ class AppContext:
             "review_available": self.svc is not None,
             "review_error": self.review_error,
             "review_generation": self.review_generation,
+            "stages": self.stages(),
             "processing": self.pipeline.state(),
         }
 
@@ -171,6 +172,19 @@ class AppContext:
 
     # ------------------------------------------------------------ processamento
 
-    def process(self, *, candidates: bool = False, refresh_osm: bool = False) -> dict[str, Any]:
+    def stages(self) -> list[dict[str, Any]]:
+        """Estado das fases da área ativa (as de passagem não aparecem)."""
+        out = []
+        for stage in [*DEFAULT_STAGES, Stage.CANDIDATES]:
+            state, why = stage_state(self.cfg, stage)
+            if why == "sem processamento próprio":
+                continue
+            out.append({"stage": stage.value, "state": state, "reason": why})
+        return out
+
+    def process(
+        self, *, candidates: bool = False, redo_from: Stage | None = None
+    ) -> dict[str, Any]:
+        """Processa as fases em falta (e, se pedido, refaz a partir de ``redo_from``)."""
         with self._lock:
-            return self.pipeline.start(self.cfg, candidates=candidates, refresh_osm=refresh_osm)
+            return self.pipeline.start(self.cfg, candidates=candidates, redo_from=redo_from)

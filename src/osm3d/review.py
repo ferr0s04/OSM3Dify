@@ -286,7 +286,7 @@ def apply_overrides(
         ),
         ridge_azimuth_deg=(
             frame.azimuth_deg % 180.0
-            if shape in (RoofShape.GABLED, RoofShape.HIPPED, RoofShape.SIDE_HIPPED)
+            if shape in (RoofShape.GABLED, RoofShape.HIPPED, RoofShape.SIDE_HIPPED, RoofShape.ROUND)
             else None
         ),
         facing_azimuth_deg=_facing(shape, frame, flip),

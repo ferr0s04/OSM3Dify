@@ -4,6 +4,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from osm3d.app.server import create_app
@@ -272,3 +273,113 @@ def test_frontend_served(client: TestClient) -> None:
     assert js.headers["cache-control"] == "no-cache"
     assert client.get("/").headers["cache-control"] == "no-cache"
     assert "cache-control" not in client.get("/api/summary").headers
+
+
+def test_candidates_reviewed_and_exported_as_new_ways(tmp_path: Path) -> None:
+    client = TestClient(_app_with_candidate(tmp_path))
+    rows = {r["key"]: r for r in client.get("/api/buildings").json()}
+    key = next(k for k in rows if k.startswith("new/"))
+    assert rows[key]["candidate"] and not rows["way/10"]["candidate"]
+    gj = client.get("/api/buildings.geojson").json()
+    assert any(f["properties"]["candidate"] for f in gj["features"])
+
+    d = client.get(f"/api/buildings/{key}").json()
+    assert d["osm_url"] is None and not d["parts_editable"]
+    assert client.get(f"/api/buildings/{key}/mesh").json()["roof"]["faces"]
+    assert client.post(f"/api/buildings/{key}/parts/start").status_code == 422
+
+    client.put(f"/api/buildings/{key}/review", json={"status": "accepted"})
+    out = client.post("/api/export").json()
+    assert out["exported"] == 1
+    root = ET.parse(out["path"]).getroot()
+    (way,) = root.findall("way")
+    assert int(way.attrib["id"]) < 0 and way.attrib["action"] == "modify"
+    tags = {t.attrib["k"]: t.attrib["v"] for t in way.findall("tag")}
+    assert tags["building"] == "yes" and tags["roof:shape"] == "gabled"
+    refs = [int(nd.attrib["ref"]) for nd in way.findall("nd")]
+    assert refs[0] == refs[-1] and len(refs) == 5 and all(r < 0 for r in refs)
+    lats = {round(float(n.attrib["lat"]), 3) for n in root.findall("node")}
+    assert all(41.2 < lat < 41.4 for lat in lats)  # WGS84
+
+
+def _app_with_candidate(tmp_path: Path) -> FastAPI:
+    """Aplicação com os edifícios de teste e um candidato (em falta no OSM)."""
+    from shapely import affinity
+
+    from osm3d.domain.models import Building, QAFlag
+
+    cfg = Config(
+        area=AreaConfig(name="teste", bbox=(-8.68, 41.27, -8.65, 41.29)),
+        paths=PathsConfig(processed=tmp_path / "processed", output=tmp_path / "out"),
+        sources=SourcesConfig(lidar_dir=tmp_path / "lidar", dtm_dir=tmp_path / "dtm"),
+    )
+    fetch = artefact_path(cfg, Stage.FETCH)
+    fetch.parent.mkdir(parents=True)
+    fetch.write_text(OSM_XML, encoding="utf-8")
+    osm = load_footprints(fetch, cfg.processing_crs, 20)
+    upd = {"ground_elevation_m": 50.0, "osm_parts": []}
+    qa = [
+        b.model_copy(
+            update={
+                "parts": [make_part(RoofShape.GABLED).model_copy(update={"geometry": b.footprint})]
+            }
+            | upd
+        )
+        for b in osm
+    ]
+    write_buildings(qa, artefact_path(cfg, Stage.QA), cfg.processing_crs)
+    fp = affinity.translate(osm[0].footprint, 80, 0)  # 80 m ao lado: sem contorno no OSM
+    cand = Building(
+        osm_type="new",
+        osm_id=123456,
+        osm_version=0,
+        footprint=fp,
+        existing_tags={"building": "yes"},
+        qa_flags=[QAFlag(code="missing_in_osm", message="teste", severity="info")],
+        parts=[make_part(RoofShape.GABLED).model_copy(update={"geometry": fp})],
+        **upd,
+    )
+    write_buildings([cand], artefact_path(cfg, Stage.CANDIDATES), cfg.processing_crs)
+    return create_app(cfg)
+
+
+def test_ortho_tiles(tmp_path: Path) -> None:
+    import io
+    import math
+
+    import numpy as np
+    import rasterio
+    from PIL import Image
+    from rasterio.transform import from_bounds
+
+    ortho_dir = tmp_path / "orthophotos"
+    ortho_dir.mkdir()
+    # Folha de 1 km (EPSG:3763), RGB + alfa, vermelha.
+    x0, y0 = -45000.0, 179000.0
+    with rasterio.open(
+        ortho_dir / "ORTOS-2025-cog-25cm-097-3_v01.tif", "w", driver="GTiff", width=200,
+        height=200, count=4, dtype="uint8", crs="EPSG:3763",
+        transform=from_bounds(x0, y0, x0 + 1000, y0 + 1000, 200, 200),
+        photometric="RGB", alpha="YES",
+    ) as dst:  # fmt: skip
+        data = np.zeros((4, 200, 200), np.uint8)
+        data[0], data[3] = 200, 255
+        dst.write(data)
+    cfg = Config(
+        area=AreaConfig(name="teste", tiles=["155480"]),
+        paths=PathsConfig(processed=tmp_path / "processed", output=tmp_path / "out"),
+        sources=SourcesConfig(orthophoto_dir=ortho_dir),
+    )
+    client = TestClient(create_app(cfg))
+    info = client.get("/api/ortho/info").json()
+    assert info["available"] and info["files"][0]["year"] == 2025
+    w, s, e, n = info["files"][0]["bbox"]
+    lon, lat, z = (w + e) / 2, (s + n) / 2, 16
+    x = int((lon + 180) / 360 * 2**z)
+    y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * 2**z)
+    r = client.get(f"/api/ortho/{z}/{x}/{y}.png")
+    assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+    px = np.asarray(Image.open(io.BytesIO(r.content)))
+    assert px.shape == (256, 256, 4) and px[128, 128, 0] == 200 and px[128, 128, 3] == 255
+    assert client.get("/api/ortho/16/0/0.png").status_code == 204  # fora das folhas
+    assert client.get("/api/ortho/3/99/0.png").status_code == 422

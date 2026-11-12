@@ -14,10 +14,12 @@ from pydantic import BaseModel, Field, ValidationError
 from osm3d.acquisition.osm import OsmLookupError
 from osm3d.app.context import AppContext, RelationLookup
 from osm3d.app.downloads import DownloadManager
+from osm3d.app.ortho import OrthoTiles
 from osm3d.app.processing import PipelineJob
 from osm3d.app.service import LayoutIn, NotFound, PartsIn, ReviewService
 from osm3d.config import Config
 from osm3d.domain.models import ReviewStatus
+from osm3d.pipeline import Stage
 from osm3d.review import Overrides
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -69,7 +71,9 @@ class AreaIn(BaseModel):
 
 class ProcessIn(BaseModel):
     candidates: bool = False  # também a fase "candidates" (edifícios em falta no OSM)
-    refresh_osm: bool = False  # voltar a obter os edifícios do OSM (Overpass)
+    # Por omissão só corre o que falta ou está desatualizado. Com uma fase, refaz essa e
+    # as seguintes (fetch: volta a pedir os edifícios ao Overpass).
+    redo_from: Stage | None = None
 
 
 def create_app(
@@ -86,6 +90,7 @@ def create_app(
     """
     ctx = AppContext(cfg, service, downloads, pipeline, relation_lookup)
     data = ctx.data
+    ortho = OrthoTiles(cfg.sources.orthophoto_dir)
     app = FastAPI(title="osm3d — revisão", docs_url="/api/docs", openapi_url="/api/openapi.json")
     app.state.ctx = ctx
     app.state.data = data
@@ -106,7 +111,7 @@ def create_app(
         return svc
 
     def key_of(osm_type: str, osm_id: int) -> str:
-        if osm_type not in ("way", "relation"):
+        if osm_type not in ("way", "relation", "new"):  # new: em falta no OSM (candidato)
             raise HTTPException(404, "Tipo OSM inválido")
         return f"{osm_type}/{osm_id}"
 
@@ -244,6 +249,30 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    # --- ortofotos (fundo do mapa) ----------------------------------------------
+
+    @app.get("/api/ortho/info")
+    def ortho_info() -> dict[str, Any]:
+        """Ortofotos descarregadas (para o fundo do mapa): ano e extensão WGS84."""
+        files = ortho.files()
+        return {
+            "available": bool(files),
+            "files": [
+                {"name": f.path.name, "year": f.year, "bbox": list(f.bounds_wgs84)} for f in files
+            ],
+        }
+
+    @app.get("/api/ortho/{z}/{x}/{y}.png")
+    def ortho_tile(z: int, x: int, y: int) -> Response:
+        """Tile XYZ das ortofotos locais (204 fora delas)."""
+        try:
+            png = ortho.tile(z, x, y)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if png is None:
+            return Response(status_code=204)
+        return Response(png, media_type="image/png", headers={"Cache-Control": "max-age=3600"})
+
     # --- áreas e processamento ---------------------------------------------------
 
     def guarded(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -299,7 +328,7 @@ def create_app(
     @app.post("/api/processing")
     def processing_start(body: ProcessIn) -> dict[str, Any]:
         """Corre o pipeline (fetch → qa) da área ativa em segundo plano."""
-        return guarded(ctx.process, candidates=body.candidates, refresh_osm=body.refresh_osm)
+        return guarded(ctx.process, candidates=body.candidates, redo_from=body.redo_from)
 
     @app.delete("/api/processing")
     def processing_cancel() -> dict[str, Any]:

@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 from osm3d.domain.models import BuildingPart, RoofShape
 from osm3d.geometry import axis_difference_deg, longest_side_azimuth_deg
 
-# Formas com cumeeira cuja direção se exprime via roof:orientation (along/across).
-_RIDGED_SHAPES = {RoofShape.GABLED, RoofShape.HIPPED}
+# Formas com cumeeira (ou eixo, no round) cuja direção se exprime via roof:orientation.
+_RIDGED_SHAPES = {RoofShape.GABLED, RoofShape.HIPPED, RoofShape.ROUND}
 # Formas cuja direção se exprime via roof:direction (azimute).
 _DIRECTED_SHAPES = {RoofShape.SKILLION, RoofShape.SIDE_HIPPED}
 

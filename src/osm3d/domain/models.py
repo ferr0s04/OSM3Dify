@@ -46,6 +46,7 @@ class RoofShape(StrEnum):
     HIPPED = "hipped"
     SIDE_HIPPED = "side_hipped"  # três águas: hip numa ponta, empena na outra
     PYRAMIDAL = "pyramidal"
+    ROUND = "round"  # abóbada / meia-lua (p.ex. estufas, pavilhões)
     UNKNOWN = "unknown"
 
 

@@ -63,6 +63,7 @@ class FitParams:
         RoofShape.HIPPED,
         RoofShape.SIDE_HIPPED,
         RoofShape.PYRAMIDAL,
+        RoofShape.ROUND,
     )
     max_rmse_m: float = 0.35
     flat_max_slope_deg: float = 5.0
@@ -111,12 +112,19 @@ class Hypothesis:
             RoofShape.HIPPED: b,
             RoofShape.SIDE_HIPPED: b,
             RoofShape.PYRAMIDAL: min(a, b),
+            RoofShape.ROUND: b,  # inclinação média do arco
         }.get(self.shape)
         return 0.0 if run is None else math.degrees(math.atan2(h, run))
 
     @property
     def ridge_azimuth_deg(self) -> float | None:
-        if self.shape in (RoofShape.GABLED, RoofShape.HIPPED, RoofShape.SIDE_HIPPED):
+        """Eixo da cumeeira (round: eixo da abóbada)."""
+        if self.shape in (
+            RoofShape.GABLED,
+            RoofShape.HIPPED,
+            RoofShape.SIDE_HIPPED,
+            RoofShape.ROUND,
+        ):
             return self.frame.azimuth_deg % 180.0
         return None
 
@@ -214,6 +222,9 @@ def hypotheses_for(
                 hyps += [
                     Hypothesis(shape, f, flip) for f in (frame, across) for flip in (False, True)
                 ]
+            case RoofShape.ROUND:
+                # Abóbada ao longo (estufas, pavilhões) ou através do lado maior.
+                hyps += [Hypothesis(shape, f) for f in (frame, across)]
     # Plantas em L, T ou dobradas: telhado que segue o eixo do edifício, como os
     # renderizadores o desenham (ver reconstruction/skeleton.py). Só na planta inteira.
     if not free_ridge and rectangularity(geometry) < SKELETON_MAX_RECTANGULARITY:

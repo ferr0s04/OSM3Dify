@@ -10,7 +10,9 @@ Regras:
   relatório.
 - Upload permitido por omissão (sem atributo ``upload``). O upload é sempre feito
   por uma pessoa, no JOSM. ``josm_upload: never`` no config volta a bloqueá-lo.
-- ``building:part`` (Fase 6) ainda não é exportado: só edifícios de uma parte.
+- ``building:part``: cada parte é uma way nova ligada ao contorno (ver ``_attach_parts``).
+- Edifícios em falta no OSM (candidatos do LiDAR, ``new/<id>``) aceites: way nova com
+  nós novos (ids negativos) e ``building=yes`` + as tags S3DB.
 """
 
 from __future__ import annotations
@@ -197,6 +199,37 @@ def _attach_parts(
         new_ways.append(el)
 
 
+def _add_new_building(
+    b: Building,
+    tags: dict[str, str],
+    nodes: dict[int, ET.Element],
+    new_ways: list[ET.Element],
+    ids: _NodeIds,
+    crs: str,
+) -> None:
+    """Edifício em falta no OSM (candidato aceite): nós e way novos (ids negativos).
+
+    O contorno é o do LiDAR (inclui beirais); no JOSM confere-se com a ortofoto antes
+    do upload.
+    """
+    to_wgs = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    ring = np.asarray(b.footprint.exterior.coords)[:-1]
+    lon, lat = to_wgs.transform(ring[:, 0], ring[:, 1])
+    refs = []
+    for x, y in zip(lon, lat, strict=True):
+        nid = ids.new()
+        nodes[nid] = ET.Element(
+            "node", id=str(nid), action="modify", visible="true", lat=f"{y:.9f}", lon=f"{x:.9f}"
+        )
+        refs.append(nid)
+    el = ET.Element("way", id=str(ids.new()), action="modify", visible="true")
+    for ref in [*refs, refs[0]]:
+        ET.SubElement(el, "nd", ref=str(ref))
+    for key, value in sorted(tags.items()):
+        ET.SubElement(el, "tag", k=key, v=value)
+    new_ways.append(el)
+
+
 def _index(root: ET.Element) -> dict[tuple[str, int], ET.Element]:
     return {
         (el.tag, int(el.attrib["id"])): el for el in root if el.tag in ("node", "way", "relation")
@@ -243,7 +276,9 @@ def write_josm_file(
                 nodes[ref] = copy.deepcopy(index[("node", ref)])
 
     for b, tags in selected:
-        if b.osm_type == "way":
+        if b.osm_type == "new":
+            _add_new_building(b, tags, nodes, new_ways, ids, crs)
+        elif b.osm_type == "way":
             add_way(b.osm_id, tags)
             if has_parts(b):
                 _attach_parts(ways[b.osm_id], b, index, nodes, new_ways, ids, policy, crs)

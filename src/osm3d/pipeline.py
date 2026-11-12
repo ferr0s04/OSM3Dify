@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from osm3d.config import Config
 from osm3d.export.s3db_tags import TagPolicy
@@ -75,13 +75,64 @@ def _require(path: Path, stage: Stage) -> Path:
     return path
 
 
-def _input_of(config: Config, stage: Stage) -> Path:
-    """Artefacto de entrada: o da fase anterior, saltando fases de passagem."""
+def _previous(config: Config, stage: Stage) -> Stage:
+    """Fase anterior com artefacto próprio (salta as fases de passagem)."""
     idx = STAGE_ORDER.index(stage) - 1
     while _is_passthrough(config, STAGE_ORDER[idx]):
         idx -= 1
-    prev = STAGE_ORDER[idx]
+    return STAGE_ORDER[idx]
+
+
+def _input_of(config: Config, stage: Stage) -> Path:
+    """Artefacto de entrada: o da fase anterior, saltando fases de passagem."""
+    prev = _previous(config, stage)
     return _require(artefact_path(config, prev), prev)
+
+
+StageState = Literal["done", "missing", "stale"]
+# Fases que leem o LAZ/MDT: ficam desatualizadas se os ficheiros raw forem mais recentes.
+_READS_RAW = {Stage.ROOFS, Stage.COLOURS, Stage.CANDIDATES}
+
+
+def _raw_tiles(config: Config) -> tuple[dict[str, Path], dict[str, Path]]:
+    return (
+        area_tiles(config, config.sources.lidar_dir, (".laz", ".las")),
+        area_tiles(config, config.sources.dtm_dir, (".tif", ".tiff")),
+    )
+
+
+def stage_state(config: Config, stage: Stage) -> tuple[StageState, str]:
+    """Estado de uma fase da área: feita e atual, em falta ou desatualizada (+ motivo).
+
+    Não deteta alterações de parâmetros no ``config.yaml``: nesse caso refaz-se a pedido.
+    """
+    if _is_passthrough(config, stage):
+        return "done", "sem processamento próprio"
+    out = artefact_path(config, stage)
+    if not out.exists():
+        return "missing", "ainda não processada"
+    made = out.stat().st_mtime
+    if stage is Stage.FETCH:
+        if not cache_matches(out, config.area.tiles):
+            return "stale", "obtida para outras quadrículas"
+        return "done", ""
+    if stage is Stage.CANDIDATES:
+        lidar, dtm = _raw_tiles(config)
+        if not cache_matches(context_path(config), sorted(set(lidar) & set(dtm))):
+            return "stale", "as quadrículas com LAZ e MDT mudaram"
+    else:
+        prev = _previous(config, stage)
+        before = artefact_path(config, prev)
+        if not before.exists():
+            return "stale", f"falta a fase '{prev.value}'"
+        if before.stat().st_mtime > made:
+            return "stale", f"a fase '{prev.value}' é mais recente"
+    if stage in _READS_RAW:
+        lidar, dtm = _raw_tiles(config)
+        newest = max((p.stat().st_mtime for p in [*lidar.values(), *dtm.values()]), default=0.0)
+        if newest > made:
+            return "stale", "há LAZ/MDT mais recentes"
+    return "done", ""
 
 
 def run_stage(
@@ -105,7 +156,11 @@ def run_stage(
             if stale and out.exists() and progress:
                 progress("  OSM em cache não é destas quadrículas: a obter de novo")
             path = fetch_buildings(
-                config.area.bbox, config.sources.overpass_url, out, force=force or stale
+                config.area.bbox,
+                config.sources.overpass_url,
+                out,
+                force=force or stale,
+                progress=progress,
             )
             mark_cache(path, config.area.tiles)
             return path
@@ -267,7 +322,11 @@ def _run_candidates(
     bbox = (min(lons), min(lats), max(lons), max(lats))
     stale = not cache_matches(context_path(config), tiles)
     ctx = fetch_context(
-        bbox, config.sources.overpass_url, context_path(config), force=force or stale
+        bbox,
+        config.sources.overpass_url,
+        context_path(config),
+        force=force or stale,
+        progress=progress,
     )
     mark_cache(ctx, tiles)
     osm, _ = load_context(ctx, config.processing_crs, None)

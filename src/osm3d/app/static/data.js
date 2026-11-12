@@ -2,7 +2,7 @@
 // escolhidas no mapa. As mesmas quadrículas definem o LAZ/MDT a descarregar e os
 // edifícios OSM processados. Aqui também se descarrega, apaga e processa a área.
 import { api } from "./api.js";
-import { BASEMAP } from "./map.js";
+import { BASEMAP, applyBasemap, basemapOptions } from "./map.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const mb = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`);
@@ -15,14 +15,20 @@ const TYPICAL_MB = { lidar: 155, dtm: 13, dsm: 13 };
 const SHORT = { lidar: "LAZ", dtm: "MDT", dsm: "MDS", orthophoto: "Orto" };
 const REQUIRED = ["lidar", "dtm"];
 const COLORS = { complete: "#16a34a", partial: "#d97706", area: "#2563eb" };
+const STAGE_LABELS = {
+  fetch: "edifícios OSM", prepare: "preparar", roofs: "telhados", colours: "cores", qa: "QA",
+  candidates: "candidatos",
+};
+const STATE_LABELS = { done: "feita", missing: "em falta", stale: "desatualizada" };
 const TASK_LABELS = {
   queued: "em fila", searching: "a pesquisar", downloading: "a descarregar", done: "descarregado",
   exists: "já existe", missing: "sem dados na DGT", error: "erro", cancelled: "cancelado",
 };
 
 export class DataView {
-  constructor({ mapEl, panelEl, hoverEl, toast }) {
+  constructor({ mapEl, panelEl, hoverEl, baseEl, toast }) {
     this.mapEl = mapEl;
+    this.baseEl = baseEl;
     this.panelEl = panelEl;
     this.hoverEl = hoverEl;
     this.toast = toast;
@@ -36,7 +42,8 @@ export class DataView {
     this.creating = null; // null = a editar a área ativa; string = nome da área nova
     this.extras = new Set(); // produtos opcionais (MDS, ortofotos)
     this.includeCache = true;
-    this.processOpts = { candidates: false, refresh_osm: false };
+    // redo_from: "" = só as fases em falta/desatualizadas; senão refaz a partir dessa.
+    this.processOpts = { candidates: false, redo_from: "" };
     this.jobs = new Map(); // quadrícula → estado da tarefa de download ativa
     this.downloads = null;
     this.processing = null;
@@ -94,6 +101,7 @@ export class DataView {
     this.map.on("moveend", () => this.loadViewport());
     this.setupBoxSelect();
     this.renderLegend();
+    this.baseEl.addEventListener("input", (e) => applyBasemap(this.map, e.target.value));
   }
 
   // ----------------------------------------------------------- dados
@@ -116,6 +124,8 @@ export class DataView {
       return;
     }
     for (const f of this.status.local.features) this.known.set(f.properties.name, f);
+    // Ortofotos podem ter sido descarregadas entretanto: rever as opções do fundo.
+    applyBasemap(this.map, await basemapOptions(this.baseEl));
     const a = this.active();
     if (this.draft === null || (!this.dirty() && this.creating === null)) this.draft = new Set(a.tiles);
     await this.ensureKnown([...this.draft]);
@@ -484,16 +494,38 @@ export class DataView {
 
   // ---------------------------------------------------------- processamento
 
+  stagePlan() {
+    // Fases que vão correr: as escolhidas para refazer, ou as em falta/desatualizadas
+    // (e, na cadeia fetch → qa, tudo o que vem depois de uma fase que corre).
+    const all = (this.areas?.stages ?? []).filter((s) => s.stage !== "candidates" || this.processOpts.candidates);
+    const redo = this.processOpts.redo_from;
+    const order = all.map((s) => s.stage);
+    let chain = false;
+    return all.filter((s) => {
+      const forced = redo && order.indexOf(s.stage) >= order.indexOf(redo);
+      const follows = chain && s.stage !== "candidates";
+      const run = forced || follows || s.state !== "done";
+      if (run && s.stage !== "candidates") chain = true;
+      return run;
+    }).map((s) => s.stage);
+  }
+
   async process() {
     const a = this.active();
+    const plan = this.stagePlan();
+    if (!plan.length) return this.toast("Todas as fases já estão feitas. Para refazer, escolher a partir de que fase.");
     const nMissing = a.tiles.length - a.tiles_complete.length;
     const warn = nMissing
       ? `\n\nAtenção: ${nMissing} de ${a.tiles.length} quadrículas não têm LAZ + MDT. Os edifícios nessas quadrículas ficam sem reconstrução.`
       : "";
-    const stages = `edifícios OSM${this.processOpts.refresh_osm ? " (obtidos de novo)" : ""} → preparar → telhados → cores → QA${this.processOpts.candidates ? " → candidatos" : ""}`;
-    if (!confirm(`Processar a área "${a.label || a.name}" (${a.tiles.length} quadrículas)?\n\n${stages}${warn}\n\nPode demorar vários minutos; a revisão é recarregada no fim.`)) return;
+    const redo = this.processOpts.redo_from;
+    const what = `${redo ? `Refazer a partir de "${STAGE_LABELS[redo]}"` : "Fases em falta"}: ${plan.map((s) => STAGE_LABELS[s]).join(" → ")}`;
+    if (!confirm(`Processar a área "${a.label || a.name}" (${a.tiles.length} quadrículas)?\n\n${what}${warn}\n\nPode demorar vários minutos; a revisão é recarregada no fim.`)) return;
     try {
-      this.setProcessing(await api.startProcessing(this.processOpts));
+      this.setProcessing(await api.startProcessing({
+        candidates: this.processOpts.candidates,
+        redo_from: this.processOpts.redo_from || null,
+      }));
       this.renderProcessing();
     } catch (e) {
       this.toast(`Processar: ${e.message}`, 6000);
@@ -562,6 +594,7 @@ export class DataView {
     const est = this.estimate(missing, this.products());
     const areaBytes = this.bytesOf(a.tiles);
     const running = this.processing?.running;
+    const plan = this.stagePlan();
     const warnings = [
       !st.index.available && `Grelha oficial não encontrada (<code>${esc(st.index.path)}</code>): usa-se a malha de 1 km calculada.`,
       !st.credentials && "Sem credenciais da DGT: definir <code>DGT_USER</code> e <code>DGT_PASSWORD</code> no <code>.env</code> para descarregar.",
@@ -608,11 +641,19 @@ export class DataView {
       <div id="d-downloads"></div>
 
       <h3>Processamento</h3>
-      <div class="actions">
-        <button class="btn primary" id="p-start" ${dirty || running ? "disabled" : ""} ${lock}>Processar área</button>
-      </div>
+      ${this.renderStageStates()}
       <label class="check small"><input type="checkbox" id="p-candidates" ${this.processOpts.candidates ? "checked" : ""}> incluir edifícios em falta no OSM (candidatos)</label>
-      <label class="check small"><input type="checkbox" id="p-refresh" ${this.processOpts.refresh_osm ? "checked" : ""}> voltar a obter os edifícios do OSM</label>
+      <label class="small redo">refazer:
+        <select id="p-redo" title="Por omissão só correm as fases em falta ou desatualizadas">
+          <option value="">nada (só as fases em falta)</option>
+          ${(this.areas.stages ?? [])
+            .filter((s) => s.stage !== "candidates" || this.processOpts.candidates)
+            .map((s) => `<option value="${s.stage}" ${this.processOpts.redo_from === s.stage ? "selected" : ""}>a partir de: ${STAGE_LABELS[s.stage]}${s.stage === "fetch" ? " (pede de novo ao Overpass)" : ""}</option>`).join("")}
+        </select></label>
+      <div class="actions">
+        <button class="btn primary" id="p-start" ${dirty || running || !plan.length ? "disabled" : ""} ${lock}>${
+          running ? "A processar…" : !plan.length ? "Tudo processado" : this.processOpts.redo_from ? `Refazer ${plan.length} fase(s)` : `Processar ${plan.length} fase(s) em falta`}</button>
+      </div>
       <div id="a-processing"></div>
 
       <h3>Áreas</h3>
@@ -643,8 +684,15 @@ export class DataView {
     $p("#d-delete").onclick = () => this.removeFiles(a.tiles, `"${a.label || a.name}"`);
     $p("#d-cache").oninput = (e) => (this.includeCache = e.target.checked);
     $p("#p-start").onclick = () => this.process();
-    $p("#p-candidates").oninput = (e) => (this.processOpts.candidates = e.target.checked);
-    $p("#p-refresh").oninput = (e) => (this.processOpts.refresh_osm = e.target.checked);
+    $p("#p-candidates").oninput = (e) => {
+      this.processOpts.candidates = e.target.checked;
+      if (!e.target.checked && this.processOpts.redo_from === "candidates") this.processOpts.redo_from = "";
+      this.renderPanel();
+    };
+    $p("#p-redo").oninput = (e) => {
+      this.processOpts.redo_from = e.target.value;
+      this.renderPanel();
+    };
     $p("#a-new").onclick = () => this.startNew();
     this.panelEl.querySelectorAll("[data-activate]").forEach((el) => (el.onclick = () => this.activate(el.dataset.activate)));
     this.panelEl.querySelectorAll("[data-remove]").forEach((el) => (el.onclick = () => this.removeArea(el.dataset.remove)));
@@ -697,6 +745,15 @@ export class DataView {
     el.querySelector("#d-cancel")?.addEventListener("click", () => this.cancelDownloads());
   }
 
+  renderStageStates() {
+    const plan = new Set(this.stagePlan());
+    const icon = { done: "✔", missing: "·", stale: "↻" };
+    return `<div class="stages">${(this.areas.stages ?? [])
+      .filter((s) => s.stage !== "candidates" || this.processOpts.candidates || s.state !== "missing")
+      .map((s) => `<span class="stage ${s.state}${plan.has(s.stage) ? " planned" : ""}" title="${esc(STATE_LABELS[s.state])}${s.reason ? `: ${esc(s.reason)}` : ""}${plan.has(s.stage) ? " · vai ser processada" : ""}">${STAGE_LABELS[s.stage]} ${icon[s.state]}</span>`)
+      .join("")}</div>`;
+  }
+
   renderProcessing() {
     const el = this.panelEl.querySelector("#a-processing");
     const p = this.processing;
@@ -705,7 +762,7 @@ export class DataView {
       el.innerHTML = "";
       return;
     }
-    const LABEL = { pending: "", running: "…", done: "✔", error: "✖", skipped: "–", cancelled: "–" };
+    const LABEL = { pending: "", running: "…", done: "✔", cached: "(mantida)", error: "✖", skipped: "–", cancelled: "–" };
     const review = !p.running && p.ok && p.area === this.areas?.active
       ? '<button class="btn ok" id="p-open">Abrir revisão</button>' : "";
     el.innerHTML = `
