@@ -266,6 +266,28 @@ def relation_boundary(relation_id: int, *, timeout_s: float = 20.0) -> tuple[str
     return found[0].get("name") or None, found[0]["geojson"]
 
 
+# Versão do conteúdo do contexto (2: + landuse e estradas). Caches antigas refazem-se.
+CONTEXT_VERSION = 2
+
+
+def context_is_current(path: Path) -> bool:
+    """O contexto em cache tem o conteúdo da versão atual?"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(data.get("osm3d_context") == CONTEXT_VERSION)
+
+
+def context_timestamp(path: Path) -> str:
+    """Data dos dados OSM do contexto (``timestamp_osm_base`` do Overpass)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "?"
+    return str(data.get("osm3s", {}).get("timestamp_osm_base", "?"))
+
+
 def fetch_context(
     bbox: tuple[float, float, float, float],
     overpass_url: str,
@@ -275,22 +297,27 @@ def fetch_context(
     force: bool = False,
     progress: Progress | None = None,
 ) -> Path:
-    """Edifícios OSM de toda a ``bbox`` (sem filtro de área) + limite da área, em JSON.
+    """Edifícios, ``landuse`` e estradas OSM de toda a ``bbox`` + limite da área, em JSON.
 
     Serve a deteção de edifícios em falta: as quadrículas LiDAR passam os limites
     administrativos, e um edifício mapeado na freguesia vizinha não está "em falta".
+    ``landuse`` e estradas (desenhados sobre imagem) ajudam a encaixar os contornos.
     """
     if out.exists() and not force:
         return out
     w, s, e, n = bbox
     timeout = query_timeout_s(bbox)
     boundary = f"rel({osm_relation_id});out geom;" if osm_relation_id else ""
+    b = f"({s},{w},{n},{e})"
     query = (
         f"[out:json][timeout:{timeout}];"
-        f'(way["building"]({s},{w},{n},{e});relation["building"]({s},{w},{n},{e}););'
+        f'(way["building"]{b};relation["building"]{b};'
+        f'way["landuse"]{b};relation["landuse"]["type"="multipolygon"]{b};'
+        f'way["highway"]{b};);'
         f"out geom;{boundary}"
     )
     data = _overpass_json(query, overpass_url, timeout_s=timeout, progress=progress)
+    data["osm3d_context"] = CONTEXT_VERSION
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".part")
     tmp.write_text(json.dumps(data), encoding="utf-8")

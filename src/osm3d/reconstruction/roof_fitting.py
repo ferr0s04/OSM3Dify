@@ -236,32 +236,51 @@ def hypotheses_for(
     return hyps
 
 
+def _fast_median(a: Array) -> float:
+    """Mediana de um vetor 1D (sem a sobrecarga de ``np.median`` no ciclo de ajuste)."""
+    n = len(a)
+    k = n // 2
+    p = np.partition(a, k)
+    return float(p[k]) if n % 2 else float((p[k] + p[:k].max()) / 2)
+
+
 def _robust_linear_fit(
     f: Array | None, z: Array, truncation: float, iterations: int = 8
 ) -> tuple[float, float, Array]:
     """Ajusta z ≈ z0 + h·f. Devolve (z0, h, resíduos)."""
-    cols = [np.ones_like(z)] if f is None else [np.ones_like(z), f]
-    design = np.column_stack(cols)
+    n_params = 1 if f is None else 2
     w = np.ones_like(z)
-    coef = np.zeros(design.shape[1])
+    z0, h = float(np.mean(z)), 0.0
+
+    def solve(w: Array) -> tuple[float, float]:
+        # Mínimos quadrados ponderados em forma fechada (1 ou 2 parâmetros): o mesmo
+        # resultado do lstsq, sem a SVD (é o ciclo mais quente do ajuste).
+        sw = float(w.sum())
+        if f is None:
+            return float((w * z).sum() / sw), 0.0
+        wf = w * f
+        swf, swff = float(wf.sum()), float((wf * f).sum())
+        swz, swfz = float((w * z).sum()), float((wf * z).sum())
+        det = sw * swff - swf * swf
+        if abs(det) < 1e-12 * max(sw * swff, 1e-12):
+            return swz / sw, 0.0
+        return (swff * swz - swf * swfz) / det, (sw * swfz - swf * swz) / det
+
     for i in range(iterations):
-        sw = np.sqrt(w)
-        coef, *_ = np.linalg.lstsq(design * sw[:, None], z * sw, rcond=None)
-        r = z - design @ coef
+        z0, h = solve(w)
+        r = z - z0 if f is None else z - z0 - h * f
         if i < iterations - 2:
             # Huber
-            sigma = max(1.4826 * float(np.median(np.abs(r - np.median(r)))), _NOISE_FLOOR_M)
+            sigma = max(1.4826 * _fast_median(np.abs(r - _fast_median(r))), _NOISE_FLOOR_M)
             c = 1.345 * sigma
             a = np.abs(r)
             w = np.where(a <= c, 1.0, c / np.maximum(a, 1e-12))
         else:
             # Últimas iterações: só inliers.
             w = (np.abs(r) <= truncation).astype(float)
-            if w.sum() < design.shape[1]:
+            if w.sum() < n_params:
                 w = np.ones_like(z)
-    r = z - design @ coef
-    z0 = float(coef[0])
-    h = float(coef[1]) if f is not None else 0.0
+    r = z - z0 if f is None else z - z0 - h * f
     return z0, h, r
 
 

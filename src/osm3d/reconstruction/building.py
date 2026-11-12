@@ -118,6 +118,7 @@ def reconstruct_building(
     area = float(footprint.area)
     rect_area = float(footprint.minimum_rotated_rectangle.area) or area
     diagnostics = {
+        **building.diagnostics,  # p.ex. desvio do ortofoto dos candidatos
         "n_points": float(len(points)),
         "point_density": len(points) / area if area else 0.0,
         "rectangularity": area / rect_area,
@@ -210,6 +211,14 @@ def reconstruct_building(
         if layout is not None and not validate_layout(layout, footprint):
             probe = building.model_copy(update=update | {"parts": [part]})
             update["suggested_layout"] = fit_layout(probe, layout, points, params)
+    if building.osm_type == "new" and building.layout is not None:
+        # Candidato com alpendres (divisão da deteção): cada parte com o seu telhado.
+        probe = building.model_copy(update=update | {"parts": [part]})
+        fitted = fit_layout(probe, building.layout, points, params)
+        if len(fitted.fitted) == len(fitted.parts) > 1:
+            return building.model_copy(
+                update=update | {"qa_flags": flags, "parts": fitted.fitted, "layout": fitted}
+            ), fit
     return building.model_copy(update=update | {"qa_flags": flags, "parts": [part]}), fit
 
 
@@ -258,6 +267,7 @@ def apply_shared_roofs(
             if (f := fits[i]) is not None
             and f.best is not None
             and results[i].ground_elevation_m is not None
+            and results[i].layout is None  # já dividido em partes: fica como está
         ]
         if not 2 <= len(members) <= max_group:
             continue

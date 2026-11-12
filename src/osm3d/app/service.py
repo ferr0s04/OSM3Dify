@@ -606,9 +606,7 @@ class ReviewService:
         )
 
     def _editable(self, b: Building) -> str | None:
-        if b.osm_type == "new":
-            return "Edifício novo (em falta no OSM): dividir em partes depois de criado no OSM"
-        if b.osm_type != "way":
+        if b.osm_type not in ("way", "new"):
             return "Divisão em partes só para contornos simples (way), não multipolígonos"
         if b.osm_parts:
             return "O edifício já tem building:part no OSM: editar no JOSM"

@@ -284,9 +284,10 @@ def test_candidates_reviewed_and_exported_as_new_ways(tmp_path: Path) -> None:
     assert any(f["properties"]["candidate"] for f in gj["features"])
 
     d = client.get(f"/api/buildings/{key}").json()
-    assert d["osm_url"] is None and not d["parts_editable"]
+    # Candidatos novos também se dividem em partes (exportadas como building:part novas).
+    assert d["osm_url"] is None and d["parts_editable"]
     assert client.get(f"/api/buildings/{key}/mesh").json()["roof"]["faces"]
-    assert client.post(f"/api/buildings/{key}/parts/start").status_code == 422
+    assert client.post(f"/api/buildings/{key}/parts/start").status_code == 200
 
     client.put(f"/api/buildings/{key}/review", json={"status": "accepted"})
     out = client.post("/api/export").json()

@@ -228,7 +228,7 @@ function renderDetail() {
            <a href="#" id="josm-link" data-obj="${josmType}${d.osm_id}">carregar no JOSM</a>
            <span class="muted">v${d.osm_version} · ${esc(d.existing_tags.building ?? "")} · ${fmt(d.area, " m²")}</span>`
         : `<span class="chip candidate" title="Pontos de edifício no LiDAR sem contorno no OSM">em falta no OSM</span>
-           <span class="muted">contorno do LiDAR (inclui beirais) · ${fmt(d.area, " m²")} · ao aceitar, é exportado como edifício novo</span>`}
+           <span class="muted">${d.diagnostics?.ortho_offset_dx !== undefined ? "contorno do ortofoto" : "contorno do LiDAR (inclui beirais)"} · ${fmt(d.area, " m²")} · ao aceitar, é exportado como edifício novo</span>`}
     </div>
     ${renderOsmChange(d)}
     <div class="actions">

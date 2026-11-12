@@ -27,8 +27,9 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 from pyproj import Transformer
+from shapely.geometry import Polygon
 
-from osm3d.domain.models import Building, BuildingPart
+from osm3d.domain.models import Building, BuildingPart, PartsLayout
 from osm3d.export.s3db_tags import TagPolicy, format_metres, merge_tags, part_to_tags
 from osm3d.parts import SNAP_M, on_segment
 
@@ -68,7 +69,7 @@ def plan_export(
             reason = "sinalizado: " + ",".join(f.code for f in b.qa_flags if f.severity != "info")
         elif not b.parts:
             reason = "sem partes"
-        elif has_parts(b) and b.osm_type != "way":
+        elif has_parts(b) and b.osm_type not in ("way", "new"):
             reason = "partes só em contornos simples (way), não em multipolígonos"
         elif len(b.parts) > 1 and not has_parts(b):
             reason = "várias partes sem divisão definida"
@@ -199,35 +200,73 @@ def _attach_parts(
         new_ways.append(el)
 
 
-def _add_new_building(
-    b: Building,
-    tags: dict[str, str],
+def _add_new_buildings(
+    selected: list[tuple[Building, dict[str, str]]],
     nodes: dict[int, ET.Element],
     new_ways: list[ET.Element],
     ids: _NodeIds,
     crs: str,
+    policy: TagPolicy,
 ) -> None:
-    """Edifício em falta no OSM (candidato aceite): nós e way novos (ids negativos).
+    """Edifícios em falta no OSM (candidatos aceites): nós e ways novos (ids negativos).
 
-    O contorno é o do LiDAR (inclui beirais); no JOSM confere-se com a ortofoto antes
-    do upload.
+    Candidatos contíguos (uma mancha LiDAR dividida em vários edifícios) e as
+    ``building:part`` de cada um partilham nós: vértices coincidentes são o mesmo nó e
+    um vértice sobre o lado de outro anel é inserido nesse lado (sem junções em T).
+    No JOSM confere-se com a ortofoto antes do upload.
     """
+    if not selected:
+        return
+    from osm3d.parts import layout_from_polygons
+
     to_wgs = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-    ring = np.asarray(b.footprint.exterior.coords)[:-1]
-    lon, lat = to_wgs.transform(ring[:, 0], ring[:, 1])
-    refs = []
-    for x, y in zip(lon, lat, strict=True):
-        nid = ids.new()
-        nodes[nid] = ET.Element(
-            "node", id=str(nid), action="modify", visible="true", lat=f"{y:.9f}", lon=f"{x:.9f}"
-        )
-        refs.append(nid)
-    el = ET.Element("way", id=str(ids.new()), action="modify", visible="true")
-    for ref in [*refs, refs[0]]:
-        ET.SubElement(el, "nd", ref=str(ref))
-    for key, value in sorted(tags.items()):
-        ET.SubElement(el, "tag", k=key, v=value)
-    new_ways.append(el)
+    # Anéis: contornos primeiro, depois as partes de cada edifício com partes.
+    rings: list[tuple[Polygon, dict[str, str]]] = [(b.footprint, tags) for b, tags in selected]
+    for b, _ in selected:
+        if has_parts(b):
+            assert b.layout is not None
+            rings += [
+                (b.layout.polygon(i), part_way_tags(part, policy)) for i, part in enumerate(b.parts)
+            ]
+    shared = layout_from_polygons([g for g, _ in rings])
+    if len(shared.parts) != len(rings):  # anel degenerado: sem partilha, um a um
+        for g, tags in rings:
+            _write_rings([tags], layout_from_polygons([g]), nodes, new_ways, ids, to_wgs)
+        return
+    _write_rings([t for _, t in rings], shared, nodes, new_ways, ids, to_wgs)
+
+
+def _write_rings(
+    tags_per_ring: list[dict[str, str]],
+    shared: PartsLayout,
+    nodes: dict[int, ET.Element],
+    new_ways: list[ET.Element],
+    ids: _NodeIds,
+    to_wgs: Transformer,
+) -> None:
+    node_of: dict[int, int] = {}
+    for k, tags in enumerate(tags_per_ring):
+        refs = []
+        for v in shared.parts[k]:
+            if v not in node_of:
+                nid = ids.new()
+                lon, lat = to_wgs.transform(*shared.vertices[v])
+                nodes[nid] = ET.Element(
+                    "node",
+                    id=str(nid),
+                    action="modify",
+                    visible="true",
+                    lat=f"{lat:.9f}",
+                    lon=f"{lon:.9f}",
+                )
+                node_of[v] = nid
+            refs.append(node_of[v])
+        el = ET.Element("way", id=str(ids.new()), action="modify", visible="true")
+        for ref in [*refs, refs[0]]:
+            ET.SubElement(el, "nd", ref=str(ref))
+        for key, value in sorted(tags.items()):
+            ET.SubElement(el, "tag", k=key, v=value)
+        new_ways.append(el)
 
 
 def _index(root: ET.Element) -> dict[tuple[str, int], ET.Element]:
@@ -275,10 +314,18 @@ def write_josm_file(
             if ref not in nodes:
                 nodes[ref] = copy.deepcopy(index[("node", ref)])
 
+    _add_new_buildings(
+        [(b, tags) for b, tags in selected if b.osm_type == "new"],
+        nodes,
+        new_ways,
+        ids,
+        crs,
+        policy,
+    )
     for b, tags in selected:
         if b.osm_type == "new":
-            _add_new_building(b, tags, nodes, new_ways, ids, crs)
-        elif b.osm_type == "way":
+            continue
+        if b.osm_type == "way":
             add_way(b.osm_id, tags)
             if has_parts(b):
                 _attach_parts(ways[b.osm_id], b, index, nodes, new_ways, ids, policy, crs)

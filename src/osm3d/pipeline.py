@@ -278,6 +278,22 @@ def area_tiles(config: Config, directory: Path, suffixes: tuple[str, ...]) -> di
     return {t: p for t, p in index_tiles(directory, suffixes).items() if t in wanted}
 
 
+def ortho_files(config: Config) -> list[Path]:
+    """Ortofotos completas na pasta (as quadrículas do ORTOS não são as do LiDAR)."""
+    from osm3d.acquisition.inventory import PARTIAL_SUFFIX, SUFFIXES
+
+    d = config.sources.orthophoto_dir
+    if not d.is_dir():
+        return []
+    return sorted(
+        p
+        for p in d.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in SUFFIXES["orthophoto"]
+        and not p.name.endswith(PARTIAL_SUFFIX)
+    )
+
+
 def review_buildings(config: Config) -> list[Building]:
     """Edifícios a rever: os do OSM (fase QA) e os em falta no OSM (fase candidates)."""
     from osm3d.export.geopackage import read_buildings
@@ -301,11 +317,11 @@ def _run_candidates(
     import shapely
     from pyproj import Transformer
 
-    from osm3d.acquisition.osm import fetch_context
+    from osm3d.acquisition.osm import context_is_current, context_timestamp, fetch_context
     from osm3d.export.geopackage import write_buildings
     from osm3d.geospatial.tiling import TileKey
     from osm3d.reconstruction.building import reconstruct_area
-    from osm3d.reconstruction.candidates import detect_candidates, load_context
+    from osm3d.reconstruction.candidates import detect_candidates, load_context, load_land
     from osm3d.validation.quality import check_building
 
     lidar = area_tiles(config, config.sources.lidar_dir, (".laz", ".las"))
@@ -320,7 +336,9 @@ def _run_candidates(
     x0, y0, x1, y1 = extent.buffer(30).bounds
     lons, lats = to_wgs.transform([x0, x1, x0, x1], [y0, y0, y1, y1])
     bbox = (min(lons), min(lats), max(lons), max(lats))
-    stale = not cache_matches(context_path(config), tiles)
+    stale = not cache_matches(context_path(config), tiles) or not context_is_current(
+        context_path(config)
+    )
     ctx = fetch_context(
         bbox,
         config.sources.overpass_url,
@@ -330,10 +348,31 @@ def _run_candidates(
     )
     mark_cache(ctx, tiles)
     osm, _ = load_context(ctx, config.processing_crs, None)
+    # Os edifícios da fase fetch também contam: um servidor Overpass alternativo pode
+    # estar desatualizado, e um edifício já mapeado não pode voltar como "em falta".
+    fetched = artefact_path(config, Stage.FETCH)
+    if fetched.exists():
+        from osm3d.geospatial.footprints import load_footprints
+
+        osm += [b.footprint for b in load_footprints(fetched, config.processing_crs, 0.0)]
     if progress:
-        progress(f"  contexto OSM: {len(osm)} edifícios em {len(tiles)} quadrículas")
+        progress(
+            f"  contexto OSM ({context_timestamp(ctx)}): {len(osm)} edifícios em "
+            f"{len(tiles)} quadrículas"
+        )
     # Limite = as próprias quadrículas da área (centróide dentro delas, como no prepare).
-    found = detect_candidates(lidar, dtm, osm, config.area.polygon())
+    orthos = ortho_files(config)
+    if progress and not orthos:
+        progress("  sem ortofotos: contornos só do LiDAR (descarregar ortofotos melhora-os)")
+    found = detect_candidates(
+        lidar,
+        dtm,
+        osm,
+        config.area.polygon(),
+        ortho_paths=orthos,
+        progress=progress,
+        land=load_land(ctx, config.processing_crs),
+    )
     if progress:
         progress(f"  {len(found)} edifícios em falta no OSM (candidatos)")
     fitted, _ = reconstruct_area(found, lidar, dtm, config, progress)
