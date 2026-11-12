@@ -3,23 +3,72 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from osm3d.domain.models import RoofShape
 
+if TYPE_CHECKING:
+    from shapely.geometry.base import BaseGeometry
+
+    from osm3d.geospatial.tiling import TileKey
+
 
 class AreaConfig(BaseModel):
-    name: str
-    bbox: tuple[float, float, float, float] = Field(
-        description="WGS84: (min_lon, min_lat, max_lon, max_lat)"
-    )
-    osm_relation_id: int | None = Field(
-        default=None,
-        description="Relação OSM do limite administrativo; filtra edifícios pelo polígono.",
-    )
+    """Área de estudo = um conjunto de quadrículas LiDAR de 1 km (grelha DGT).
+
+    As mesmas quadrículas definem o LAZ/MDT a descarregar e os edifícios OSM a
+    processar (os que têm o centróide dentro delas). Não há outra definição de área.
+    """
+
+    # Usado em caminhos (data/processed/<nome>): só minúsculas, dígitos, "-" e "_".
+    name: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
+    label: str | None = Field(default=None, max_length=200, description="Nome a mostrar.")
+    tiles: list[str] = Field(min_length=1, description="Identificadores DGT (p.ex. 155480).")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bbox_to_tiles(cls, data: Any) -> Any:
+        # Compatibilidade: uma bbox WGS84 antiga é convertida nas quadrículas que interseta.
+        if isinstance(data, dict) and "tiles" not in data and "bbox" in data:
+            from osm3d.geospatial.tiling import tiles_in_bbox
+
+            w, s, e, n = (float(v) for v in data["bbox"])
+            data = {k: v for k, v in data.items() if k not in ("bbox", "osm_relation_id")}
+            data["tiles"] = [k.dgt_name for k in tiles_in_bbox((w, s, e, n))]
+        return data
+
+    @field_validator("tiles", mode="before")
+    @classmethod
+    def _check_tiles(cls, value: Any) -> list[str]:
+        tiles = [str(t).strip() for t in value]  # no YAML vêm como números
+        bad = [t for t in tiles if not (len(t) == 6 and t.isdigit())]
+        if bad:
+            raise ValueError(f"Identificadores DGT inválidos: {', '.join(bad[:5])}")
+        return sorted(set(tiles))
+
+    @property
+    def tile_keys(self) -> list[TileKey]:
+        from osm3d.geospatial.tiling import TileKey
+
+        return [TileKey.from_dgt_name(t) for t in self.tiles]
+
+    def polygon(self) -> BaseGeometry:
+        """União das quadrículas (EPSG:3763)."""
+        import shapely
+
+        return shapely.union_all([shapely.box(*k.bounds) for k in self.tile_keys])
+
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        """Caixa envolvente WGS84 das quadrículas (min_lon, min_lat, max_lon, max_lat)."""
+        from osm3d.geospatial.tiling import tile_rings_wgs84
+
+        pts = [p for ring in tile_rings_wgs84(self.tile_keys) for p in ring]
+        lons, lats = [p[0] for p in pts], [p[1] for p in pts]
+        return (min(lons), min(lats), max(lons), max(lats))
 
 
 class PathsConfig(BaseModel):
@@ -27,6 +76,12 @@ class PathsConfig(BaseModel):
     processed: Path = Path("data/processed")
     output: Path = Path("data/output")
     reference: Path = Path("data/reference")
+    # Registo das áreas criadas na aplicação e da área ativa (omissão: data/areas.json).
+    areas_file: Path | None = None
+
+    @property
+    def areas_path(self) -> Path:
+        return self.areas_file or self.processed.parent / "areas.json"
 
 
 class SourcesConfig(BaseModel):
@@ -41,6 +96,8 @@ class SourcesConfig(BaseModel):
         }
     )
     dgt_delay_s: float = Field(default=2.0, ge=0.5, description="Pausa entre pedidos à DGT.")
+    # Grelha oficial de quadrículas LiDAR (NAME, LOTE, DISPONIVEL); opcional.
+    dgt_tile_index: Path = Path("data/raw/dgt/LiDAR2024_2025_Seccionamento.gpkg")
     lidar_dir: Path = Path("data/raw/lidar")
     dtm_dir: Path = Path("data/raw/dtm")
     dsm_dir: Path = Path("data/raw/dsm")

@@ -179,7 +179,8 @@ class GroundInfo(BaseModel):
 class Building(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    osm_type: Literal["way", "relation"]
+    # "new": edifício em falta no OSM, detetado no LiDAR (ainda sem id OSM).
+    osm_type: Literal["way", "relation", "new"]
     osm_id: int
     osm_version: int = Field(description="Versão OSM no download — usada para detetar conflitos.")
     footprint: Geometry

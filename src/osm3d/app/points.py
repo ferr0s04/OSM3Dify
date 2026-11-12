@@ -83,6 +83,14 @@ class TilePointCache:
         self._mem: dict[str, PointSet] = {}  # ordem de inserção = ordem de uso (LRU)
         self._lock = threading.Lock()
 
+    def set_tiles(self, lidar_tiles: dict[str, Path]) -> None:
+        """Atualiza o índice de LAZ (após downloads ou limpeza de ficheiros raw)."""
+        with self._lock:
+            for name in list(self._mem):
+                if lidar_tiles.get(name) != self.lidar_tiles.get(name):
+                    self._mem.pop(name)
+            self.lidar_tiles = lidar_tiles
+
     def _tile(self, name: str) -> PointSet | None:
         src = self.lidar_tiles.get(name)
         if src is None:

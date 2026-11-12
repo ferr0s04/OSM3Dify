@@ -1,6 +1,7 @@
 // Aplicação de revisão: mapa (com filtros) + 3D + edição de tags e partes.
 import { api } from "./api.js";
 import { CHANGE_COLORS, CHANGE_LABELS, SHAPE_LABELS } from "./colors.js";
+import { DataView } from "./data.js";
 import { BuildingMap } from "./map.js";
 import { renderResults } from "./results.js";
 import { Viewer } from "./viewer.js";
@@ -35,6 +36,7 @@ const state = {
 
 const viewer = new Viewer($("#viewer"));
 const map = new BuildingMap("map", $("#legend"), (key) => select(key));
+const dataView = new DataView({ mapEl: $("#data-map"), panelEl: $("#data-panel"), hoverEl: $("#data-hover"), toast: (m, ms) => toast(m, ms) });
 
 function toast(msg, ms = 3500) {
   const el = $("#toast");
@@ -378,16 +380,7 @@ function wire() {
   $("#pe-undo").addEventListener("click", () => editor.undo());
 
   document.querySelectorAll(".tab").forEach((tab) =>
-    tab.addEventListener("click", async () => {
-      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
-      const results = tab.dataset.tab === "results";
-      $("#view-review").classList.toggle("hidden", results);
-      $("#view-results").classList.toggle("hidden", !results);
-      if (results) {
-        $("#view-results").innerHTML = "<p class='muted'>A calcular…</p>";
-        renderResults($("#view-results"), await api.summary());
-      }
-    }),
+    tab.addEventListener("click", () => showTab(tab.dataset.tab)),
   );
 
   $("#btn-export").addEventListener("click", async (e) => {
@@ -411,6 +404,40 @@ function wire() {
     else if (k === "r") review("rejected");
     else if (k === "u") resetReview();
   });
+}
+
+async function reviewChanged() {
+  // A revisão foi recarregada no servidor (outra área ou novos resultados) depois de a
+  // página a ter carregado? Então os edifícios, o mapa e o 3D desta página estão velhos.
+  try {
+    const a = await api.areas();
+    return state.reviewGeneration !== undefined && a.review_generation !== state.reviewGeneration;
+  } catch {
+    return false;
+  }
+}
+
+async function showTab(name) {
+  if ((name === "review" || name === "results") && (await reviewChanged())) {
+    location.hash = name === "review" ? "" : name;
+    return location.reload();
+  }
+  // O separador fica no URL: ao mudar de área a página recarrega e volta a ele.
+  history.replaceState(null, "", name === "review" ? location.pathname : `#${name}`);
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
+  for (const v of ["review", "results", "data"]) $(`#view-${v}`).classList.toggle("hidden", v !== name);
+  if (name === "results") {
+    $("#view-results").innerHTML = "<p class='muted'>A calcular…</p>";
+    try {
+      renderResults($("#view-results"), await api.summary());
+    } catch (e) {
+      $("#view-results").innerHTML = `<p class="muted">${esc(e.message)}</p>`;
+    }
+  } else if (name === "data") {
+    await dataView.show();
+  } else {
+    map.map.resize(); // o mapa pode ter mudado de tamanho enquanto estava escondido
+  }
 }
 
 // --------------------------------------------------------------- partes
@@ -649,9 +676,18 @@ async function reload() {
 
 async function init() {
   wire();
+  const initial = location.hash.slice(1);
+  // Geração da revisão carregada por esta página (ver reviewChanged).
+  try {
+    const a = await api.areas();
+    state.reviewGeneration = a.review_generation;
+    const active = a.areas.find((x) => x.active);
+    $("#area-name").textContent = active?.label ? `${active.label} · ${a.active}` : a.active;
+    $("#area-name").title = `Área ativa: ${a.active}, ${active?.tiles.length ?? "?"} quadrículas (mudar no separador Dados)`;
+  } catch { /* sem áreas: o erro aparece abaixo */ }
+  if (initial === "data" || initial === "results") showTab(initial);
   try {
     const [rows, geojson, summary] = await Promise.all([api.buildings(), api.geojson(), api.summary()]);
-    $("#area-name").textContent = summary.area;
     $("#palette").innerHTML = (summary.palette ?? []).map((c) => `<option value="${c.hex}">${esc(c.label)}</option>`).join("");
     map.setPalette(summary.palette ?? [], summary.default_colours ?? { roof: "#c8c8c8" });
     state.rows = rows;
@@ -660,6 +696,12 @@ async function init() {
     await map.setData(geojson);
     if (state.filtered.length) select(state.filtered[0].key);
   } catch (e) {
+    if (e.status === 503) {
+      // Sem resultados do pipeline (área nova): começar pelos dados.
+      toast(`${e.message}. No separador Dados: descarregar e processar a área.`, 8000);
+      if (initial !== "data") showTab("data");
+      return;
+    }
     toast(`Erro ao carregar: ${e.message}`, 10000);
   }
 }

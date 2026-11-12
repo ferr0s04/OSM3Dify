@@ -12,7 +12,10 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field
 
+import numpy as np
+import shapely
 from pyproj import Transformer
+from shapely.geometry.base import BaseGeometry
 
 from osm3d.domain.models import Building
 
@@ -68,6 +71,40 @@ def tiles_in_bbox(
     xs, ys = t.transform([w, w, e, e], [s, n, s, n])
     lo, hi = tile_of(min(xs), min(ys)), tile_of(max(xs), max(ys))
     return [TileKey(ix, iy) for ix in range(lo.ix, hi.ix + 1) for iy in range(lo.iy, hi.iy + 1)]
+
+
+def tiles_in_geometry(geom_wgs84: BaseGeometry, crs: str = "EPSG:3763") -> list[TileKey]:
+    """Quadrículas com interior em comum com um polígono WGS84 (p.ex. um limite)."""
+    t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    geom = shapely.transform(geom_wgs84, lambda c: np.column_stack(t.transform(c[:, 0], c[:, 1])))
+    x0, y0, x1, y1 = geom.bounds
+    lo, hi = tile_of(x0, y0), tile_of(x1, y1)
+    shapely.prepare(geom)
+    out = []
+    for ix in range(lo.ix, hi.ix + 1):
+        for iy in range(lo.iy, hi.iy + 1):
+            key = TileKey(ix, iy)
+            cell = shapely.box(*key.bounds)
+            if geom.intersects(cell) and geom.intersection(cell).area > 1.0:
+                out.append(key)
+    return out
+
+
+def tile_rings_wgs84(keys: list[TileKey], crs: str = "EPSG:3763") -> list[list[list[float]]]:
+    """Anel exterior (fechado, 5 vértices) de cada quadrícula em WGS84, para GeoJSON."""
+    if not keys:
+        return []
+    corners = np.array(
+        [
+            [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+            for x0, y0, x1, y1 in (k.bounds for k in keys)
+        ]
+    ).reshape(-1, 2)
+    t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    lon, lat = t.transform(corners[:, 0], corners[:, 1])
+    ring = np.round(np.column_stack([lon, lat]), 6).reshape(len(keys), 5, 2)
+    rings: list[list[list[float]]] = ring.tolist()
+    return rings
 
 
 @dataclass

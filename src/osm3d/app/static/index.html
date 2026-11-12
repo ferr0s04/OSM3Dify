@@ -22,6 +22,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="review">Revisão</button>
       <button class="tab" data-tab="results">Resultados</button>
+      <button class="tab" data-tab="data" title="Quadrículas LiDAR: selecionar área, descarregar e eliminar ficheiros raw">Dados</button>
     </nav>
     <div class="progress" id="progress"></div>
     <select id="archive-action" class="btn" title="Arquivar decisões já tratadas: deixam de aparecer na lista e no mapa e de ser exportadas">
@@ -99,6 +100,14 @@
   </main>
 
   <main id="view-results" class="view results-layout hidden"></main>
+
+  <main id="view-data" class="view data-layout hidden">
+    <section class="map-pane">
+      <div id="data-map"></div>
+      <div id="data-hover" class="legend data-legend"></div>
+    </section>
+    <section id="data-panel" class="data-panel detail"></section>
+  </main>
 
   <datalist id="palette"></datalist>
   <div id="toast" class="toast hidden"></div>

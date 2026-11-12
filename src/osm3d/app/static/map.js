@@ -132,7 +132,7 @@ class RoofsLayer {
   }
 }
 
-const BASEMAP = {
+export const BASEMAP = {
   version: 8,
   sources: {
     osm: {

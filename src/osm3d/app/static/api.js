@@ -9,7 +9,9 @@ async function request(method, url, body) {
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try { msg = (await res.json()).detail ?? msg; } catch { /* sem corpo JSON */ }
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
@@ -36,4 +38,23 @@ export const api = {
   partsPreview: (key, layout, overrides) => request("POST", `${path(key)}/parts/preview`, { layout, overrides }),
   partsSplit: (key, layout, part, a, b) => request("POST", `${path(key)}/parts/split`, { layout, part, a, b }),
   partsMerge: (key, layout, part) => request("POST", `${path(key)}/parts/merge`, { layout, part }),
+  // Dados raw (quadrículas DGT).
+  dataStatus: () => request("GET", "/api/data/status"),
+  dataTiles: (bbox) => request("GET", `/api/data/tiles?bbox=${bbox.map((v) => v.toFixed(5)).join(",")}`),
+  dataTilesByName: (names) => request("GET", `/api/data/tiles?names=${names.join(",")}`),
+  downloads: () => request("GET", "/api/data/downloads"),
+  startDownloads: (tiles, products) => request("POST", "/api/data/downloads", { tiles, products }),
+  cancelDownloads: () => request("DELETE", "/api/data/downloads"),
+  deleteRaw: (tiles, products, includeCache = true) =>
+    request("POST", "/api/data/delete", { tiles, products, include_cache: includeCache }),
+  // Áreas de estudo e processamento.
+  areas: () => request("GET", "/api/areas"),
+  createArea: (area) => request("POST", "/api/areas", area),
+  updateArea: (name, area) => request("PUT", `/api/areas/${encodeURIComponent(name)}`, area),
+  activateArea: (name) => request("POST", `/api/areas/${encodeURIComponent(name)}/activate`),
+  deleteArea: (name) => request("DELETE", `/api/areas/${encodeURIComponent(name)}`),
+  osmRelation: (id) => request("GET", `/api/osm/relation/${id}`),
+  processing: () => request("GET", "/api/processing"),
+  startProcessing: (opts) => request("POST", "/api/processing", opts),
+  cancelProcessing: () => request("DELETE", "/api/processing"),
 };

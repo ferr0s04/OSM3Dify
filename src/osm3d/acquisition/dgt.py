@@ -15,15 +15,19 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urljoin
 
 import requests
+
+if TYPE_CHECKING:
+    from osm3d.geospatial.tiling import TileKey
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +54,10 @@ _EXTENSIONS = {
 
 class DgtError(RuntimeError):
     pass
+
+
+class DgtCancelled(Exception):
+    """Download interrompido a pedido do utilizador (não é repetido como uma falha)."""
 
 
 # --------------------------------------------------------------------------- login
@@ -231,12 +239,20 @@ class DgtClient:
         dest_dir: Path,
         *,
         progress: Callable[[str], None] | None = None,
+        on_bytes: Callable[[int, int], None] | None = None,
+        cancel: threading.Event | None = None,
     ) -> Path:
+        """Descarrega um asset (retoma: não repete ficheiros completos).
+
+        ``on_bytes(feitos, total)`` reporta o progresso; ``cancel`` interrompe o download
+        (apaga o ``.part`` e levanta :class:`DgtCancelled`).
+        """
         dest = dest_dir / filename_for(item, asset)
         if dest.exists() and dest.stat().st_size > 0:
             log.info("Já existe: %s", dest)
             return dest
         dest_dir.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".part")
         for attempt in (1, 2, 3):
             self._ensure_session()
             time.sleep(self.delay_s)
@@ -250,19 +266,51 @@ class DgtClient:
                         self._logged_at = None
                         raise DgtError("Sessão expirada")
                     total = int(resp.headers.get("Content-Length", 0))
-                    tmp = dest.with_suffix(dest.suffix + ".part")
                     done, last_report = 0, 0.0
                     with tmp.open("wb") as fh:
                         for chunk in resp.iter_content(chunk_size=1 << 20):
+                            if cancel is not None and cancel.is_set():
+                                raise DgtCancelled(dest.name)
                             fh.write(chunk)
                             done += len(chunk)
+                            if on_bytes:
+                                on_bytes(done, total)
                             if progress and time.monotonic() - last_report > 5:
                                 last_report = time.monotonic()
                                 pct = f" ({done / total:.0%})" if total else ""
                                 progress(f"  {dest.name}: {done / 1e6:.0f} MB{pct}")
                     tmp.replace(dest)
                     return dest
+            except DgtCancelled:
+                tmp.unlink(missing_ok=True)
+                raise
             except (requests.RequestException, DgtError) as exc:
                 log.warning("Download falhou (tentativa %d): %s", attempt, exc)
                 time.sleep(5 * attempt)
+        tmp.unlink(missing_ok=True)
         raise DgtError(f"Não foi possível descarregar {dest.name}")
+
+
+class Searcher(Protocol):
+    def search(
+        self, bbox_wgs84: tuple[float, float, float, float], collections: list[str]
+    ) -> list[DgtItem]: ...
+
+
+def tile_items(
+    client: Searcher, key: TileKey, collection: str, crs: str = "EPSG:3763"
+) -> list[DgtItem]:
+    """Versão mais recente dos itens de uma coleção para uma quadrícula.
+
+    A bbox é encolhida 50 m para não apanhar as quadrículas vizinhas. Nos produtos da
+    grelha LiDAR (LAZ, MDT, MDS), os itens de outras quadrículas que ainda assim apareçam
+    são descartados. Os produtos noutra grelha (ortofotos: folhas de ~8 × 5 km, id sem
+    quadrícula, p.ex. ``ORTOS-2025-cog-25cm-097-3``) ficam: a pesquisa já garante que
+    intersetam a quadrícula.
+    """
+    found = [
+        it
+        for it in client.search(key.bounds_wgs84(crs, inset_m=50), [collection])
+        if it.tile is None or it.tile == key.dgt_name
+    ]
+    return latest_versions(found)

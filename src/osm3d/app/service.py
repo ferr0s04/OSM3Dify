@@ -123,6 +123,10 @@ class ReviewService:
         self._scene_cache: dict[str, dict[str, Any] | None] = {}
         self._wgs84: dict[str, Any] = {}
 
+    def refresh_points(self) -> None:
+        """Volta a indexar os LAZ (ficheiros raw descarregados ou apagados)."""
+        self.points.set_tiles(index_tiles(self.cfg.sources.lidar_dir, (".laz", ".las")))
+
     # ------------------------------------------------------------------ básico
 
     def _h(self, v: float) -> float:

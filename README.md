@@ -64,7 +64,10 @@ uv sync --extra osm        # + leitura de extratos PBF (pyosmium)
 ## Utilização
 
 ```bash
-uv run osm3d info                      # configuração ativa e estado dos artefactos
+uv run osm3d info                      # área ativa e estado dos artefactos
+uv run osm3d area                      # listar áreas; `osm3d area area-2` ativa outra
+uv run osm3d area --new --relation 3892769 # nova área (id area-N): quadrículas de um limite OSM
+uv run osm3d area --new --tiles 155480,156480 --label Teste  # nova área: quadrículas indicadas
 uv run osm3d stage fetch               # edifícios OSM da área (Overpass)
 uv run osm3d tiles                     # edifícios por quadrícula LiDAR (com id DGT)
 uv run osm3d dgt -t 155480 --dry-run   # verificar disponibilidade no Centro de Dados DGT
@@ -91,9 +94,14 @@ upload (por exemplo, numa área de teste), usar `export.josm_upload: never` no c
 O download da DGT precisa de `DGT_USER` e `DGT_PASSWORD` num ficheiro `.env` na raiz
 do repositório, que não é versionado.
 
-A configuração por omissão está em [config/config.yaml](config/config.yaml). Para
-uma área de estudo própria, copiar para `config/local.yaml` (ignorado pelo git) e usar
-`--config config/local.yaml`.
+A configuração por omissão está em [config/config.yaml](config/config.yaml). Uma área
+de estudo é **um conjunto de quadrículas LiDAR de 1 km**: o LAZ/MDT descarregado e os
+edifícios OSM processados (centróide dentro das quadrículas) são sempre os mesmos. A
+área **não depende do `config.yaml`**: a que lá está é só a inicial. As outras criam-se
+e ativam-se no separador "Dados" da aplicação ou com `osm3d area`, e ficam em
+`data/areas.json` (não versionado). A área ativa vale para a aplicação e para todos os
+comandos da CLI. No separador "Dados" também se descarregam as quadrículas da área e se
+corre o pipeline (fetch → qa) em segundo plano.
 
 ## Dados
 

@@ -25,8 +25,8 @@ ser reimplementadas.
 | --- | --- | --- |
 | **Revisão de edifícios** | ✅ Núcleo da aplicação | Nenhuma ferramenta existente compara o modelo 3D proposto com os pontos LiDAR de cada edifício nem gere uma fila de revisão. A revisão humana é também uma exigência para publicar no OSM (Import Guidelines / Automated Edits). |
 | **Visualização de resultados** | ✅ Integrada na revisão | O QGIS abre os GeoPackages, mas a inspeção edifício a edifício (modelo vs. nuvem de pontos) é lenta. |
-| **Seleção de área** | ⏸️ Fase posterior | Útil com várias áreas ou para o concelho inteiro. Hoje é uma entrada no `config.yaml`. |
-| **Gestão de downloads/processamento** | ⏸️ Fase posterior | Para um só utilizador, a CLI chega. Ganha valor com ~170 quadrículas (concelho), como página de estado: descarregada → processada → revista. |
+| **Seleção de área** | ✅ Separador "Dados" | Áreas criadas, editadas e ativadas na aplicação (registo `data/areas.json`); o `config.yaml` só dá a área inicial. |
+| **Gestão de downloads/processamento** | ✅ | Downloads em segundo plano, eliminação de ficheiros raw por quadrícula e pipeline (fetch → qa) da área ativa em segundo plano (ver §8). |
 
 ### O que não entra
 
@@ -223,6 +223,61 @@ aplicadas (`export.include_pending: false`, por omissão desde 2026-11-11).
     - o contorno recebe `height` = parte mais alta;
     - só para contornos simples (way), e só se o edifício ainda não tiver
       `building:part` no OSM.
+
+- **Separador "Dados"** (`src/osm3d/app/data.py`, `downloads.py`, `static/data.js`):
+  - grelha oficial `LiDAR2024_2025_Seccionamento.gpkg` (`sources.dgt_tile_index`):
+    lê só `NAME`, `LOTE` e `DISPONIVEL`; a geometria sai do identificador. Sem o
+    ficheiro, usa a malha de 1 km calculada. `DISPONIVEL` é só informativo (está
+    desatualizado);
+  - mapa com o estado local de cada quadrícula (LAZ + MDT, incompleta, nada) e a área
+    do `config.yaml`;
+  - seleção: clique, `Shift`+arrastar (acrescenta um retângulo), `Alt`+arrastar
+    (retira), "Área do projeto", "Com ficheiros";
+  - **download em falta**: fila em segundo plano (uma thread, pedidos em série com
+    pausa, uma sessão DGT), com progresso por ficheiro e cancelamento. Só descarrega
+    os produtos que ainda não existem localmente. Por omissão, LAZ + MDT;
+  - **ortofotos noutra grelha:** a DGT distribui-as em folhas de ~8 × 5 km
+    (`ORTOS-2025-cog-25cm-097-3`, COG de 25 cm, ~480 MB), sem identificador de
+    quadrícula. A pesquisa aceita-as por interseção, o inventário lê os limites do
+    GeoTIFF para saber que quadrículas cada folha cobre, e uma folha só é descarregada
+    uma vez. Apagá-la retira-a a todas as quadrículas que cobre;
+  - **eliminar ficheiros locais** das quadrículas selecionadas, por produto, incluindo
+    `.part` e versões antigas e, opcionalmente, as caches de pontos `.npz` da revisão.
+    É recusado enquanto houver downloads dessas quadrículas;
+  - a aplicação arranca mesmo sem resultados do pipeline: abre diretamente no separador
+    "Dados" (área nova).
+- **Áreas de estudo** (`src/osm3d/areas.py`, `app/context.py`):
+  - **uma área é só um conjunto de quadrículas de 1 km.** As mesmas quadrículas definem
+    o LAZ/MDT a descarregar, os ficheiros que o pipeline lê e os edifícios OSM
+    processados: os que têm o centróide dentro delas (`pipeline.in_area`). Cada edifício
+    pertence a uma só quadrícula, por isso áreas vizinhas não partilham edifícios. Já
+    não há bbox nem relação OSM na configuração. Uma `bbox` antiga é convertida nas
+    quadrículas que interseta;
+  - registo em `data/areas.json`, com a área ativa. A área do `config.yaml` é a inicial,
+    pode ser ajustada mas não removida;
+  - edição no mapa: clique, `Shift`+arrastar (acrescenta) ou `Alt`+arrastar (retira).
+    "Juntar limite" acrescenta as quadrículas que cobrem uma relação OSM (polígono pelo
+    Nominatim). Exemplos: Vilar e Mosteiró ocupa 16 quadrículas, Vila do Conde 187. As
+    alterações ficam por guardar até "Guardar área";
+  - se as quadrículas mudarem depois do processamento, a área fica marcada como
+    desatualizada até ser processada de novo;
+  - o identificador é neutro e gerado (`area-1`, `area-2`, …), dá a pasta
+    `data/processed/<id>` e nunca muda. O nome a mostrar é opcional e editável (✎), porque
+    as quadrículas também podem mudar. Os registos antigos, com ids derivados de nomes de
+    lugares, migram uma vez para `area-<n>`: a pasta muda de nome e um nome herdado da
+    área inicial é descartado. Remover uma área só a tira do registo: os dados ficam;
+  - o OSM em cache (`00_fetch.osm`, `osm_context.json`) regista para que quadrículas
+    foi obtido (`*.meta.json`). Se as quadrículas mudarem, é obtido de novo;
+  - a revisão é recarregada ao voltar ao separador "Revisão" sempre que o servidor a
+    recarregou (outra área ou novos resultados: `review_generation` em `/api/areas`);
+  - ativar uma área recarrega a página: a revisão passa a ser a dessa área, ou fica
+    indisponível até ser processada;
+  - a CLI usa a mesma área ativa (`osm3d area` para listar, ativar ou criar).
+- **Processamento** (`app/processing.py`): "Processar área" corre `fetch → qa` (e,
+  opcionalmente, `candidates`) da área ativa numa thread, com o mesmo `run_stage` da
+  CLI, e mostra as fases e o registo. Opção para voltar a obter o OSM. Só há uma corrida
+  de cada vez, e não se muda de área durante uma corrida. Cancelar só tem efeito entre
+  fases. No fim, a revisão é recarregada com os novos resultados.
 
 ### Por fazer
 
