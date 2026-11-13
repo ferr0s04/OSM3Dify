@@ -744,7 +744,7 @@ export class DataView {
       <label class="check"><input type="checkbox" id="p-municipal" ${on ? "checked" : ""}>
         usar a cartografia municipal (${esc(m.name)})</label>
       <span class="muted">Contornos municipais confirmados pelo LiDAR passam a candidatos (casa, anexo, garagem, telheiro separados);
-        candidatos só do LiDAR que não constam dela ficam sinalizados. Área mínima ${m.min_area_m2} m²${m.source_tag ? ` · tag <code>source=${esc(m.source_tag)}</code>` : ""}.</span>
+        candidatos só do LiDAR que não constam dela ficam sinalizados. Área mínima ${m.min_area_m2} m².</span>
       <span>${cache}${used} · <a href="${esc(m.viewer_url)}" target="_blank" rel="noopener">geoportal ↗</a></span>
       <label class="check"><input type="checkbox" id="p-muni-refresh" ${on ? "" : "disabled"} ${this.processOpts.refresh_municipal ? "checked" : ""}>
         voltar a obter do geoportal (refaz os candidatos)</label>

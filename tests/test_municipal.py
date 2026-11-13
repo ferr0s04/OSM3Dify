@@ -107,14 +107,14 @@ def test_merge_municipal(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _ctx(pts, 5.0, osm=[in_osm])
     # Candidato LiDAR que junta casa + anexo (encostados): substituído pelos municipais.
     lidar = [_lidar_candidate(box(0, 0, 14, 8)), _lidar_candidate(recent)]
-    cfg = MunicipalSourceConfig(enabled=True, source_tag="CM Teste")
+    cfg = MunicipalSourceConfig(enabled=True)
     out, stats = merge_municipal(ctx, lidar, municipal, (0.0, 0.0), cfg)
     assert stats.from_municipal == 2 and stats.without_lidar == 1
     assert stats.replaced == 1 and stats.not_in_municipal == 1
     tags = sorted(b.existing_tags["building"] for b in out if "municipal_gid" in b.diagnostics)
     assert tags == ["house", "shed"]
     muni = next(b for b in out if b.diagnostics.get("municipal_gid") == 1.0)
-    assert muni.existing_tags["source"] == "CM Teste"
+    assert muni.existing_tags == {"building": "house"}  # sem tag source
     assert muni.footprint.equals(house)
     only_lidar = next(b for b in out if "municipal_gid" not in b.diagnostics)
     assert "not_in_municipal" in {f.code for f in only_lidar.qa_flags}

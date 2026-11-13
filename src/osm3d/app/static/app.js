@@ -245,7 +245,7 @@ function osmTags(d) {
 
 function renderTags(tags, existing) {
   const keys = [...new Set([...Object.keys(existing), ...Object.keys(tags.proposed), ...Object.keys(tags.final)])]
-    .filter((k) => k.startsWith("roof") || k.startsWith("building") || k.includes("height") || k === "source")
+    .filter((k) => k.startsWith("roof") || k.startsWith("building") || k.includes("height"))
     .sort();
   return `<table class="kv"><tr><th>tag</th><th>OSM atual</th><th>proposto</th><th>final</th></tr>
     ${keys

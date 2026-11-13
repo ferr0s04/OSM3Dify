@@ -479,7 +479,6 @@ def municipal_status(config: Config) -> dict[str, Any]:
         "name": m.name,
         "enabled": m.enabled,
         "viewer_url": m.viewer_url,
-        "source_tag": m.source_tag,
         "min_area_m2": m.min_area_m2,
         "cached": path.exists(),
         "n": meta.get("n"),

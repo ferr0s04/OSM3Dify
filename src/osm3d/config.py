@@ -99,8 +99,6 @@ class MunicipalSourceConfig(BaseModel):
     filter: str = "objeto = 'const_poligonos'"
     chunk_m: float = Field(default=250.0, gt=10, le=1000)
     delay_s: float = Field(default=0.5, ge=0.2, description="Pausa entre pedidos.")
-    # Tag ``source`` dos edifícios novos com contorno municipal (None: sem tag).
-    source_tag: str | None = None
     min_area_m2: float = Field(default=8.0, ge=0)
 
 

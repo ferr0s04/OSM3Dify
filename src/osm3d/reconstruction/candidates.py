@@ -816,8 +816,6 @@ def municipal_candidate(
     if height is None or cover < MUNICIPAL_MIN_COVER or height < MUNICIPAL_MIN_HEIGHT_M:
         return False
     tags = {"building": tag}
-    if cfg.source_tag:
-        tags["source"] = cfg.source_tag
     flags = [
         QAFlag(
             code="missing_in_osm",
