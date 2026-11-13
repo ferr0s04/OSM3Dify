@@ -82,6 +82,24 @@ def test_ground_sampling(tmp_path: Path) -> None:
     assert index_tiles(tmp_path, (".tif",)) == {"155480": path}
 
 
+def test_reconstruction_keeps_detection_flags() -> None:
+    from osm3d.config import AreaConfig, Config
+    from osm3d.reconstruction.building import reconstruct_building
+
+    class NoDtm:
+        def values_in(self, geom: object) -> np.ndarray:
+            return np.empty(0)
+
+    cand = _building(1, None).model_copy(
+        update={"qa_flags": [QAFlag(code="not_in_municipal", message="m", severity="warning")]}
+    )
+    cfg = Config(area=AreaConfig(name="t", bbox=(-8.68, 41.27, -8.65, 41.29)))
+    out, _ = reconstruct_building(
+        cand, PointSet(np.zeros((0, 3)), np.zeros(0, np.uint8)), NoDtm(), (0.0, 0.0), cfg
+    )  # type: ignore[arg-type]
+    assert [f.code for f in out.qa_flags] == ["not_in_municipal", "no_ground"]
+
+
 def test_fit_then_evaluate() -> None:
     syn = make_roof(RoofShape.HIPPED)
     fit = fit_roof(syn.footprint, syn.points, syn.ground_z)

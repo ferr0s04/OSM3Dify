@@ -21,7 +21,7 @@ from osm3d.app.service import ReviewService
 from osm3d.areas import area_store, with_area
 from osm3d.config import AreaConfig, Config
 from osm3d.geospatial.tiling import tiles_in_geometry
-from osm3d.pipeline import Stage, artefact_path, stage_state
+from osm3d.pipeline import Stage, artefact_path, municipal_status, stage_state
 
 # relation_id → (nome, polígono GeoJSON WGS84)
 RelationLookup = Callable[[int], tuple[str | None, Any]]
@@ -116,6 +116,8 @@ class AppContext:
             "review_generation": self.review_generation,
             "stages": self.stages(),
             "processing": self.pipeline.state(),
+            # Cartografia municipal (fase candidates): estado da cache e se foi usada.
+            "municipal": municipal_status(self.cfg),
         }
 
     def activate(self, name: str) -> dict[str, Any]:
@@ -183,8 +185,19 @@ class AppContext:
         return out
 
     def process(
-        self, *, candidates: bool = False, redo_from: Stage | None = None
+        self,
+        *,
+        candidates: bool = False,
+        redo_from: Stage | None = None,
+        municipal: bool | None = None,
+        refresh_municipal: bool = False,
     ) -> dict[str, Any]:
         """Processa as fases em falta (e, se pedido, refaz a partir de ``redo_from``)."""
         with self._lock:
-            return self.pipeline.start(self.cfg, candidates=candidates, redo_from=redo_from)
+            return self.pipeline.start(
+                self.cfg,
+                candidates=candidates,
+                redo_from=redo_from,
+                municipal=municipal,
+                refresh_municipal=refresh_municipal,
+            )

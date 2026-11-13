@@ -45,6 +45,21 @@ sources:
   dtm_dir: data/raw/dtm            # MDT GeoTIFF do mesmo levantamento LiDAR
   dsm_dir: data/raw/dsm            # MDS GeoTIFF (opcional)
   orthophoto_dir: data/raw/orthophotos
+  # Cartografia municipal de edifícios (1:5000 homologada, ~2017) do geoportal
+  # MapGuide da Câmara, usada na fase candidates (uso autorizado pelo município).
+  # Polígonos confirmados pelo LiDAR passam a candidatos com o contorno municipal;
+  # candidatos só do LiDAR que não constam dela são sinalizados.
+  # Ver src/osm3d/acquisition/municipal.py.
+  municipal:
+    enabled: true
+    name: Câmara Municipal de Vila do Conde
+    viewer_url: https://sig.cm-viladoconde.pt/geoportal
+    mapagent_url: https://sig.cm-viladoconde.pt/mapguide/mapagent/mapagent.fcgi
+    chunk_m: 250       # caixa de cada pedido
+    delay_s: 0.5       # pausa entre pedidos (uso responsável)
+    min_area_m2: 8.0
+    # Tag "source" dos edifícios novos com contorno municipal (vazio: sem tag).
+    source_tag: Câmara Municipal de Vila do Conde
 
 footprints:
   min_area_m2: 20.0
@@ -75,9 +90,10 @@ roofs:
   max_rmse_m: 0.20
 
 appearance:
-  # roof:colour a partir do RGB do LiDAR, com uma paleta realista (telha, branco,
-  # cinzentos). Ver src/osm3d/appearance/roof_colours.py. A cor das fachadas não é
-  # estimada: o LiDAR aéreo não tem pontos nas fachadas.
+  # roof:colour a partir do ortofoto (se houver) confirmado pelo RGB do LiDAR, com uma
+  # paleta realista (telha, telha escura, vermelho, laranja, verde, branco, cinzentos).
+  # Ver src/osm3d/appearance/roof_colours.py. A cor das fachadas não é estimada: o
+  # LiDAR aéreo não tem pontos nas fachadas.
   enabled: true
   min_colour_confidence: 0.6
 

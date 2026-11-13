@@ -43,7 +43,8 @@ export class DataView {
     this.extras = new Set(); // produtos opcionais (MDS, ortofotos)
     this.includeCache = true;
     // redo_from: "" = só as fases em falta/desatualizadas; senão refaz a partir dessa.
-    this.processOpts = { candidates: false, redo_from: "" };
+    // municipal: usar a cartografia municipal nos candidatos (null = a do config.yaml).
+    this.processOpts = { candidates: false, redo_from: "", municipal: null, refresh_municipal: false };
     this.jobs = new Map(); // quadrícula → estado da tarefa de download ativa
     this.downloads = null;
     this.processing = null;
@@ -131,6 +132,7 @@ export class DataView {
     await this.ensureKnown([...this.draft]);
     this.setDownloads(this.status.downloads);
     this.setProcessing(this.areas.processing);
+    if (this.processOpts.municipal === null && this.areas.municipal) this.processOpts.municipal = this.areas.municipal.enabled;
     this.renderOthers();
     if (!this.framed) {
       this.framed = true;
@@ -504,10 +506,22 @@ export class DataView {
     return all.filter((s) => {
       const forced = redo && order.indexOf(s.stage) >= order.indexOf(redo);
       const follows = chain && s.stage !== "candidates";
-      const run = forced || follows || s.state !== "done";
+      const run = forced || follows || (s.stage === "candidates" ? this.candidatesNeedRun(s) : s.state !== "done");
       if (run && s.stage !== "candidates") chain = true;
       return run;
     }).map((s) => s.stage);
+  }
+
+  candidatesNeedRun(s) {
+    // O estado do servidor usa a escolha do config.yaml; aqui conta a escolha do painel.
+    const m = this.areas?.municipal;
+    const want = !!this.processOpts.municipal;
+    if (s.state === "missing" || this.processOpts.refresh_municipal) return true;
+    if (m && m.used_in_candidates !== null && want !== m.used_in_candidates) return true;
+    if (m && m.used_in_candidates === null && want) return true;
+    const aboutMunicipal = (s.reason ?? "").startsWith("cartografia municipal");
+    if (aboutMunicipal) return want && s.reason.includes("por obter");
+    return s.state !== "done";
   }
 
   async process() {
@@ -522,10 +536,14 @@ export class DataView {
     const what = `${redo ? `Refazer a partir de "${STAGE_LABELS[redo]}"` : "Fases em falta"}: ${plan.map((s) => STAGE_LABELS[s]).join(" → ")}`;
     if (!confirm(`Processar a área "${a.label || a.name}" (${a.tiles.length} quadrículas)?\n\n${what}${warn}\n\nPode demorar vários minutos; a revisão é recarregada no fim.`)) return;
     try {
+      const cand = this.processOpts.candidates;
       this.setProcessing(await api.startProcessing({
-        candidates: this.processOpts.candidates,
+        candidates: cand,
         redo_from: this.processOpts.redo_from || null,
+        municipal: cand ? !!this.processOpts.municipal : null,
+        refresh_municipal: cand && !!this.processOpts.municipal && this.processOpts.refresh_municipal,
       }));
+      this.processOpts.refresh_municipal = false;
       this.renderProcessing();
     } catch (e) {
       this.toast(`Processar: ${e.message}`, 6000);
@@ -643,6 +661,7 @@ export class DataView {
       <h3>Processamento</h3>
       ${this.renderStageStates()}
       <label class="check small"><input type="checkbox" id="p-candidates" ${this.processOpts.candidates ? "checked" : ""}> incluir edifícios em falta no OSM (candidatos)</label>
+      ${this.processOpts.candidates ? this.renderMunicipal() : ""}
       <label class="small redo">refazer:
         <select id="p-redo" title="Por omissão só correm as fases em falta ou desatualizadas">
           <option value="">nada (só as fases em falta)</option>
@@ -689,6 +708,15 @@ export class DataView {
       if (!e.target.checked && this.processOpts.redo_from === "candidates") this.processOpts.redo_from = "";
       this.renderPanel();
     };
+    $p("#p-municipal")?.addEventListener("input", (e) => {
+      this.processOpts.municipal = e.target.checked;
+      if (!e.target.checked) this.processOpts.refresh_municipal = false;
+      this.renderPanel();
+    });
+    $p("#p-muni-refresh")?.addEventListener("input", (e) => {
+      this.processOpts.refresh_municipal = e.target.checked;
+      this.renderPanel();
+    });
     $p("#p-redo").oninput = (e) => {
       this.processOpts.redo_from = e.target.value;
       this.renderPanel();
@@ -700,6 +728,27 @@ export class DataView {
     this.panelEl.querySelectorAll("[data-delete-tile]").forEach((el) => (el.onclick = () => this.removeFiles([el.dataset.deleteTile], `a quadrícula ${el.dataset.deleteTile}`)));
     this.renderDownloads();
     this.renderProcessing();
+  }
+
+  renderMunicipal() {
+    // Cartografia municipal de edifícios (fase candidatos): usar ou não, estado, refazer.
+    const m = this.areas?.municipal;
+    if (!m) return "";
+    const on = !!this.processOpts.municipal;
+    const when = m.fetched_at ? new Date(m.fetched_at).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "short" }) : null;
+    const cache = m.cached
+      ? `${m.n ?? "?"} polígonos de edifício obtidos${when ? ` em ${when}` : ""}`
+      : "ainda não obtida (é obtida ao processar os candidatos)";
+    const used = m.used_in_candidates === null ? "" : m.used_in_candidates ? " · usada nos candidatos atuais" : " · os candidatos atuais não a usam";
+    return `<div class="muni-box small">
+      <label class="check"><input type="checkbox" id="p-municipal" ${on ? "checked" : ""}>
+        usar a cartografia municipal (${esc(m.name)})</label>
+      <span class="muted">Contornos municipais confirmados pelo LiDAR passam a candidatos (casa, anexo, garagem, telheiro separados);
+        candidatos só do LiDAR que não constam dela ficam sinalizados. Área mínima ${m.min_area_m2} m²${m.source_tag ? ` · tag <code>source=${esc(m.source_tag)}</code>` : ""}.</span>
+      <span>${cache}${used} · <a href="${esc(m.viewer_url)}" target="_blank" rel="noopener">geoportal ↗</a></span>
+      <label class="check"><input type="checkbox" id="p-muni-refresh" ${on ? "" : "disabled"} ${this.processOpts.refresh_municipal ? "checked" : ""}>
+        voltar a obter do geoportal (refaz os candidatos)</label>
+    </div>`;
   }
 
   renderLocal() {

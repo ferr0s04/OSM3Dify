@@ -44,11 +44,12 @@
       <div class="filterbar" id="filterbar">
         <input id="f-search" type="search" placeholder="id OSM…" title="Procurar por id OSM">
         <!-- Dropdowns multi-seleção (nada marcado = todos). -->
-        <details class="msel" data-group="origin" data-label="origem" title="Edifícios do OSM ou em falta no OSM (detetados no LiDAR)">
+        <details class="msel" data-group="origin" data-label="origem" title="Edifícios do OSM ou em falta no OSM (contorno municipal ou do LiDAR)">
           <summary></summary>
           <div class="msel-menu">
             <label><input type="checkbox" value="osm"> do OSM</label>
-            <label><input type="checkbox" value="new"> em falta no OSM</label>
+            <label title="Contorno da cartografia municipal, confirmado pelo LiDAR"><input type="checkbox" value="municipal"> novo: cartografia municipal</label>
+            <label title="Só no LiDAR/ortofoto (com a cartografia ativa: não consta dela)"><input type="checkbox" value="lidar"> novo: só LiDAR</label>
           </div>
         </details>
         <details class="msel" data-group="change" data-label="relação OSM" title="O que a análise muda no OSM">
@@ -86,6 +87,7 @@
           <option value="status">Cor: estado da revisão</option>
           <option value="match">Cor: concordância com OSM</option>
           <option value="shape">Cor: forma do telhado (análise)</option>
+          <option value="origin">Cor: origem (OSM / municipal / LiDAR)</option>
         </select>
         <label class="check"><input id="m-3d" type="checkbox"> 3D</label>
         <select id="m-base" title="Fundo do mapa"><option value="osm">Fundo: mapa OSM</option></select>

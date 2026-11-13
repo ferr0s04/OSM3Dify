@@ -11,8 +11,53 @@ const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const fmt = (v, unit = "") => (v === null || v === undefined ? "—" : `${v}${unit}`);
 const SHAPES = ["flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "round", "unknown"];
-const OVERRIDE_FIELDS = ["ground", "roof_shape", "height", "roof_height", "roof_orientation", "roof_direction", "roof_colour", "building_colour"];
-const COLOUR_SOURCE = { "omissão": "sem tag: cor por omissão", OSM: "já no OSM", estimada: "estimada (LiDAR)", manual: "corrigida" };
+const OVERRIDE_FIELDS = ["ground", "building", "roof_shape", "height", "roof_height", "roof_orientation", "roof_direction", "roof_colour", "building_colour"];
+const COLOUR_SOURCE = { "omissão": "sem tag: cor por omissão", OSM: "já no OSM", estimada: "estimada", manual: "corrigida" };
+const COLOUR_VIA = { orthophoto: "ortofoto + LiDAR", lidar: "só LiDAR" };
+
+// Origem da cor estimada e confiança (abaixo do mínimo, a tag não é exportada).
+function colourSource(c, conf) {
+  let s = COLOUR_SOURCE[c.roof_source] ?? c.roof_source;
+  if (c.roof_via) s += ` (${COLOUR_VIA[c.roof_via] ?? c.roof_via})`;
+  if (conf !== null && conf !== undefined) {
+    const min = state.summary?.min_colour_confidence ?? 0;
+    s += ` · ${Math.round(conf * 100)}%${c.roof_source === "omissão" && conf < min ? ` < ${Math.round(min * 100)}%: não exportada` : ""}`;
+  }
+  return s;
+}
+
+// Amostras da paleta de telhados para um campo de cor (clicar escolhe a cor).
+function swatches(current, attrs) {
+  const pal = state.summary?.palette ?? [];
+  const cur = (current ?? "").toLowerCase();
+  return `<div class="swatches" ${attrs}>${pal
+    .map((c) => `<button type="button" class="swatch ${c.hex === cur ? "on" : ""}" data-hex="${c.hex}" title="${esc(c.label)} (${c.hex})" style="background:${c.hex}"></button>`)
+    .join("")}</div>`;
+}
+
+// Liga as amostras ao campo de cor: muda o valor e dispara "input" (como o seletor).
+function wireSwatches(root) {
+  root.querySelectorAll(".swatches").forEach((box) =>
+    box.addEventListener("click", (e) => {
+      const btn = e.target.closest(".swatch");
+      if (!btn) return;
+      const input = box.dataset.for
+        ? root.querySelector(`[name="${box.dataset.for}"]`)
+        : root.querySelector(`[data-f="roof_colour"][data-i="${box.dataset.i}"]`);
+      if (!input) return;
+      input.value = btn.dataset.hex;
+      box.querySelectorAll(".swatch").forEach((s) => s.classList.toggle("on", s === btn));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }),
+  );
+}
+
+function buildingTypeOptions(sel) {
+  const types = state.summary?.building_types ?? [];
+  const known = types.some((t) => t.value === sel);
+  return (known ? "" : `<option value="${esc(sel)}" selected>${esc(sel)}</option>`) +
+    types.map((t) => `<option value="${t.value}" ${t.value === sel ? "selected" : ""}>${esc(t.label)} (${t.value})</option>`).join("");
+}
 
 // Converte qualquer cor CSS (p.ex. "red", do OSM) em #rrggbb para os campos de cor.
 function toHex(css) {
@@ -85,7 +130,7 @@ function applyFilters() {
   const rows = state.rows.filter(
     (r) =>
       (!q || r.key.includes(q)) &&
-      (!origin.size || origin.has(r.candidate ? "new" : "osm")) &&
+      (!origin.size || origin.has(r.candidate ? r.candidate_source ?? "lidar" : "osm")) &&
       (!change.size || change.has(r.change)) &&
       (!status.size || status.has(r.status)) &&
       (!flagged || r.needs_review) &&
@@ -193,9 +238,14 @@ function renderOsmChange(d) {
   </div>`;
 }
 
+// Tags já no OSM: num edifício novo não há nenhuma (building/source são propostas).
+function osmTags(d) {
+  return d.candidate ? {} : d.existing_tags;
+}
+
 function renderTags(tags, existing) {
-  const keys = [...new Set([...Object.keys(existing), ...Object.keys(tags.proposed)])]
-    .filter((k) => k.startsWith("roof") || k.startsWith("building") || k.includes("height"))
+  const keys = [...new Set([...Object.keys(existing), ...Object.keys(tags.proposed), ...Object.keys(tags.final)])]
+    .filter((k) => k.startsWith("roof") || k.startsWith("building") || k.includes("height") || k === "source")
     .sort();
   return `<table class="kv"><tr><th>tag</th><th>OSM atual</th><th>proposto</th><th>final</th></tr>
     ${keys
@@ -228,7 +278,10 @@ function renderDetail() {
            <a href="#" id="josm-link" data-obj="${josmType}${d.osm_id}">carregar no JOSM</a>
            <span class="muted">v${d.osm_version} · ${esc(d.existing_tags.building ?? "")} · ${fmt(d.area, " m²")}</span>`
         : `<span class="chip candidate" title="Pontos de edifício no LiDAR sem contorno no OSM">em falta no OSM</span>
-           <span class="muted">${d.diagnostics?.ortho_offset_dx !== undefined ? "contorno do ortofoto" : "contorno do LiDAR (inclui beirais)"} · ${fmt(d.area, " m²")} · ao aceitar, é exportado como edifício novo</span>`}
+           ${d.candidate_source === "municipal" ? '<span class="chip municipal" title="Contorno da cartografia municipal, confirmado pelo LiDAR">cartografia municipal</span>' : ""}
+           <span class="muted">${d.candidate_source === "municipal"
+             ? `contorno municipal (gid ${fmt(d.diagnostics?.municipal_gid)}; LiDAR em ${Math.round((d.diagnostics?.municipal_lidar_cover ?? 0) * 100)}% da área)`
+             : d.diagnostics?.ortho_offset_dx !== undefined ? "contorno do ortofoto" : "contorno do LiDAR (inclui beirais)"} · ${fmt(d.area, " m²")} · ao aceitar, é exportado como edifício novo</span>`}
     </div>
     ${renderOsmChange(d)}
     <div class="actions">
@@ -240,6 +293,8 @@ function renderDetail() {
     <h3>Correções</h3>
     <form class="form" id="edit-form" autocomplete="off">
       ${renderGround(d, val, t)}
+      ${d.candidate ? `<label class="full ${t("building")}">building (tipo do edifício novo) <span class="est">${d.candidate_source === "municipal" ? "da cartografia municipal" : "estimado"}: ${esc(d.estimated_building ?? "yes")}</span>
+        <select name="building">${buildingTypeOptions(val("building", d.building_type ?? "yes"))}</select></label>` : ""}
       <label class="${t("roof_shape")}">forma do telhado <span class="est">estimado: ${fmt(est.roof_shape)} (${fmt(est.roof_shape_conf)})</span>
         <select name="roof_shape">${shapeOpts(val("roof_shape", eff.roof_shape))}</select></label>
       <label class="${t("height")}">height (m) <span class="est">estimado: ${fmt(est.height)}</span>
@@ -254,8 +309,9 @@ function renderDetail() {
         </select></label>
       <label class="${t("roof_direction")}">roof:direction (°, uma água) <span class="est">estimado: ${fmt(est.roof_direction)}</span>
         <input name="roof_direction" type="number" step="1" min="0" max="359" value="${val("roof_direction", eff.roof_direction)}"></label>
-      <label class="${t("roof_colour")}">roof:colour <span class="est">${COLOUR_SOURCE[d.colours.roof_source]}${est.roof_colour_conf !== null && est.roof_colour_conf !== undefined ? ` (${Math.round(est.roof_colour_conf * 100)}%)` : ""}</span>
-        <input name="roof_colour" type="color" list="palette" value="${toHex(val("roof_colour", d.colours.roof))}"></label>
+      <label class="${t("roof_colour")}">roof:colour <span class="est">${colourSource(d.colours, est.roof_colour_conf)}</span>
+        <input name="roof_colour" type="color" list="palette" value="${toHex(val("roof_colour", d.colours.roof))}">
+        ${swatches(toHex(val("roof_colour", d.colours.roof)), 'data-for="roof_colour"')}</label>
       <label class="${t("building_colour")}">building:colour <span class="est">${COLOUR_SOURCE[d.colours.walls_source]}</span>
         <input name="building_colour" type="color" value="${toHex(val("building_colour", d.colours.walls))}"></label>
       <label class="full">nota<textarea name="note" rows="2">${esc(d.note ?? "")}</textarea></label>
@@ -265,7 +321,7 @@ function renderDetail() {
     <div id="parts-section"></div>
 
     <h3>Tags</h3>
-    <div id="tags">${renderTags(d.tags, d.existing_tags)}</div>
+    <div id="tags">${renderTags(d.tags, osmTags(d))}</div>
 
     <h3>Sinalizações</h3>
     <div class="flags">${d.qa_flags.length ? d.qa_flags.map((f) => `<div><span class="chip ${f.severity === "info" ? "" : f.severity === "error" ? "bad" : "warn"}">${esc(f.code)}</span> ${esc(f.message)}</div>`).join("") : '<span class="muted">nenhuma</span>'}</div>
@@ -290,6 +346,7 @@ function renderDetail() {
       .catch(() => toast("JOSM não respondeu: está aberto com o controlo remoto ativo?"));
   };
   const form = $("#edit-form");
+  wireSwatches(form);
   form.addEventListener("input", (e) => {
     const name = e.target.name;
     if (!OVERRIDE_FIELDS.includes(name)) return;
@@ -309,7 +366,7 @@ function schedulePreview() {
       const p = await api.preview(key, overrides());
       if (token !== state.token) return;
       viewer.setModel(p.mesh);
-      $("#tags").innerHTML = renderTags(p.tags, state.detail.existing_tags);
+      $("#tags").innerHTML = renderTags(p.tags, osmTags(state.detail));
       // Mudar o terreno de referência recalcula a altura (se não foi corrigida à mão).
       const h = document.querySelector('[name="height"]');
       if (h && !state.touched.has("height") && p.effective) h.value = p.effective.height;
@@ -580,7 +637,7 @@ function schedulePartsPreview(delay = 300) {
       state.parts.info = res;
       if (res.mesh) viewer.setModel(res.mesh);
       updatePartsInfo();
-      if (res.tags) $("#tags").innerHTML = renderTags(res.tags, state.detail.existing_tags) + renderPartTags(res.parts);
+      if (res.tags) $("#tags").innerHTML = renderTags(res.tags, osmTags(state.detail)) + renderPartTags(res.parts);
     } catch (e) {
       toast(`Partes: ${e.message}`);
     }
@@ -631,7 +688,8 @@ function renderPartsSection() {
             <label>min_height (m)<input data-f="min_height" data-i="${i}" type="number" step="0.5" min="0" value="${ov(i, "min_height")}"></label>
             <label>roof:height (m)<input data-f="roof_height" data-i="${i}" type="number" step="0.5" min="0" value="${ov(i, "roof_height")}"></label>
             <label>roof:direction (°)<input data-f="roof_direction" data-i="${i}" type="number" step="1" min="0" max="359" value="${ov(i, "roof_direction")}"></label>
-            <label>roof:colour<input data-f="roof_colour" data-i="${i}" type="color" list="palette" value="${ov(i, "roof_colour") || "#b5533c"}"></label>
+            <label>roof:colour<input data-f="roof_colour" data-i="${i}" type="color" list="palette" value="${ov(i, "roof_colour") || "#b5533c"}">
+              ${swatches(ov(i, "roof_colour"), `data-i="${i}"`)}</label>
           </div>
         </div>`).join("")}
     </div>
@@ -646,9 +704,10 @@ function renderPartsSection() {
       schedulePartsPreview();
     }),
   );
+  wireSwatches(el);
   el.querySelectorAll(".part-card").forEach((c) =>
     c.addEventListener("click", (e) => {
-      if (!e.target.closest("input, select")) editor.selectPart(Number(c.dataset.part));
+      if (!e.target.closest("input, select, .swatches")) editor.selectPart(Number(c.dataset.part));
     }),
   );
   $("#p-single").addEventListener("click", deactivateParts);
@@ -717,6 +776,7 @@ async function init() {
   if (initial === "data" || initial === "results") showTab(initial);
   try {
     const [rows, geojson, summary] = await Promise.all([api.buildings(), api.geojson(), api.summary()]);
+    state.summary = summary;
     $("#palette").innerHTML = (summary.palette ?? []).map((c) => `<option value="${c.hex}">${esc(c.label)}</option>`).join("");
     map.setPalette(summary.palette ?? [], summary.default_colours ?? { roof: "#c8c8c8" });
     state.rows = rows;

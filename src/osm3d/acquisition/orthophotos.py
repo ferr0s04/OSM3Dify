@@ -1,7 +1,8 @@
 """Obtenção de ortofotos (Fase 5 — cores de telhado).
 
 Atenção: ortofotos convencionais não são "true ortho"; o telhado aparece deslocado
-do footprint. A amostragem de cor usa a máscara de telhado derivada do LiDAR.
+do footprint. A amostragem de cor usa a máscara de telhado derivada do LiDAR
+(ver ``appearance/roof_colours.py``).
 """
 
 from __future__ import annotations

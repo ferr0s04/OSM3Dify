@@ -18,7 +18,7 @@ from typing import Literal
 
 import numpy as np
 import shapely
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from shapely.geometry.base import BaseGeometry
 
 from osm3d.domain.models import (
@@ -42,9 +42,42 @@ DEFAULT_ROOF_HEIGHT_RATIO = 0.3  # telhado novo sem altura indicada: 30 % da alt
 MAX_DEFAULT_ROOF_HEIGHT_M = 2.5
 
 
+# Valores de ``building`` que a revisão pode escolher para um edifício novo.
+BUILDING_TYPES: dict[str, str] = {
+    "yes": "edifício (genérico)",
+    "house": "moradia",
+    "detached": "moradia isolada",
+    "semidetached_house": "moradia geminada",
+    "terrace": "moradias em banda",
+    "apartments": "prédio de apartamentos",
+    "residential": "residencial",
+    "garage": "garagem",
+    "garages": "garagens",
+    "shed": "arrecadação / anexo",
+    "roof": "telheiro / alpendre",
+    "carport": "telheiro para carros",
+    "hut": "barraca",
+    "farm_auxiliary": "anexo agrícola",
+    "barn": "palheiro / celeiro",
+    "greenhouse": "estufa",
+    "industrial": "indústria / fábrica",
+    "warehouse": "armazém",
+    "commercial": "comércio / serviços",
+    "retail": "loja",
+    "service": "técnico (posto de transformação…)",
+    "church": "igreja",
+    "chapel": "capela",
+    "school": "escola",
+    "public": "público",
+    "ruins": "ruína",
+}
+
+
 class Overrides(BaseModel):
     """Correções manuais. ``None`` = manter o valor estimado."""
 
+    # Só em edifícios novos (candidatos): tipo ``building``. Nos do OSM não se mexe.
+    building: str | None = None
     roof_shape: RoofShape | None = None
     height: float | None = Field(default=None, gt=0, le=200)
     roof_height: float | None = Field(default=None, ge=0, le=50)
@@ -56,6 +89,13 @@ class Overrides(BaseModel):
     ground: GroundChoice | None = None
     # Só para partes: base da parte acima do terreno (volumes suspensos/sobrepostos).
     min_height: float | None = Field(default=None, ge=0, le=200)
+
+    @field_validator("building")
+    @classmethod
+    def _known_building(cls, v: str | None) -> str | None:
+        if v is not None and v not in BUILDING_TYPES:
+            raise ValueError(f"building={v!r} desconhecido (opções: {', '.join(BUILDING_TYPES)})")
+        return v
 
     def is_empty(self) -> bool:
         return all(v is None for v in self.model_dump().values())
@@ -387,7 +427,9 @@ def apply_corrections(b: Building, ov: Overrides) -> Building:
     """Aplica as correções (terreno primeiro, depois telhado/alturas/cores)."""
     if ov.ground is not None:
         b = apply_ground(b, ov.ground)
-    if b.parts and not ov.is_empty():
+    if ov.building is not None and b.osm_type == "new":
+        b = b.model_copy(update={"existing_tags": {**b.existing_tags, "building": ov.building}})
+    if b.parts and not ov.model_copy(update={"building": None}).is_empty():
         b = b.model_copy(update={"parts": [apply_overrides(b, b.parts[0], ov), *b.parts[1:]]})
     return b
 

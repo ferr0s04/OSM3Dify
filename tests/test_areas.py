@@ -331,6 +331,68 @@ def test_stage_state_follows_files(tmp_path: Path) -> None:
     assert stage_state(cfg, Stage.ROOFS) == ("stale", "há LAZ/MDT mais recentes")
 
 
+def test_pipeline_job_municipal_options(tmp_path: Path) -> None:
+    from osm3d.pipeline import municipal_path
+
+    cfg = make_cfg(tmp_path)
+    seen: list[tuple[str, bool, bool]] = []
+    mpath = municipal_path(cfg)
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+
+    def runner(c: Config, stage: Stage, *, force: bool, progress: Any) -> Path:
+        seen.append((stage.value, c.sources.municipal.enabled, mpath.exists()))
+        return Path("x")
+
+    def state_of(c: Config, stage: Stage) -> tuple[str, str]:
+        return "done", ""
+
+    job = PipelineJob(runner=runner, state_of=state_of)  # type: ignore[arg-type]
+    # Ligar a cartografia só nesta corrida e voltar a obtê-la: a cache é apagada e os
+    # candidatos correm mesmo estando "feitos".
+    mpath.write_text("{}", encoding="utf-8")
+    job.start(cfg, candidates=True, municipal=True, refresh_municipal=True)
+    assert job.wait(10)
+    assert seen == [("candidates", True, False)]
+    with pytest.raises(ValueError):
+        job.start(cfg, municipal=True, refresh_municipal=True)  # sem candidatos
+    with pytest.raises(ValueError):
+        job.start(cfg, candidates=True, municipal=False, refresh_municipal=True)
+
+
+def test_stage_state_candidates_follow_municipal_choice(tmp_path: Path) -> None:
+    from osm3d.pipeline import (
+        _raw_tiles,
+        candidates_sources,
+        context_path,
+        municipal_path,
+        municipal_status,
+        stage_state,
+        with_municipal,
+    )
+
+    cfg = make_cfg(tmp_path)
+    out = artefact_path(cfg, Stage.CANDIDATES)
+    out.parent.mkdir(parents=True)
+    out.write_bytes(b"x")
+    lidar, dtm = _raw_tiles(cfg)
+    context_path(cfg).write_text("{}", encoding="utf-8")
+    mark_cache(context_path(cfg), sorted(set(lidar) & set(dtm)))
+    assert stage_state(cfg, Stage.CANDIDATES)[0] == "done"  # sem cartografia, sem registo
+    on = with_municipal(cfg, True)
+    assert stage_state(on, Stage.CANDIDATES) == ("stale", "cartografia municipal ativada")
+    out.with_name(out.name + ".sources.json").write_text('{"municipal": true}', encoding="utf-8")
+    assert candidates_sources(cfg) == {"municipal": True}
+    assert stage_state(on, Stage.CANDIDATES)[1] == "cartografia municipal por obter ou mais recente"
+    municipal_path(cfg).write_text("{}", encoding="utf-8")
+    import os
+
+    os.utime(municipal_path(cfg), (out.stat().st_mtime - 10,) * 2)
+    assert stage_state(on, Stage.CANDIDATES)[0] == "done"
+    assert stage_state(cfg, Stage.CANDIDATES) == ("stale", "cartografia municipal desativada")
+    st = municipal_status(on)
+    assert st["enabled"] and st["cached"] and st["used_in_candidates"] is True
+
+
 def test_pipeline_job_cancel_between_stages(tmp_path: Path) -> None:
     gate = threading.Event()
 

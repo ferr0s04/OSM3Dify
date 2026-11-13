@@ -7,10 +7,12 @@ Cada fase lê o artefacto da anterior e escreve o seu em
 
 from __future__ import annotations
 
+import contextlib
+import json
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from osm3d.config import Config
 from osm3d.export.s3db_tags import TagPolicy
@@ -120,6 +122,15 @@ def stage_state(config: Config, stage: Stage) -> tuple[StageState, str]:
         lidar, dtm = _raw_tiles(config)
         if not cache_matches(context_path(config), sorted(set(lidar) & set(dtm))):
             return "stale", "as quadrículas com LAZ e MDT mudaram"
+        used = candidates_sources(config) or {}
+        wanted = config.sources.municipal.enabled
+        if bool(used.get("municipal")) != wanted:
+            return "stale", (
+                "cartografia municipal ativada" if wanted else "cartografia municipal desativada"
+            )
+        mpath = municipal_path(config)
+        if wanted and (not mpath.exists() or mpath.stat().st_mtime > made):
+            return "stale", "cartografia municipal por obter ou mais recente"
     else:
         prev = _previous(config, stage)
         before = artefact_path(config, prev)
@@ -198,7 +209,10 @@ def run_stage(
 
             buildings = read_buildings(_input_of(config, stage))
             lidar = area_tiles(config, config.sources.lidar_dir, (".laz", ".las"))
-            coloured = colour_area(buildings, lidar, progress)
+            orthos = ortho_files(config)
+            if progress and not orthos:
+                progress("  sem ortofotos: cor só do LiDAR (descarregar ortofotos melhora-a)")
+            coloured = colour_area(buildings, lidar, progress, orthos)
             return write_buildings(coloured, out, config.processing_crs)
         case Stage.QA:
             from osm3d.export.geopackage import read_buildings, write_buildings
@@ -310,10 +324,19 @@ def context_path(config: Config) -> Path:
     return area_dir(config) / "osm_context.json"
 
 
+def municipal_path(config: Config) -> Path:
+    """Cache da cartografia municipal de edifícios (fase candidates)."""
+    return area_dir(config) / "municipal_buildings.geojson"
+
+
+# Margem à volta das quadrículas: o candidato da borda precisa dos vizinhos.
+TILE_CONTEXT_MARGIN_M = 30.0
+
+
 def _run_candidates(
     config: Config, out: Path, force: bool, progress: Callable[[str], None] | None
 ) -> Path:
-    """Deteta edifícios em falta no OSM e ajusta-lhes o telhado como aos restantes."""
+    """Deteta edifícios em falta no OSM e ajusta-lhes o telhado e a cor como aos restantes."""
     import shapely
     from pyproj import Transformer
 
@@ -360,6 +383,24 @@ def _run_candidates(
             f"  contexto OSM ({context_timestamp(ctx)}): {len(osm)} edifícios em "
             f"{len(tiles)} quadrículas"
         )
+    municipal = None
+    if config.sources.municipal.enabled:
+        from osm3d.acquisition.municipal import (
+            fetch_municipal_buildings,
+            load_municipal_buildings,
+        )
+
+        mpath = municipal_path(config)
+        mx0, my0, mx1, my1 = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
+        fetch_municipal_buildings(
+            (mx0, my0, mx1, my1),
+            config.sources.municipal,
+            mpath,
+            force=force or not cache_matches(mpath, tiles),
+            progress=progress,
+        )
+        mark_cache(mpath, tiles)
+        municipal = load_municipal_buildings(mpath)
     # Limite = as próprias quadrículas da área (centróide dentro delas, como no prepare).
     orthos = ortho_files(config)
     if progress and not orthos:
@@ -372,16 +413,86 @@ def _run_candidates(
         ortho_paths=orthos,
         progress=progress,
         land=load_land(ctx, config.processing_crs),
+        municipal=municipal,
+        municipal_cfg=config.sources.municipal,
     )
     if progress:
         progress(f"  {len(found)} edifícios em falta no OSM (candidatos)")
     fitted, _ = reconstruct_area(found, lidar, dtm, config, progress)
+    # Cor do telhado, como na fase colours dos edifícios OSM.
+    from osm3d.appearance.area import colour_area
+
+    fitted = colour_area(fitted, lidar, progress, orthos)
     checked = []
     for b in fitted:
         known = {f.code for f in b.qa_flags}
         extra = [f for f in check_building(b) if f.code not in known]
         checked.append(b.model_copy(update={"qa_flags": [*b.qa_flags, *extra]}))
-    return write_buildings(checked, out, config.processing_crs)
+    path = write_buildings(checked, out, config.processing_crs)
+    _sources_meta(out).write_text(
+        json.dumps({"municipal": municipal is not None}), encoding="utf-8"
+    )
+    return path
+
+
+def _sources_meta(out: Path) -> Path:
+    """Fontes usadas na última corrida dos candidatos (p.ex. a cartografia municipal)."""
+    return out.with_name(out.name + ".sources.json")
+
+
+def candidates_sources(config: Config) -> dict[str, Any] | None:
+    """Fontes usadas nos candidatos da área (``None``: sem registo)."""
+    meta = _sources_meta(artefact_path(config, Stage.CANDIDATES))
+    if not meta.exists():
+        return None
+    try:
+        data = json.loads(meta.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def with_municipal(config: Config, enabled: bool) -> Config:
+    """``config`` com a cartografia municipal ligada ou desligada (só desta corrida)."""
+    sources = config.sources.model_copy(
+        update={"municipal": config.sources.municipal.model_copy(update={"enabled": enabled})}
+    )
+    return config.model_copy(update={"sources": sources})
+
+
+def municipal_status(config: Config) -> dict[str, Any]:
+    """Cartografia municipal da área ativa, para a aplicação."""
+    m = config.sources.municipal
+    path = municipal_path(config)
+    fetch = path.with_name(path.name + ".fetch.json")
+    meta: dict[str, Any] = {}
+    if path.exists() and fetch.exists():
+        try:
+            meta = json.loads(fetch.read_text(encoding="utf-8"))
+        except ValueError:
+            meta = {}
+    if path.exists() and meta.get("n") is None:  # caches antigas: contar no ficheiro
+        with contextlib.suppress(ValueError, KeyError):
+            meta["n"] = len(json.loads(path.read_text(encoding="utf-8"))["features"])
+    used = candidates_sources(config)
+    return {
+        "name": m.name,
+        "enabled": m.enabled,
+        "viewer_url": m.viewer_url,
+        "source_tag": m.source_tag,
+        "min_area_m2": m.min_area_m2,
+        "cached": path.exists(),
+        "n": meta.get("n"),
+        "fetched_at": meta.get("fetched_at"),
+        "used_in_candidates": None if used is None else bool(used.get("municipal")),
+    }
+
+
+def clear_municipal_cache(config: Config) -> None:
+    """Apaga a cache da cartografia municipal (é obtida de novo na próxima corrida)."""
+    path = municipal_path(config)
+    for p in (path, _cache_meta(path), path.with_name(path.name + ".fetch.json")):
+        p.unlink(missing_ok=True)
 
 
 def review_store_path(config: Config) -> Path:

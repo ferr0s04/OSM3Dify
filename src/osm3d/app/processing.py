@@ -16,7 +16,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 from osm3d.config import Config
-from osm3d.pipeline import STAGE_ORDER, Stage, StageState, run_stage, stage_state
+from osm3d.pipeline import (
+    STAGE_ORDER,
+    Stage,
+    StageState,
+    clear_municipal_cache,
+    run_stage,
+    stage_state,
+    with_municipal,
+)
 
 log = logging.getLogger(__name__)
 
@@ -71,15 +79,25 @@ class PipelineJob:
         *,
         candidates: bool = False,
         redo_from: Stage | None = None,
+        municipal: bool | None = None,
+        refresh_municipal: bool = False,
     ) -> dict[str, Any]:
         """Processa a área: só as fases em falta ou desatualizadas.
 
         ``redo_from``: refazer também essa fase e as seguintes, mesmo que estejam feitas
-        (``fetch`` volta a pedir o OSM ao Overpass).
+        (``fetch`` volta a pedir o OSM ao Overpass). ``municipal``: usar (ou não) a
+        cartografia municipal nos candidatos (``None``: o do config.yaml);
+        ``refresh_municipal``: voltar a obtê-la (refaz os candidatos).
         """
         stages = [*DEFAULT_STAGES, *([Stage.CANDIDATES] if candidates else [])]
         if redo_from is not None and redo_from not in stages:
             raise ValueError(f"Fase '{redo_from.value}' não faz parte deste processamento")
+        if refresh_municipal and not candidates:
+            raise ValueError("A cartografia municipal só é usada na fase dos candidatos")
+        if municipal is not None:
+            cfg = with_municipal(cfg, municipal)
+        if refresh_municipal and not cfg.sources.municipal.enabled:
+            raise ValueError("Ativar a cartografia municipal para a voltar a obter")
         with self._lock:
             if self._thread is not None:
                 raise RuntimeError("Já há um processamento em curso")
@@ -97,7 +115,7 @@ class PipelineJob:
             }
             self._thread = threading.Thread(
                 target=self._run,
-                args=(cfg, stages, redo_from),
+                args=(cfg, stages, redo_from, refresh_municipal),
                 name="pipeline",
                 daemon=True,
             )
@@ -123,7 +141,13 @@ class PipelineJob:
                 self._state["stages"][i]["stage"] if status == "running" else None
             )
 
-    def _run(self, cfg: Config, stages: list[Stage], redo_from: Stage | None) -> None:
+    def _run(
+        self,
+        cfg: Config,
+        stages: list[Stage],
+        redo_from: Stage | None,
+        refresh_municipal: bool = False,
+    ) -> None:
         ok = False
         redo_idx = STAGE_ORDER.index(redo_from) if redo_from is not None else None
         chain_ran = False  # uma fase da cadeia correu: as seguintes têm de correr
@@ -135,6 +159,10 @@ class PipelineJob:
                     self._log("Processamento cancelado.")
                     break
                 forced = redo_idx is not None and STAGE_ORDER.index(stage) >= redo_idx
+                if stage is Stage.CANDIDATES and refresh_municipal:
+                    clear_municipal_cache(cfg)
+                    self._log("[candidates] cartografia municipal: a obter de novo")
+                    forced = True
                 # Os candidatos não dependem da cadeia fetch → qa (leem o LAZ/MDT e o seu
                 # próprio contexto OSM): decidem pelo próprio estado.
                 follows = chain_ran and stage is not Stage.CANDIDATES

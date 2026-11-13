@@ -74,6 +74,9 @@ class ProcessIn(BaseModel):
     # Por omissão só corre o que falta ou está desatualizado. Com uma fase, refaz essa e
     # as seguintes (fetch: volta a pedir os edifícios ao Overpass).
     redo_from: Stage | None = None
+    # Cartografia municipal nos candidatos: None = a do config.yaml.
+    municipal: bool | None = None
+    refresh_municipal: bool = False  # voltar a obtê-la do geoportal (refaz os candidatos)
 
 
 def create_app(
@@ -328,7 +331,13 @@ def create_app(
     @app.post("/api/processing")
     def processing_start(body: ProcessIn) -> dict[str, Any]:
         """Corre o pipeline (fetch → qa) da área ativa em segundo plano."""
-        return guarded(ctx.process, candidates=body.candidates, redo_from=body.redo_from)
+        return guarded(
+            ctx.process,
+            candidates=body.candidates,
+            redo_from=body.redo_from,
+            municipal=body.municipal,
+            refresh_municipal=body.refresh_municipal,
+        )
 
     @app.delete("/api/processing")
     def processing_cancel() -> dict[str, Any]:

@@ -84,6 +84,26 @@ class PathsConfig(BaseModel):
         return self.areas_file or self.processed.parent / "areas.json"
 
 
+class MunicipalSourceConfig(BaseModel):
+    """Cartografia municipal de edifícios (geoportal MapGuide), para os candidatos.
+
+    Ver ``acquisition/municipal.py``. Só com autorização do município.
+    """
+
+    enabled: bool = False
+    name: str = "Câmara Municipal de Vila do Conde"
+    viewer_url: str = "https://sig.cm-viladoconde.pt/geoportal"
+    mapagent_url: str = "https://sig.cm-viladoconde.pt/mapguide/mapagent/mapagent.fcgi"
+    feature_source: str = "Library://geoportal/Data/pg_viladoconde.FeatureSource"
+    feature_class: str = "cartografia_simplificada:muni_5000_h_planimetria_pg"
+    filter: str = "objeto = 'const_poligonos'"
+    chunk_m: float = Field(default=250.0, gt=10, le=1000)
+    delay_s: float = Field(default=0.5, ge=0.2, description="Pausa entre pedidos.")
+    # Tag ``source`` dos edifícios novos com contorno municipal (None: sem tag).
+    source_tag: str | None = None
+    min_area_m2: float = Field(default=8.0, ge=0)
+
+
 class SourcesConfig(BaseModel):
     overpass_url: str = "https://overpass-api.de/api/interpreter"
     dgt_stac_url: str | None = None
@@ -102,6 +122,7 @@ class SourcesConfig(BaseModel):
     dtm_dir: Path = Path("data/raw/dtm")
     dsm_dir: Path = Path("data/raw/dsm")
     orthophoto_dir: Path = Path("data/raw/orthophotos")
+    municipal: MunicipalSourceConfig = MunicipalSourceConfig()
 
     def product_dir(self, product: str) -> Path:
         dirs = {

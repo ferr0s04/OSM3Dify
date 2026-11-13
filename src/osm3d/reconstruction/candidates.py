@@ -42,6 +42,8 @@ from shapely.geometry.base import BaseGeometry
 from shapely.geometry.polygon import orient
 from shapely.ops import polygonize, unary_union
 
+from osm3d.acquisition.municipal import MunicipalBuilding
+from osm3d.config import MunicipalSourceConfig
 from osm3d.domain.models import Building, QAFlag
 from osm3d.geospatial.point_clouds import PointSet, read_points
 from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation
@@ -376,16 +378,21 @@ def detect_candidates(
     ortho_paths: list[Path] | None = None,
     progress: Callable[[str], None] | None = None,
     land: LandContext | None = None,
+    municipal: list[MunicipalBuilding] | None = None,
+    municipal_cfg: MunicipalSourceConfig | None = None,
 ) -> list[Building]:
     """Edifícios em falta no OSM, quadrícula a quadrícula.
 
     Com ortofoto a cobrir a quadrícula, o contorno vem do ortofoto e as manchas LiDAR
     são divididas em edifícios contíguos (:mod:`osm3d.reconstruction.ortho_outline`).
     Sem ortofoto, fica o contorno derivado só do LiDAR. Com ``land`` (landuse e
-    estradas do OSM), os contornos do ortofoto são encaixados neles.
+    estradas do OSM), os contornos do ortofoto são encaixados neles. Com
+    ``municipal`` (cartografia municipal), ver :func:`merge_municipal`.
     """
     available = sorted(set(lidar_tiles) & set(dtm_tiles))
     osm_index = shapely.STRtree(osm_buildings) if osm_buildings else None
+    municipal_cfg = municipal_cfg or MunicipalSourceConfig()
+    muni_index = shapely.STRtree([m.geometry for m in municipal or []])
     found: dict[int, Building] = {}
     ortho = OrthoMosaic(ortho_paths) if ortho_paths else None
     try:
@@ -403,16 +410,27 @@ def detect_candidates(
                     else []
                 )
                 ctx = _TileContext(tile, (x0, y0, x1, y1), bounds, pts, dtm, near, boundary, land)
+                offset = (0.0, 0.0)
                 if ortho is not None and ortho.covers((x0, y0, x1, y1)):
-                    new = _detect_tile_ortho(ctx, ortho)
+                    new, offset = _detect_tile_ortho(ctx, ortho)
                     how = "ortofoto"
                 else:
                     new = _detect_tile_lidar(ctx)
                     how = "só LiDAR (sem ortofoto)"
+                note = ""
+                if municipal is not None:
+                    near_m = [municipal[i] for i in muni_index.query(shapely.box(*bounds))]
+                    new, stats = merge_municipal(ctx, new, near_m, offset, municipal_cfg)
+                    note = (
+                        f"; cartografia municipal: {stats.from_municipal} contornos municipais"
+                        f" confirmados pelo LiDAR, {stats.without_lidar} sem LiDAR (demolidos"
+                        f" ou sob árvores), {stats.replaced} candidatos LiDAR substituídos,"
+                        f" {stats.not_in_municipal} só no LiDAR"
+                    )
                 for b in new:
                     found[b.osm_id] = b
                 if progress:
-                    progress(f"  quadrícula {tile}: {len(new)} candidatos ({how})")
+                    progress(f"  quadrícula {tile}: {len(new)} candidatos ({how}{note})")
     finally:
         if ortho is not None:
             ortho.close()
@@ -468,7 +486,10 @@ MIN_PART_AREA_M2 = 8.0  # parte (alpendre) mínima
 SMALL_IRREGULAR_M2 = 60.0  # abaixo disto, irregular = não é edifício
 
 
-def _detect_tile_ortho(ctx: _TileContext, ortho: OrthoMosaic) -> list[Building]:
+def _detect_tile_ortho(
+    ctx: _TileContext, ortho: OrthoMosaic
+) -> tuple[list[Building], tuple[float, float]]:
+    """Candidatos da quadrícula e o desvio ortofoto → LiDAR usado."""
     grid = height_grid(ctx.pts, ctx.dtm, ctx.bounds)
     offset = estimate_ortho_offset(grid, ortho, ctx.core)
     if offset is None:
@@ -511,7 +532,7 @@ def _detect_tile_ortho(ctx: _TileContext, ortho: OrthoMosaic) -> list[Building]:
                 out += [cand] if cand is not None else []
             else:
                 out += _grouped_candidates(group, ctx, offset, len(pieces), patch)
-    return out
+    return out, offset
 
 
 def _grouped_candidates(
@@ -717,3 +738,164 @@ def _evaluate(blob: Polygon, pts: PointSet, dtm: DtmMosaic) -> Building | None:
             )
         ],
     )
+
+
+# ------------------------------------------------------- cartografia municipal
+
+MUNICIPAL_INSET_M = 0.5  # erosão antes de medir o LiDAR (desvio residual, beirais)
+MUNICIPAL_CELL_M = 1.0
+MUNICIPAL_MIN_COVER = 0.5  # fração da área com pontos de edifício
+MUNICIPAL_MIN_HEIGHT_M = 1.8  # telheiros e anexos baixos
+MUNICIPAL_REPLACES = 0.3  # candidato LiDAR coberto acima disto por contornos municipais: sai
+NOT_IN_MUNICIPAL = 0.2  # abaixo disto, o candidato LiDAR não consta da cartografia
+
+
+@dataclass
+class MunicipalStats:
+    from_municipal: int = 0
+    without_lidar: int = 0
+    replaced: int = 0
+    not_in_municipal: int = 0
+
+
+def lidar_support(footprint_lidar: Polygon, ctx: _TileContext) -> tuple[float, float | None]:
+    """(fração da área com pontos de edifício, altura P90 acima do terreno).
+
+    Mede-se no contorno erodido ``MUNICIPAL_INSET_M``, em células de 1 m.
+    """
+    inner = footprint_lidar.buffer(-MUNICIPAL_INSET_M, join_style="mitre")
+    if inner.is_empty or inner.area < 2.0:
+        inner = footprint_lidar
+    xyz = ctx.pts.xyz
+    bx0, by0, bx1, by1 = inner.bounds
+    near = np.flatnonzero(
+        (xyz[:, 0] >= bx0) & (xyz[:, 0] <= bx1) & (xyz[:, 1] >= by0) & (xyz[:, 1] <= by1)
+    )
+    inside = near[shapely.contains_xy(inner, xyz[near, 0], xyz[near, 1])]
+    if not len(inside):
+        return 0.0, None
+    cells = np.unique(np.floor(xyz[inside, :2] / MUNICIPAL_CELL_M).astype(np.int64), axis=0)
+    cover = min(1.0, len(cells) * MUNICIPAL_CELL_M**2 / inner.area)
+    ground = sample_ground_elevation(ctx.dtm, footprint_lidar, 2.0, 5)
+    if ground is None:
+        return cover, None
+    return cover, float(np.percentile(xyz[inside, 2], 90)) - ground
+
+
+def _overlap(poly: BaseGeometry, others: list[BaseGeometry], tree: shapely.STRtree) -> float:
+    """Fração da área de ``poly`` coberta por ``others`` (contornos não sobrepostos)."""
+    if not others or not poly.area:
+        return 0.0
+    inter = sum(float(poly.intersection(others[i]).area) for i in tree.query(poly))
+    return min(1.0, inter / float(poly.area))
+
+
+def municipal_candidate(
+    m: MunicipalBuilding,
+    ctx: _TileContext,
+    offset: tuple[float, float],
+    cfg: MunicipalSourceConfig,
+) -> Building | None | bool:
+    """Candidato com o contorno municipal, se o LiDAR confirma o edifício.
+
+    ``None``: não é candidato (tipo excluído, pequeno, já no OSM, fora da quadrícula);
+    ``False``: o LiDAR não o confirma. A cartografia é anterior ao LiDAR, por isso é
+    um edifício demolido ou escondido (sob árvores).
+    """
+    tag = m.building_tag
+    if tag is None or not ctx.owns(m.geometry.centroid):
+        return None
+    footprint = orient(Polygon(m.geometry.exterior), 1.0)
+    if footprint.area < cfg.min_area_m2:
+        return None
+    if any(footprint.intersection(g).area > 0.3 * footprint.area for g in ctx.osm):
+        return None
+    dx, dy = offset
+    in_lidar = shapely.transform(footprint, lambda c: c + np.array([dx, dy]))
+    cover, height = lidar_support(in_lidar, ctx)
+    if height is None or cover < MUNICIPAL_MIN_COVER or height < MUNICIPAL_MIN_HEIGHT_M:
+        return False
+    tags = {"building": tag}
+    if cfg.source_tag:
+        tags["source"] = cfg.source_tag
+    flags = [
+        QAFlag(
+            code="missing_in_osm",
+            message=f"Edifício da cartografia municipal sem contorno no OSM: {m.descr} "
+            f"({footprint.area:.0f} m², ~{height:.1f} m de altura). Contorno municipal "
+            f"(gid {m.gid}), confirmado pelo LiDAR em {cover:.0%} da área.",
+            severity="info",
+        )
+    ]
+    if m.geometry.interiors:
+        flags.append(
+            QAFlag(
+                code="municipal_courtyard",
+                message="O contorno municipal tem pátio interior, que não foi incluído: "
+                "rever (multipolígono).",
+                severity="warning",
+            )
+        )
+    c = footprint.centroid
+    return Building(
+        osm_type="new",
+        osm_id=candidate_id(c.x, c.y),
+        osm_version=0,
+        footprint=footprint,
+        existing_tags=tags,
+        qa_flags=flags,
+        diagnostics={
+            "ortho_offset_dx": dx,
+            "ortho_offset_dy": dy,
+            "municipal_gid": float(m.gid),
+            "municipal_lidar_cover": cover,
+        },
+    )
+
+
+def merge_municipal(
+    ctx: _TileContext,
+    lidar_candidates: list[Building],
+    municipal: list[MunicipalBuilding],
+    offset: tuple[float, float],
+    cfg: MunicipalSourceConfig,
+) -> tuple[list[Building], MunicipalStats]:
+    """Junta a cartografia municipal aos candidatos LiDAR da quadrícula.
+
+    - Cada polígono municipal (tipos de edifício) sem contorno no OSM e **confirmado
+      pelo LiDAR** passa a candidato com o contorno municipal, que separa casa,
+      anexo, garagem e telheiro (o LiDAR não os distingue quando estão encostados).
+    - Os candidatos LiDAR cobertos (> 30 %) por esses contornos saem.
+    - Os restantes candidatos LiDAR ficam; os que não constam da cartografia (< 20 %,
+      contando todos os tipos) são sinalizados: a cartografia é anterior ao LiDAR,
+      logo construção recente, ou falso positivo.
+    """
+    stats = MunicipalStats()
+    accepted: list[Building] = []
+    for m in municipal:
+        cand = municipal_candidate(m, ctx, offset, cfg)
+        if cand is False:
+            stats.without_lidar += 1
+        elif isinstance(cand, Building):
+            accepted.append(cand)
+    stats.from_municipal = len(accepted)
+    acc_geoms = [b.footprint for b in accepted]
+    acc_tree = shapely.STRtree(acc_geoms)
+    all_geoms = [m.geometry for m in municipal]
+    all_tree = shapely.STRtree(all_geoms)
+    kept: list[Building] = []
+    for b in lidar_candidates:
+        if _overlap(b.footprint, acc_geoms, acc_tree) > MUNICIPAL_REPLACES:
+            stats.replaced += 1
+            continue
+        if _overlap(b.footprint, all_geoms, all_tree) < NOT_IN_MUNICIPAL:
+            stats.not_in_municipal += 1
+            flag = QAFlag(
+                code="not_in_municipal",
+                message="Não consta da cartografia municipal (anterior ao LiDAR): "
+                "construção recente ou falso positivo. Confirmar no ortofoto.",
+                severity="warning",
+            )
+            b = b.model_copy(update={"qa_flags": [*b.qa_flags, flag]})
+        kept.append(b)
+    return kept + accepted, stats

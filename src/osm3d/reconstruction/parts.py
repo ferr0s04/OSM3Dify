@@ -14,6 +14,8 @@ secundários) e a aplicação de revisão usa-o a cada edição da divisão.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import shapely
 
@@ -29,6 +31,9 @@ from osm3d.domain.models import (
 )
 from osm3d.geospatial.point_clouds import PointSet
 from osm3d.reconstruction.roof_fitting import FitParams, fit_roof
+
+if TYPE_CHECKING:
+    from osm3d.reconstruction.ortho_outline import OrthoMosaic
 
 MIN_PART_POINTS = 20
 
@@ -50,12 +55,17 @@ def _empty_part(pid: str, poly, height: float) -> BuildingPart:  # type: ignore[
 
 
 def fit_layout(
-    building: Building, layout: PartsLayout, points: PointSet, params: FitParams
+    building: Building,
+    layout: PartsLayout,
+    points: PointSet,
+    params: FitParams,
+    ortho: OrthoMosaic | None = None,
 ) -> PartsLayout:
     """Ajusta cada parte e devolve a divisão com ``fitted`` preenchido.
 
     ``points`` estão no referencial do LiDAR (com o deslocamento de co-registo). As
     partes estão no referencial do OSM e são deslocadas para selecionar os pontos.
+    Com ``ortho``, a cor do telhado vem do ortofoto (confirmada pelo LiDAR).
     """
     ground = building.ground_elevation_m
     if ground is None:
@@ -81,7 +91,7 @@ def fit_layout(
         part = BuildingPart(id=pid, geometry=poly, height=fit.height, roof=fit.roof)
         # Cor do telhado com os pontos desta parte (máscara sobre o seu próprio modelo).
         probe = building.model_copy(update={"footprint": poly, "parts": [part]})
-        colour = estimate_roof_colour(probe, pts)
+        colour = estimate_roof_colour(probe, pts, ortho)
         if colour is not None:
             part = part.model_copy(update={"roof": part.roof.model_copy(update={"colour": colour})})
         fitted.append(part)

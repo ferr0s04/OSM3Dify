@@ -92,6 +92,22 @@ def test_apply_review_and_stale(fitted: Building) -> None:
     assert any(f.code == "review_stale" for f in b.qa_flags)
 
 
+def test_building_type_override_only_for_new(fitted: Building) -> None:
+    ov = Overrides(building="garage")
+    new = fitted.model_copy(
+        update={"osm_type": "new", "osm_version": 0, "existing_tags": {"building": "house"}}
+    )
+    out = apply_review(new, Review(osm_key=new.key, osm_version=0, overrides=ov))
+    assert out.existing_tags["building"] == "garage"
+    assert out.parts[0] == new.parts[0]  # só o tipo: telhado e alturas intactos
+    # Edifício do OSM: o tipo não se muda pela revisão.
+    osm = fitted.model_copy(update={"existing_tags": {"building": "yes"}})
+    kept = apply_review(osm, Review(osm_key="way/1", osm_version=4, overrides=ov))
+    assert kept.existing_tags["building"] == "yes"
+    with pytest.raises(ValueError):
+        Overrides(building="castelo")
+
+
 def test_mesh(fitted: Building) -> None:
     p = fitted.parts[0]
     roof = roof_mesh(fitted.footprint, p.roof.model, RoofShape.GABLED, 0.0)

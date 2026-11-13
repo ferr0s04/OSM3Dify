@@ -51,6 +51,19 @@ export const CHANGE_LABELS = {
   "sem proposta": "sem proposta",
 };
 
+// Origem do edifício: do OSM, ou candidato (contorno municipal ou do LiDAR/ortofoto).
+export const ORIGIN_COLORS = {
+  municipal: "#0891b2",
+  lidar: "#c026d3",
+  osm: "#c4c9d1",
+};
+
+export const ORIGIN_LABELS = {
+  municipal: "novo: cartografia municipal",
+  lidar: "novo: só LiDAR/ortofoto",
+  osm: "do OSM",
+};
+
 // Classes ASPRS
 export const CLASS_COLORS = {
   2: [150, 120, 90],

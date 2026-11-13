@@ -200,6 +200,66 @@ O tempo de `roofs` + `colours` chegou a **~6,3 min** por 509 edifícios na v5. A
 do volume principal faz até 80 ajustes rápidos em cada edifício difícil. Para o concelho, a ~28 000 edifícios, seriam ~6 h: há que otimizar
 antes de escalar, por exemplo vetorizando os ajustes de todas as hipóteses de uma vez.
 
+**v8 — cor do telhado com ortofoto** (área-2, quadrícula `LO-156482`, ORTOS-2025
+folha 097-3; 111 edifícios OSM + 138 candidatos):
+
+- **O problema:** só 31 % dos telhados ficavam com `roof:colour` exportado. Os
+  candidatos nunca recebiam cor (a fase `colours` corria antes deles). Nos OSM, 34 de
+  111 ficavam abaixo da confiança mínima (0,6), sobretudo `gabled`. A confiança era a
+  fração de pontos a ΔE < 10 da mediana, e penalizava o que não muda a cor: a água à
+  sombra é 12–24 unidades de L* mais escura do que a água ao sol, e o RGB do LiDAR
+  tem uma amplitude interquartil de L* de 15–25 dentro de uma só água. Cores fortes
+  fora do tom da telha (chapa vermelha, verde) caíam nos cinzentos.
+- **Ortofoto como sensor principal:** lido na posição dos pontos LiDAR de telhado
+  (mesma máscara), sem vegetação (NDVI > 0,2) nem sombras. É muito mais homogéneo:
+  homogeneidade mediana de 0,97 contra 0,54 do LiDAR nos telhados com baixa
+  confiança. O LiDAR fica como alternativa e confirmação.
+- **Cor e confiança por águas:** cor = média das medianas das águas; confiança =
+  concordância das células de 1,5 m (com a luz de cada água descontada) ×
+  suficiência de pontos, reforçada quando os dois sensores concordam.
+- **Paleta:** junta vermelho, laranja e verde às 6 cores. Vermelho: tom < 12° (carmim)
+  ou, em telhados planos ou de uma água, < 22°, porque a telha cerâmica não cobre
+  terraços.
+
+Calibração e avaliação contra 198 telhados etiquetados à vista sobre o ortofoto. Os
+limiares foram afinados nestas mesmas etiquetas, por isso a exatidão está
+otimista:
+
+| Cor do telhado (n = 249, 198 etiquetados) | v7 | LiDAR (v8) | **Ortofoto + LiDAR (v8)** |
+| --- | ---: | ---: | ---: |
+| Com cor exportável (confiança ≥ 0,6) | 31 % | 79 % | **94 %** |
+| Família certa (telha / cinzentos / verde) | — | 97 % | **97 %** |
+| Classe certa | — | 57 % | **80 %** |
+| Vermelhos encontrados | 0/12 | 11/12 | **12/12** |
+
+As confusões restantes são entre classes vizinhas (telha ↔ telha escura,
+cinzento ↔ cinzento claro), onde as próprias etiquetas são subjetivas. Não houve
+nenhum caso real de laranja (chapa, não telha), por isso o limiar (tom ≥ 58°,
+C* ≥ 15) não está validado. Os limiares do ortofoto são desta folha e deste ano;
+outras folhas podem ter radiometria diferente.
+
+**v9 — cartografia municipal nos candidatos** (uso autorizado pela Câmara Municipal
+de Vila do Conde; ver `acquisition/municipal.py`):
+
+- **Fonte:** cartografia topográfica vetorial 1:5000 homologada (~2017) do geoportal
+  MapGuide (`sig.cm-viladoconde.pt`). Polígonos `const_poligonos` com o tipo
+  (`descr`), mas sem altura nem telhado. São obtidos por `SELECTFEATURES` em caixas de
+  250 m e guardados em cache (`municipal_buildings.geojson`). Na quadrícula 156482
+  são 1046 polígonos, a ~0,4 m do OSM e do ortofoto.
+- **Regra:** cada polígono de um tipo de edifício, sem contorno no OSM e
+  **confirmado pelo LiDAR** (≥ 50 % da área com pontos de edifício, ≥ 1,8 m acima do
+  terreno), passa a candidato com o contorno municipal e com a tag `building` do tipo
+  (casa → `house`, anexo → `shed`, garagem → `garage`, telheiro → `roof`…).
+  Escadas, piscinas, reservatórios e ruínas ficam de fora. Os candidatos LiDAR
+  cobertos (> 30 %) por esses contornos saem; os que não constam da cartografia
+  ficam com a sinalização `not_in_municipal` (construção recente ou falso positivo).
+- **Área-2:** 655 contornos municipais confirmados, 46 sem LiDAR (demolidos ou sob
+  árvores), 331 candidatos LiDAR substituídos e 23 só no LiDAR. A cartografia separa
+  casa, anexo, garagem e telheiro encostados, que o LiDAR juntava numa só mancha.
+- **Revisão obrigatória:** todos entram como `new/<id>` por rever. Na aplicação há o
+  filtro e a cor do mapa "origem" (OSM / municipal / só LiDAR), o tipo `building`
+  editável e a escolha (e nova obtenção) da cartografia no processamento.
+
 **Telhados partilhados.** Para grupos de edifícios encostados cuja planta conjunta é
 retangular, ajusta-se também um telhado único ao grupo. Esse telhado é usado se
 explicar os pontos melhor do que os telhados individuais, pelo mesmo critério

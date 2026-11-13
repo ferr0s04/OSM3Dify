@@ -31,14 +31,17 @@ from osm3d.pipeline import (
     area_dir,
     artefact_path,
     export_area,
+    ortho_files,
     review_store_path,
     tag_policy,
 )
 from osm3d.reconstruction.building import fit_params
 from osm3d.reconstruction.ground import STEP_THRESHOLD_M
+from osm3d.reconstruction.ortho_outline import OrthoMosaic
 from osm3d.reconstruction.parts import fit_layout
 from osm3d.reconstruction.skeleton import has_skeleton, renders_as_skeleton
 from osm3d.review import (
+    BUILDING_TYPES,
     Overrides,
     Review,
     ReviewStore,
@@ -185,6 +188,15 @@ class ReviewService:
             "osm_parts": change.osm_parts,
             "key": b.key,
             "candidate": b.osm_type == "new",  # em falta no OSM, detetado no LiDAR
+            # Origem do contorno do candidato: cartografia municipal ou LiDAR/ortofoto.
+            "candidate_source": (
+                None
+                if b.osm_type != "new"
+                else "municipal"
+                if "municipal_gid" in b.diagnostics
+                else "lidar"
+            ),
+            "building_type": b.existing_tags.get("building"),
             "status": b.review_status,
             "archived": b.review_archived,
             "needs_review": b.needs_review,
@@ -230,6 +242,8 @@ class ReviewService:
                             "change",
                             "archived",
                             "candidate",
+                            "candidate_source",
+                            "building_type",
                         )
                     }
                     | {"flags": ",".join(row["flags"])},
@@ -300,6 +314,8 @@ class ReviewService:
                 out[f"{name}_source"] = (
                     "manual" if est and est.source.value == "manual" else "estimada"
                 )
+                if est is not None and est.source.value != "manual":
+                    out[f"{name}_via"] = est.source.value  # orthophoto | lidar
         return out
 
     def _part_info(self, b: Building, index: int = 0) -> dict[str, Any] | None:
@@ -346,6 +362,8 @@ class ReviewService:
             "qa_flags": [f.model_dump() for f in b.qa_flags],
             "diagnostics": {k: _num(v, 3) for k, v in b.diagnostics.items()},
             "existing_tags": b.existing_tags,
+            # Tipo estimado (antes da correção da revisão), p.ex. o da cartografia municipal.
+            "estimated_building": base.existing_tags.get("building"),
             "tags": self._tags(b),
             "colours": self._colours(b),
             "osm_change": {
@@ -653,7 +671,12 @@ class ReviewService:
     def _fit(self, b: Building, layout: PartsLayout) -> PartsLayout:
         minx, miny, maxx, maxy = self._shifted(b).bounds
         points = self.points.around((minx - 1, miny - 1, maxx + 1, maxy + 1))
-        return fit_layout(b, layout, points, fit_params(self.cfg))
+        orthos = ortho_files(self.cfg)
+        if not orthos:
+            return fit_layout(b, layout, points, fit_params(self.cfg))
+        # Aberto por pedido: os datasets do rasterio não são partilháveis entre threads.
+        with OrthoMosaic(orthos) as ortho:
+            return fit_layout(b, layout, points, fit_params(self.cfg), ortho)
 
     def parts_preview(self, key: str, data: LayoutIn, overrides: list[Overrides]) -> dict[str, Any]:
         """Ajusta cada parte da divisão editada e devolve tags, malha 3D e problemas."""
@@ -790,6 +813,11 @@ class ReviewService:
             "changes": dict(Counter(r["change"] for r in rows)),
             "changes_osm3d": dict(Counter(r["change"] for r in rows if r["osm3d"])),
             "palette": [{"label": c.label, "hex": c.hex} for c in PALETTE.values()],
+            "building_types": [{"value": k, "label": v} for k, v in BUILDING_TYPES.items()],
+            "candidate_sources": dict(
+                Counter(r["candidate_source"] for r in rows if r["candidate_source"])
+            ),
+            "min_colour_confidence": self.policy.min_colour_confidence,
             "default_colours": {"roof": DEFAULT_ROOF_HEX, "walls": DEFAULT_FACADE_HEX},
             "flags": dict(Counter(f for r in rows for f in r["flags"])),
             "evaluation": {

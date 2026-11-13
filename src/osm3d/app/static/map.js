@@ -5,6 +5,8 @@ import {
   CHANGE_COLORS,
   CHANGE_LABELS,
   MATCH_COLORS,
+  ORIGIN_COLORS,
+  ORIGIN_LABELS,
   SHAPE_COLORS,
   SHAPE_LABELS,
   STATUS_COLORS,
@@ -220,6 +222,12 @@ const COLOR_MODES = {
     legend: MATCH_COLORS,
     labels: { true: "= OSM", false: "≠ OSM", none: "sem referência" },
   },
+  // Origem: OSM, ou candidato com contorno municipal / do LiDAR (ortofoto).
+  origin: {
+    expr: matchExpr("candidate_source", { municipal: ORIGIN_COLORS.municipal, lidar: ORIGIN_COLORS.lidar }, ORIGIN_COLORS.osm),
+    legend: ORIGIN_COLORS,
+    labels: ORIGIN_LABELS,
+  },
 };
 
 export class BuildingMap {
@@ -354,6 +362,6 @@ export class BuildingMap {
       .map(([k, c]) => `<div><span class="sw" style="background:${c}"></span>${labels[k] ?? k}</div>`)
       .join("") +
       `<div><span class="sw" style="background:none;border:2.5px solid ${OSM3D_LINE}"></span>já com 3D no OSM</div>` +
-      `<div><span class="sw" style="background:none;border:2.5px solid ${CANDIDATE_LINE}"></span>em falta no OSM (LiDAR)</div>`;
+      `<div><span class="sw" style="background:none;border:2.5px solid ${CANDIDATE_LINE}"></span>em falta no OSM (cartografia municipal ou LiDAR)</div>`;
   }
 }

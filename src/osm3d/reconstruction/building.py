@@ -124,7 +124,9 @@ def reconstruct_building(
         "rectangularity": area / rect_area,
         "area_m2": area,
     }
-    flags: list[QAFlag] = []
+    # As sinalizações de entrada (p.ex. da deteção dos candidatos: em falta no OSM, não
+    # consta da cartografia municipal) mantêm-se; a reconstrução só acrescenta.
+    flags: list[QAFlag] = list(building.qa_flags)
     if diagnostics["rectangularity"] < MIN_RECTANGULARITY:
         flags.append(
             _flag("complex_footprint", "Planta não retangular: candidata a partes", "info")
