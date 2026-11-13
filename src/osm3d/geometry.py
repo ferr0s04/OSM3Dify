@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from shapely.geometry import Polygon
 from shapely.geometry.base import BaseGeometry
 
 
@@ -54,3 +55,46 @@ def direction_difference_deg(a: float, b: float) -> float:
     """Diferença entre duas direções (com sentido), em [0, 180]."""
     d = abs(a - b) % 360.0
     return min(d, 360.0 - d)
+
+
+def remove_spikes(poly: Polygon, min_turn_deg: float = 178.0, min_len_m: float = 0.01) -> Polygon:
+    """Tira vértices repetidos e "espigões" (o contorno vai e volta pelo mesmo caminho).
+
+    Um espigão tem área nula, por isso o polígono continua "válido", mas a ida-e-volta
+    parte operações como ``segmentize`` (devolve um multipolígono) e a malha 3D, e não
+    deve ir para o OSM. Remove-se o vértice onde o contorno inverte o sentido
+    (viragem ≥ ``min_turn_deg``), até não haver mais.
+    """
+    if not isinstance(poly, Polygon) or poly.is_empty:
+        return poly
+
+    def clean(ring: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        pts = ring[:-1]
+        changed = True
+        while changed and len(pts) >= 3:
+            changed = False
+            for i in range(len(pts)):
+                a, b, c = pts[i - 1], pts[i], pts[(i + 1) % len(pts)]
+                ab = (b[0] - a[0], b[1] - a[1])
+                bc = (c[0] - b[0], c[1] - b[1])
+                lab, lbc = math.hypot(*ab), math.hypot(*bc)
+                if lab < min_len_m:
+                    del pts[i]
+                    changed = True
+                    break
+                if lbc < min_len_m:
+                    continue
+                cos = (ab[0] * bc[0] + ab[1] * bc[1]) / (lab * lbc)
+                turn = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+                if turn >= min_turn_deg:
+                    del pts[i]
+                    changed = True
+                    break
+        return [*pts, pts[0]] if len(pts) >= 3 else []
+
+    shell = clean(list(poly.exterior.coords))
+    if not shell:
+        return poly
+    holes = [h for r in poly.interiors if (h := clean(list(r.coords)))]
+    out = Polygon(shell, holes)
+    return out if out.is_valid and not out.is_empty else poly

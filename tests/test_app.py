@@ -384,3 +384,59 @@ def test_ortho_tiles(tmp_path: Path) -> None:
     assert px.shape == (256, 256, 4) and px[128, 128, 0] == 200 and px[128, 128, 3] == 255
     assert client.get("/api/ortho/16/0/0.png").status_code == 204  # fora das folhas
     assert client.get("/api/ortho/3/99/0.png").status_code == 422
+
+
+def test_roof_colour_option(tmp_path: Path) -> None:
+    # Opção da aplicação: não propor o roof:colour estimado; fica guardada.
+    from osm3d.domain.models import Estimate, Source
+
+    cfg = Config(
+        area=AreaConfig(name="teste", bbox=(-8.68, 41.27, -8.65, 41.29)),
+        paths=PathsConfig(
+            raw=tmp_path / "raw", processed=tmp_path / "processed", output=tmp_path / "out"
+        ),
+        sources=SourcesConfig(lidar_dir=tmp_path / "lidar", dtm_dir=tmp_path / "dtm"),
+    )
+    fetch = artefact_path(cfg, Stage.FETCH)
+    fetch.parent.mkdir(parents=True)
+    fetch.write_text(OSM_XML, encoding="utf-8")
+    colour = Estimate[str](value="#b5533c", confidence=0.95, source=Source.ORTHOPHOTO)
+    buildings = []
+    for b in load_footprints(fetch, cfg.processing_crs, 20):
+        part = make_part(RoofShape.GABLED).model_copy(update={"geometry": b.footprint})
+        part.roof.colour = colour
+        update = {"parts": [part], "ground_elevation_m": 50.0, "osm_parts": []}
+        buildings.append(b.model_copy(update=update))
+    write_buildings(buildings, artefact_path(cfg, Stage.QA), cfg.processing_crs)
+    client = TestClient(create_app(cfg))
+    assert client.get("/api/settings").json()["export_roof_colour"] is True
+    assert "roof:colour" in client.get("/api/buildings/relation/30").json()["tags"]["proposed"]
+    r = client.put("/api/settings", json={"export_roof_colour": False})
+    assert r.status_code == 200 and r.json()["export_roof_colour"] is False
+    assert "roof:colour" not in client.get("/api/buildings/relation/30").json()["tags"]["proposed"]
+    # Guardada: uma nova aplicação (nova sessão) arranca com a opção desligada.
+    again = TestClient(create_app(cfg))
+    assert again.get("/api/settings").json()["export_roof_colour"] is False
+    tags = again.get("/api/buildings/relation/30").json()["tags"]["proposed"]
+    assert "roof:colour" not in tags
+
+
+def test_municipal_full_download(client: TestClient) -> None:
+    from osm3d.app.municipal import MunicipalDownload
+
+    calls: list[str] = []
+
+    def fake(cfg, *, on_box, cancel, progress):  # type: ignore[no-untyped-def]
+        calls.append(cfg.name)
+        on_box(1, 2, 10)
+        on_box(2, 2, 20)
+        return cfg.full_path
+
+    ctx = client.app.state.ctx  # type: ignore[attr-defined]
+    ctx.municipal = MunicipalDownload(fetcher=fake)
+    r = client.post("/api/municipal/download")
+    assert r.status_code == 200
+    assert ctx.municipal.wait(5)
+    state = client.get("/api/municipal/download").json()
+    assert state["ok"] is True and state["done"] == 2 and state["found"] == 20
+    assert calls and client.get("/api/areas").json()["municipal"]["download"]["ok"] is True

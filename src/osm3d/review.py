@@ -270,12 +270,13 @@ def apply_overrides(
     )
     shifted = geometry if geometry is not None else _shifted_footprint(b)
     base = LocalFrame.from_geometry(shifted)
-    flip, ridge_ratio, ridge_offset = False, None, None
+    flip, ridge_ratio, ridge_offset, ridge_shift = False, None, None, None
     if geometry_unchanged:
         assert roof.model is not None
         m = roof.model
         frame = LocalFrame(m.cx, m.cy, m.azimuth_deg, m.half_length, m.half_width)
         flip, ridge_ratio, ridge_offset = m.flip, m.ridge_ratio, m.ridge_offset
+        ridge_shift = m.ridge_shift
     elif shape in (RoofShape.SKILLION, RoofShape.SIDE_HIPPED):
         facing = ov.roof_direction
         if facing is None:
@@ -301,6 +302,7 @@ def apply_overrides(
                 ridge_ratio if shape in (RoofShape.HIPPED, RoofShape.SIDE_HIPPED) else None
             ),
             ridge_offset=ridge_offset if shape is RoofShape.GABLED else None,
+            ridge_shift=ridge_shift if shape is RoofShape.HIPPED else None,
             # Planta não retangular: gabled/hipped seguem o esqueleto (como no renderizador).
             skeleton=renders_as_skeleton(shifted, shape) and has_skeleton(shifted, shape),
             eave_z=ground + height - roof_h,

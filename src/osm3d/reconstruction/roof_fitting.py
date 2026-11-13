@@ -12,6 +12,11 @@ Para cada hipótese (forma × eixo × sentido):
 A confiança vem da diferença de pontuação entre a melhor hipótese e a melhor
 hipótese de *outra* forma. RMSE alto ou poucos inliers → ``unknown``.
 
+Formas raras (``side_hipped``, ``round``) pagam um custo a priori (:data:`SHAPE_PRIOR`):
+só ganham se explicarem claramente melhor os pontos. Sem isto, a flexibilidade extra
+fazia-as ganhar em telhados hipped/gabled com uma ponta irregular ou uma faixa mais
+baixa num dos lados (casos corrigidos na revisão de Vila do Conde).
+
 Os pontos têm de vir já selecionados para a parte (footprint + co-registo) e
 filtrados por classe.
 """
@@ -52,6 +57,20 @@ HIPPED_RIDGE_RATIOS = tuple(round(r, 2) for r in np.arange(0.10, 0.951, 0.05))
 SIDE_HIPPED_RIDGE_RATIOS = tuple(round(r, 2) for r in np.arange(0.30, 0.951, 0.05))
 # gabled: posição da cumeeira em v (fração da meia-largura); 0 = a meio.
 GABLED_RIDGE_OFFSETS = (-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3)
+# hipped assimétrico: comprimento de cada ponta (fração de a). Testado só quando a
+# melhor hipótese é hipped ou side_hipped (refinamento): uma ponta curta e outra longa
+# é um hipped, não um side_hipped (que tem uma empena vertical).
+ASYMMETRIC_HIP_FRACTIONS = (0.05, *(round(r, 2) for r in np.arange(0.1, 0.951, 0.1)))
+# Custo a priori das formas raras, como melhoria relativa mínima da perda truncada
+# (score += n·ln(1 + m)): side_hipped tem de explicar os pontos ≥ 8 % melhor do que um
+# hipped/gabled, round ≥ 10 % melhor do que as águas retas.
+SHAPE_PRIOR: dict[RoofShape, float] = {RoofShape.SIDE_HIPPED: 0.08, RoofShape.ROUND: 0.10}
+# round: as duas metades (de um e do outro lado do eixo) têm de ter flecha parecida.
+# Uma faixa baixa num só lado (anexo, caleira) dá um "round" assimétrico, que não é.
+ROUND_MIN_HALF_RATIO = 0.5
+# ... e, em cada metade, o arco tem de explicar os pontos ≥ 15 % melhor do que uma água
+# reta (em Vila do Conde: abóbadas 0,1–0,8; falsos round 0,97–1,6).
+ROUND_MAX_HALF_RSS_RATIO = 0.85
 
 
 @dataclass(frozen=True)
@@ -80,6 +99,7 @@ class Hypothesis:
     flip: bool = False  # skillion: água virada para −v; side_hipped: hip em −u
     ridge_ratio: float | None = None  # hipped/side_hipped: cumeeira / comprimento
     ridge_offset: float | None = None  # gabled: posição da cumeeira (fração de b)
+    ridge_shift: float | None = None  # hipped assimétrico: centro da cumeeira (fração de a)
     # gabled/hipped por straight skeleton sobre esta planta (não retangular).
     skeleton: BaseGeometry | None = None
 
@@ -102,6 +122,7 @@ class Hypothesis:
             ridge_ratio=self.ridge_ratio,
             flip=self.flip,
             ridge_offset=self.ridge_offset,
+            ridge_shift=self.ridge_shift,
         )
 
     def slope_deg(self, h: float) -> float:
@@ -155,7 +176,8 @@ class FitResult:
 
     @property
     def n_params(self) -> int:
-        return N_PARAMS[self.shape]
+        # hipped assimétrico: mais um parâmetro (o comprimento da outra ponta).
+        return N_PARAMS[self.shape] + (1 if self.hypothesis.ridge_shift else 0)
 
     @property
     def top_z(self) -> float:
@@ -236,6 +258,21 @@ def hypotheses_for(
     return hyps
 
 
+def asymmetric_hipped(frame: LocalFrame) -> list[Hypothesis]:
+    """hipped com pontas de comprimento diferente (as simétricas já estão na grelha)."""
+    a = frame.half_length
+    hyps = []
+    for f_pos in ASYMMETRIC_HIP_FRACTIONS:
+        for f_neg in ASYMMETRIC_HIP_FRACTIONS:
+            if f_pos == f_neg or f_pos + f_neg > 1.9:
+                continue
+            hip_pos, hip_neg = f_pos * a, f_neg * a
+            r = a - (hip_pos + hip_neg) / 2  # meia cumeeira
+            shift = (hip_neg - hip_pos) / 2 / a  # centro da cumeeira, fração de a
+            hyps.append(Hypothesis(RoofShape.HIPPED, frame, ridge_ratio=r / a, ridge_shift=shift))
+    return hyps
+
+
 def _fast_median(a: Array) -> float:
     """Mediana de um vetor 1D (sem a sobrecarga de ``np.median`` no ciclo de ajuste)."""
     n = len(a)
@@ -292,9 +329,42 @@ def _evaluate(hyp: Hypothesis, xyz: Array, params: FitParams) -> FitResult | Non
     n = len(r)
     inliers = np.abs(r) <= params.truncation_m
     rho = float(np.minimum(r**2, params.truncation_m**2).sum())
-    score = penalized_score(rho, n, N_PARAMS[hyp.shape])
+    n_params = N_PARAMS[hyp.shape] + (1 if hyp.ridge_shift else 0)
+    score = penalized_score(rho, n, n_params) + n * math.log1p(SHAPE_PRIOR.get(hyp.shape, 0.0))
     rmse = float(np.sqrt(np.mean(r[inliers] ** 2))) if inliers.any() else float("inf")
     return FitResult(hyp, z0, h, rmse, float(inliers.mean()), score, rho, n)
+
+
+def halves_agree(res: FitResult, xyz: Array, params: FitParams) -> bool:
+    """O ``round`` é uma abóbada dos dois lados do eixo?
+
+    Ajusta, em cada metade (v > 0 e v < 0), o arco e uma água reta. Numa abóbada
+    verdadeira o arco explica claramente melhor as duas metades, com flechas parecidas.
+    Um telhado plano ou de uma água com uma faixa mais baixa num dos lados (anexo,
+    caleira), ou um gabled assimétrico, só "curva" de um lado. Uma metade quase sem
+    pontos também não confirma a abóbada.
+    """
+    hyp = res.hypothesis
+    f = hyp.basis(xyz[:, 0], xyz[:, 1])
+    if f is None:
+        return True
+    _, v = hyp.frame.to_local(xyz[:, 0], xyz[:, 1])
+    straight = 1 - np.abs(v) / hyp.frame.half_width
+    t2 = params.truncation_m**2
+    hs = []
+    for side in (v >= 0, v < 0):
+        if side.sum() < max(params.min_points // 2, 0.15 * len(xyz)):
+            return False  # quase sem pontos de um dos lados: a abóbada não se confirma
+        _, h, r = _robust_linear_fit(f[side], xyz[side, 2], params.truncation_m)
+        _, _, r_lin = _robust_linear_fit(straight[side], xyz[side, 2], params.truncation_m)
+        curved = (
+            np.minimum(r**2, t2).sum() <= ROUND_MAX_HALF_RSS_RATIO * np.minimum(r_lin**2, t2).sum()
+        )
+        if not curved:
+            return False
+        hs.append(h)
+    lo, hi = min(hs), max(hs)
+    return hi > 0 and lo / hi >= ROUND_MIN_HALF_RATIO
 
 
 def penalized_score(rss: float, n: int, n_params: int) -> float:
@@ -353,6 +423,27 @@ def fit_roof(
         if (res := _evaluate(hyp, xyz, params)) is not None
     ]
     results.sort(key=lambda r: r.score)
+    if (
+        results
+        and RoofShape.HIPPED in params.candidates
+        and results[0].shape in (RoofShape.HIPPED, RoofShape.SIDE_HIPPED)
+        and results[0].hypothesis.skeleton is None
+    ):
+        # Refinamento: hipped com uma ponta curta e outra longa, no referencial da
+        # melhor hipótese (compete com o side_hipped).
+        frame = results[0].hypothesis.frame
+        results += [
+            res
+            for hyp in asymmetric_hipped(frame)
+            if (res := _evaluate(hyp, xyz, params)) is not None
+        ]
+        results.sort(key=lambda r: r.score)
+    if (
+        results
+        and results[0].shape is RoofShape.ROUND
+        and not halves_agree(results[0], xyz, params)
+    ):
+        results = [r for r in results if r.shape is not RoofShape.ROUND]
     if not results:
         return _unknown(xyz, ground_z, params, results)
 
@@ -386,6 +477,7 @@ def fit_roof(
             flip=hyp.flip,
             ridge_ratio=hyp.ridge_ratio,
             ridge_offset=hyp.ridge_offset or None,
+            ridge_shift=hyp.ridge_shift or None,
             skeleton=hyp.skeleton is not None,
             eave_z=best.z0,
             roof_height=0.0 if best.shape is RoofShape.FLAT else best.h,

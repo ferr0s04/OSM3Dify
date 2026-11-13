@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -69,6 +71,11 @@ class AreaIn(BaseModel):
     activate: bool = False
 
 
+class SettingsIn(BaseModel):
+    # None: voltar ao valor do config.yaml.
+    export_roof_colour: bool | None = None
+
+
 class ProcessIn(BaseModel):
     candidates: bool = False  # também a fase "candidates" (edifícios em falta no OSM)
     # Por omissão só corre o que falta ou está desatualizado. Com uma fase, refaz essa e
@@ -77,6 +84,32 @@ class ProcessIn(BaseModel):
     # Cartografia municipal nos candidatos: None = a do config.yaml.
     municipal: bool | None = None
     refresh_municipal: bool = False  # voltar a obtê-la do geoportal (refaz os candidatos)
+
+
+@asynccontextmanager
+async def _quiet_connection_resets(app: FastAPI) -> AsyncIterator[None]:
+    """Sem o traceback do asyncio no Windows quando o browser fecha uma ligação.
+
+    Acontece ao arrastar o mapa (o browser cancela pedidos de tiles a meio): o
+    ProactorEventLoop regista ``ConnectionResetError`` (WinError 10054) ao fechar o
+    socket. Não é um erro da aplicação; os outros erros continuam a ser registados.
+    """
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+
+    def handler(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if isinstance(context.get("exception"), ConnectionResetError):
+            return
+        if previous is not None:
+            previous(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+    try:
+        yield
+    finally:
+        loop.set_exception_handler(previous)
 
 
 def create_app(
@@ -94,7 +127,12 @@ def create_app(
     ctx = AppContext(cfg, service, downloads, pipeline, relation_lookup)
     data = ctx.data
     ortho = OrthoTiles(cfg.sources.orthophoto_dir)
-    app = FastAPI(title="osm3d — revisão", docs_url="/api/docs", openapi_url="/api/openapi.json")
+    app = FastAPI(
+        title="osm3d — revisão",
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        lifespan=_quiet_connection_resets,
+    )
     app.state.ctx = ctx
     app.state.data = data
 
@@ -211,6 +249,16 @@ def create_app(
     def export() -> dict[str, Any]:
         return rs().export()
 
+    @app.get("/api/settings")
+    def settings() -> dict[str, Any]:
+        """Opções da aplicação (p.ex. propor ou não roof:colour)."""
+        return ctx.settings_info()
+
+    @app.put("/api/settings")
+    def settings_update(body: SettingsIn) -> dict[str, Any]:
+        """Guarda as opções e recarrega a revisão com elas."""
+        return ctx.update_settings(body.export_roof_colour)
+
     # --- dados raw (quadrículas DGT) -------------------------------------------
 
     @app.get("/api/data/status")
@@ -323,6 +371,19 @@ def create_app(
             raise HTTPException(502, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/municipal/download")
+    def municipal_download_state() -> dict[str, Any]:
+        return ctx.municipal.state()
+
+    @app.post("/api/municipal/download")
+    def municipal_download_start() -> dict[str, Any]:
+        """Descarrega toda a cartografia municipal do concelho (fica para todas as áreas)."""
+        return guarded(ctx.download_municipality)
+
+    @app.delete("/api/municipal/download")
+    def municipal_download_cancel() -> dict[str, Any]:
+        return ctx.municipal.cancel()
 
     @app.get("/api/processing")
     def processing_state() -> dict[str, Any]:

@@ -336,6 +336,13 @@ export class BuildingMap {
     }
   }
 
+  async reload3D(loadScene) {
+    // Cena desatualizada (p.ex. outras cores propostas): volta a pedi-la se o 3D está ligado.
+    if (this.map.getLayer("roofs-3d")) this.map.removeLayer("roofs-3d");
+    this.roofs = null;
+    if (this.is3d) await this.set3D(true, loadScene);
+  }
+
   updateBuilding(sceneBuilding) {
     if (this.roofs && sceneBuilding) this.roofs.setBuilding(sceneBuilding);
   }

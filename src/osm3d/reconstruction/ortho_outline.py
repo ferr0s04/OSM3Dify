@@ -1078,6 +1078,8 @@ def buildings_from_seed(seed: Polygon, patch: Patch) -> list[Polygon]:
     # Vegetação (árvores sobre o telhado ou mal classificadas como edifício) sai da
     # semente: fragmentos só de vegetação desaparecem, casas ficam só com o telhado.
     mask &= ~vegetation(patch)
+    if not mask.any():
+        return []  # mancha só de vegetação: não é edifício
     seed_dom = dominant_orientation(patch, seed)
     surfaces, _ = segment_roofs(patch, mask)
     # Cada superfície contínua (sem degraus) ainda pode ter vários edifícios: divide-se

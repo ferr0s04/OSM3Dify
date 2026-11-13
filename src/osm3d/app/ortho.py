@@ -13,6 +13,7 @@ import logging
 import math
 import re
 import threading
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,7 @@ import numpy as np
 from affine import Affine
 from PIL import Image
 from rasterio.enums import ColorInterp, Resampling
-from rasterio.errors import WindowError
+from rasterio.errors import NotGeoreferencedWarning, WindowError
 from rasterio.io import DatasetReader
 from rasterio.warp import reproject, transform_bounds
 from rasterio.windows import Window, from_bounds
@@ -188,7 +189,7 @@ def _read_reprojected(
         else src.dataset_mask(window=win, out_shape=(oh, ow))
     )
     common = {
-        "src_transform": src.window_transform(win) * Affine.scale(win.width / ow, win.height / oh),
+        "src_transform": src.window_transform(win) @ Affine.scale(win.width / ow, win.height / oh),
         "src_crs": src.crs,
         "dst_transform": dst_transform,
         "dst_crs": "EPSG:3857",
@@ -197,6 +198,10 @@ def _read_reprojected(
     }
     rgb = np.zeros((3, TILE_PX, TILE_PX), np.uint8)
     a = np.zeros((TILE_PX, TILE_PX), np.uint8)
-    reproject(data, rgb, resampling=Resampling.bilinear, **common)
-    reproject(alpha, a, resampling=Resampling.nearest, **common)
+    with warnings.catch_warnings():
+        # As transformações vão explícitas: o aviso do GDAL sobre arrays sem
+        # georreferenciação não se aplica.
+        warnings.simplefilter("ignore", NotGeoreferencedWarning)
+        reproject(data, rgb, resampling=Resampling.bilinear, **common)
+        reproject(alpha, a, resampling=Resampling.nearest, **common)
     return rgb, a

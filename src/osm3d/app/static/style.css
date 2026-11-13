@@ -234,3 +234,9 @@ label.redo select { font: inherit; padding: 2px 4px; border: 1px solid var(--bor
 @media (max-width: 1200px) {
   .review-layout { grid-template-columns: 1fr 440px; }
 }
+
+/* Cópia de toda a cartografia municipal do concelho (separador Dados). */
+.muni-full { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
+.muni-full .t-bar { flex: 1 1 120px; background: var(--chip); border-radius: 3px; height: 8px; overflow: hidden; }
+.muni-full .t-bar span { display: block; height: 100%; background: var(--accent); }
+.topbar-opt { font-size: 12px; color: var(--muted); }

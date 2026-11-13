@@ -500,3 +500,12 @@ def test_areas_api_create_activate_process(
     assert client.get("/api/summary").json()["area"] == "area-1"
     assert client.delete("/api/areas/area-2").status_code == 200
     assert client.delete("/api/areas/area-1").status_code == 422
+
+
+def test_active_default_uses_saved_tiles(tmp_path: Path) -> None:
+    # Área inicial alterada na aplicação sem a ativar ("active": null): continua a ser a
+    # área ativa, com as quadrículas guardadas (não as do config.yaml).
+    store = AreaStore(tmp_path / "areas.json", BASE)
+    store.save(BASE.model_copy(update={"tiles": ["155480"]}))
+    assert store.active().tiles == ["155480"]
+    assert store.active() == store.areas()["area-1"]

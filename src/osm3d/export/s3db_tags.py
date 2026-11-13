@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from osm3d.domain.models import BuildingPart, RoofShape
+from osm3d.domain.models import BuildingPart, RoofShape, Source
 from osm3d.geometry import axis_difference_deg, longest_side_azimuth_deg
 
 # Formas com cumeeira (ou eixo, no round) cuja direção se exprime via roof:orientation.
@@ -23,6 +23,9 @@ class TagPolicy:
     min_colour_confidence: float = 0.6
     height_rounding_m: float = 0.5
     roof_height_rounding_m: float = 0.5
+    # False: não propor o roof:colour estimado (o existente no OSM mantém-se). Uma cor
+    # escolhida à mão na revisão é proposta na mesma.
+    roof_colour: bool = True
 
 
 @dataclass
@@ -76,7 +79,11 @@ def part_to_tags(part: BuildingPart, policy: TagPolicy | None = None) -> dict[st
     if shape in _DIRECTED_SHAPES and roof.facing_azimuth_deg is not None:
         tags["roof:direction"] = str(round(roof.facing_azimuth_deg) % 360)
 
-    if roof.colour is not None and roof.colour.confidence >= policy.min_colour_confidence:
+    if (
+        roof.colour is not None
+        and (policy.roof_colour or roof.colour.source is Source.MANUAL)
+        and roof.colour.confidence >= policy.min_colour_confidence
+    ):
         tags["roof:colour"] = roof.colour.value
     if (
         part.facade_colour is not None

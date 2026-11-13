@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -100,6 +102,17 @@ class MunicipalSourceConfig(BaseModel):
     chunk_m: float = Field(default=250.0, gt=10, le=1000)
     delay_s: float = Field(default=0.5, ge=0.2, description="Pausa entre pedidos.")
     min_area_m2: float = Field(default=8.0, ge=0)
+    # Cópia de todo o concelho (descarregada uma vez, a pedido): as áreas recortam-na
+    # localmente em vez de pedirem ao geoportal. Pedidos de 1 km (~700 polígonos cada).
+    cache_dir: Path = Path("data/raw/municipal")
+    full_chunk_m: float = Field(default=1000.0, gt=10, le=1000)
+
+    @property
+    def full_path(self) -> Path:
+        """Cópia de todo o concelho (GeoJSON, EPSG:3763)."""
+        ascii_name = unicodedata.normalize("NFKD", self.name).encode("ascii", "ignore").decode()
+        slug = re.sub(r"[^a-z0-9]+", "-", ascii_name.lower())
+        return self.cache_dir / f"{slug.strip('-') or 'municipal'}.geojson"
 
 
 class SourcesConfig(BaseModel):
@@ -174,6 +187,9 @@ class ExportConfig(BaseModel):
     height_rounding_m: float = 0.5
     roof_height_rounding_m: float = 0.5
     overwrite_existing_tags: bool = False
+    # false: não acrescentar nem alterar roof:colour com a cor estimada (o do OSM, se
+    # houver, fica; uma cor escolhida à mão na revisão é exportada na mesma).
+    roof_colour: bool = True
     export_parts_to_osm: bool = False
     # Incluir edifícios ainda não revistos (sem sinalizações). A revisão é então feita
     # no JOSM; com false, só os "accepted" (aplicação de revisão) são exportados.
@@ -185,6 +201,9 @@ class ExportConfig(BaseModel):
 class Config(BaseModel):
     area: AreaConfig
     processing_crs: str = "EPSG:3763"
+    # Processos para o ajuste dos telhados e a deteção de candidatos (resultados iguais
+    # aos de um só processo). None: núcleos − 1, até 8; 1: em série.
+    workers: int | None = Field(default=None, ge=1, le=64)
     paths: PathsConfig = PathsConfig()
     sources: SourcesConfig = SourcesConfig()
     footprints: FootprintsConfig = FootprintsConfig()

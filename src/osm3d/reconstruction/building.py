@@ -12,6 +12,7 @@ Para cada quadrícula com LAZ e MDT:
 
 from __future__ import annotations
 
+import atexit
 import logging
 from collections import defaultdict
 from collections.abc import Callable
@@ -30,6 +31,7 @@ from osm3d.domain.models import (
     Estimate,
     GroundChoice,
     QAFlag,
+    Roof,
     RoofShape,
     Source,
 )
@@ -37,11 +39,13 @@ from osm3d.geospatial.point_clouds import PointSet, assign_points, read_points
 from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation, wall_foot_profile
 from osm3d.geospatial.registration import estimate_tile_offset
 from osm3d.geospatial.tiling import TileKey, tile_of
+from osm3d.parallel import ordered_map, process_pool, worker_count
 from osm3d.parts import suggest_layout, validate_layout
 from osm3d.reconstruction.ground import STEP_THRESHOLD_M, choose_ground, parse_levels
 from osm3d.reconstruction.parts import fit_layout
 from osm3d.reconstruction.roof_fitting import (
     FitParams,
+    FitResult,
     RoofFit,
     fit_main_volume,
     fit_roof,
@@ -318,6 +322,50 @@ def apply_shared_roofs(
     return changed
 
 
+# ------------------------------------------------------------- em paralelo
+
+# Recursos de cada processo do pool (abertos uma vez, no arranque do processo).
+_worker_dtm: DtmMosaic | None = None
+_worker_cfg: Config | None = None
+
+# Entre processos, os modelos pydantic vão em JSON (o mesmo do GeoPackage, sem perdas):
+# os genéricos (Estimate[float]) não passam pelo pickle.
+_Task = tuple[str, PointSet, tuple[float, float]]
+_Done = tuple[str, tuple[str, str, FitResult | None] | None]
+
+
+def _init_worker(dtm_paths: list[Path], cfg: Config) -> None:
+    global _worker_dtm, _worker_cfg
+    _worker_dtm, _worker_cfg = DtmMosaic(dtm_paths), cfg
+    atexit.register(_worker_dtm.close)  # fechar o GDAL antes de o processo terminar
+
+
+def _reconstruct_here(task: _Task, dtm: DtmMosaic, cfg: Config) -> _Done:
+    b_json, pts, offset = task
+    built, fit = reconstruct_building(Building.model_validate_json(b_json), pts, dtm, offset, cfg)
+    # A lista de todas as hipóteses só serve o próprio ajuste: não se transporta.
+    payload = (
+        None
+        if fit is None
+        else (fit.roof.model_dump_json(), fit.height.model_dump_json(), fit.best)
+    )
+    return built.model_dump_json(), payload
+
+
+def _reconstruct_task(task: _Task) -> _Done:
+    assert _worker_dtm is not None and _worker_cfg is not None
+    return _reconstruct_here(task, _worker_dtm, _worker_cfg)
+
+
+def _unpack(done: _Done) -> tuple[Building, RoofFit | None]:
+    b_json, payload = done
+    if payload is None:
+        return Building.model_validate_json(b_json), None
+    roof, height, best = payload
+    fit = RoofFit(Roof.model_validate_json(roof), Estimate[float].model_validate_json(height), best)
+    return Building.model_validate_json(b_json), fit
+
+
 def reconstruct_area(
     buildings: list[Building],
     lidar_tiles: dict[str, Path],
@@ -341,7 +389,14 @@ def reconstruct_area(
     margin = cfg.footprints.registration_max_shift_m + 1.0
     results: list[Building] = []
     reports: list[TileReport] = []
-    with DtmMosaic(dtm_tiles[t] for t in available) as dtm:
+    dtm_paths = [dtm_tiles[t] for t in available]
+    workers = worker_count(cfg.workers, len(covered))
+    with (
+        DtmMosaic(dtm_paths) as dtm,
+        process_pool(workers, _init_worker, (dtm_paths, cfg)) as pool,
+    ):
+        if progress and pool is not None:
+            progress(f"  ajuste dos telhados em {workers} processos")
         for tile in sorted(by_tile):
             group = by_tile[tile]
             minx, miny, maxx, maxy = shapely.union_all([b.footprint for b in group]).bounds
@@ -363,12 +418,17 @@ def reconstruct_area(
                 )
             indices = assign_points(points, [b.footprint for b in group], offset)
             point_sets = [points.subset(idx) for idx in indices]
-            tile_results: list[Building] = []
-            fits: list[RoofFit | None] = []
-            for b, pts in zip(group, point_sets, strict=True):
-                built, fit = reconstruct_building(b, pts, dtm, offset, cfg)
-                tile_results.append(built)
-                fits.append(fit)
+            tasks = [
+                (b.model_dump_json(), pts, offset) for b, pts in zip(group, point_sets, strict=True)
+            ]
+            done = [
+                _unpack(d)
+                for d in ordered_map(
+                    pool, _reconstruct_task, tasks, lambda t: _reconstruct_here(t, dtm, cfg)
+                )
+            ]
+            tile_results = [built for built, _ in done]
+            fits = [fit for _, fit in done]
             shared = apply_shared_roofs(tile_results, fits, point_sets, offset, cfg)
             if progress and shared:
                 progress(f"  quadrícula {tile}: {shared} edifícios com telhado partilhado")

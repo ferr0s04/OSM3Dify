@@ -17,6 +17,7 @@ from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
 from osm3d.domain.models import RoofModel, RoofShape
+from osm3d.geometry import remove_spikes
 from osm3d.reconstruction.roof_models import model_surface_z
 
 Array = npt.NDArray[np.float64]
@@ -46,6 +47,15 @@ def _polygons(geom: BaseGeometry) -> list[Polygon]:
     return []
 
 
+def _dense(poly: Polygon, resolution_m: float) -> list[Polygon]:
+    """Contorno densificado. Contornos com idas-e-voltas (espigões) dão multipolígonos
+    em ``segmentize``: limpam-se primeiro, para o edifício não ficar sem malha."""
+    dense = shapely.segmentize(poly, resolution_m)
+    if not isinstance(dense, Polygon):
+        dense = shapely.segmentize(remove_spikes(poly), resolution_m)
+    return _polygons(dense)
+
+
 def roof_mesh(
     footprint: BaseGeometry,
     model: RoofModel | None,
@@ -56,8 +66,8 @@ def roof_mesh(
     verts: list[Array] = []
     faces: list[npt.NDArray[np.int64]] = []
     offset = 0
-    for poly in _polygons(footprint):
-        dense = shapely.segmentize(poly, resolution_m)
+    for dense in [d for p in _polygons(footprint) for d in _dense(p, resolution_m)]:
+        poly = dense  # mesma forma, com os lados densificados
         boundary = np.vstack(
             [np.asarray(r.coords)[:-1] for r in (dense.exterior, *dense.interiors)]
         )
@@ -93,8 +103,8 @@ def wall_mesh(
 ) -> Mesh:
     verts: list[Array] = []
     faces: list[list[int]] = []
-    for poly in _polygons(footprint):
-        dense = shapely.segmentize(poly, resolution_m)
+    dense_polys = [d for poly in _polygons(footprint) for d in _dense(poly, resolution_m)]
+    for dense in dense_polys:
         for ring in (dense.exterior, *dense.interiors):
             xy = np.asarray(ring.coords)
             top = roof_z(model, shape, xy[:, 0], xy[:, 1], flat_z, footprint)

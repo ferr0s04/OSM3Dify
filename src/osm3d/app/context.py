@@ -16,8 +16,10 @@ from osm3d.acquisition.inventory import REQUIRED_PRODUCTS, by_tile, has_product,
 from osm3d.acquisition.osm import relation_boundary
 from osm3d.app.data import DataService
 from osm3d.app.downloads import DownloadManager
+from osm3d.app.municipal import MunicipalDownload
 from osm3d.app.processing import DEFAULT_STAGES, PipelineJob
 from osm3d.app.service import ReviewService
+from osm3d.app.settings import AppSettings, apply_settings, load_settings, save_settings
 from osm3d.areas import area_store, with_area
 from osm3d.config import AreaConfig, Config
 from osm3d.geospatial.tiling import tiles_in_geometry
@@ -35,18 +37,31 @@ class AppContext:
         downloads: DownloadManager | None = None,
         pipeline: PipelineJob | None = None,
         relation_lookup: RelationLookup | None = None,
+        municipal: MunicipalDownload | None = None,
     ) -> None:
-        # ``base``: configuração do config.yaml; a sua área é a área inicial do registo.
+        # ``base``: configuração do config.yaml (com as opções guardadas da aplicação); a
+        # sua área é a área inicial do registo.
+        self.yaml_base = base
+        self.settings = load_settings(base)
+        base = apply_settings(base, self.settings)
         self.base = base
         self.store = area_store(base)
         self._lock = threading.RLock()
         self._lookup: RelationLookup = relation_lookup or relation_boundary
-        self.cfg = service.cfg if service is not None else with_area(base, self.store.active())
+        self.cfg = (
+            apply_settings(service.cfg, self.settings)
+            if service is not None
+            else with_area(base, self.store.active())
+        )
+        if service is not None and service.cfg != self.cfg:
+            service = ReviewService(self.cfg)
         self.data = DataService(self.cfg, downloads)
         self.data.downloads.on_change = self._files_changed
         self.pipeline = pipeline or PipelineJob()
         self.pipeline.on_done = self._processed
         self.svc: ReviewService | None = service
+        # Cópia de todo o concelho (cartografia municipal), descarregada a pedido.
+        self.municipal = municipal or MunicipalDownload()
         self.review_error: str | None = None
         # Muda sempre que a revisão é recarregada (outra área ou novos resultados): o
         # frontend compara-o para saber que tem de recarregar os edifícios.
@@ -117,7 +132,7 @@ class AppContext:
             "stages": self.stages(),
             "processing": self.pipeline.state(),
             # Cartografia municipal (fase candidates): estado da cache e se foi usada.
-            "municipal": municipal_status(self.cfg),
+            "municipal": municipal_status(self.cfg) | {"download": self.municipal.state()},
         }
 
     def activate(self, name: str) -> dict[str, Any]:
@@ -171,6 +186,32 @@ class AppContext:
         if not tiles:
             raise ValueError(f"A relação {relation_id} não cobre quadrículas LiDAR da DGT")
         return {"label": label, "osm_relation_id": relation_id, "tiles": tiles}
+
+    # ------------------------------------------------------- cartografia municipal
+
+    def download_municipality(self) -> dict[str, Any]:
+        """Descarrega (em segundo plano) todos os edifícios do concelho."""
+        return self.municipal.start(self.base.sources.municipal)
+
+    # ------------------------------------------------------------------ opções
+
+    def settings_info(self) -> dict[str, Any]:
+        return {
+            # Valor em uso (opção guardada, senão o do config.yaml) e o do config.yaml.
+            "export_roof_colour": self.cfg.export.roof_colour,
+            "config_export_roof_colour": self.yaml_base.export.roof_colour,
+        }
+
+    def update_settings(self, export_roof_colour: bool | None) -> dict[str, Any]:
+        """Muda as opções da aplicação e recarrega a revisão com elas."""
+        with self._lock:
+            self.settings = AppSettings(export_roof_colour=export_roof_colour)
+            save_settings(self.yaml_base, self.settings)
+            self.base = apply_settings(self.yaml_base, self.settings)
+            self.cfg = with_area(self.base, self.cfg.area)
+            self.data.cfg = self.cfg
+            self._load_review()
+        return self.settings_info()
 
     # ------------------------------------------------------------ processamento
 

@@ -133,6 +133,8 @@ export class DataView {
     this.setDownloads(this.status.downloads);
     this.setProcessing(this.areas.processing);
     if (this.processOpts.municipal === null && this.areas.municipal) this.processOpts.municipal = this.areas.municipal.enabled;
+    // Download do concelho em curso (p.ex. iniciado antes de recarregar a página).
+    if (this.areas.municipal?.download?.running && !this.muniDownload?.running) this.setMuniDownload(this.areas.municipal.download);
     this.renderOthers();
     if (!this.framed) {
       this.framed = true;
@@ -728,6 +730,7 @@ export class DataView {
     this.panelEl.querySelectorAll("[data-delete-tile]").forEach((el) => (el.onclick = () => this.removeFiles([el.dataset.deleteTile], `a quadrícula ${el.dataset.deleteTile}`)));
     this.renderDownloads();
     this.renderProcessing();
+    this.renderMuniDownload();
   }
 
   renderMunicipal() {
@@ -736,9 +739,12 @@ export class DataView {
     if (!m) return "";
     const on = !!this.processOpts.municipal;
     const when = m.fetched_at ? new Date(m.fetched_at).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "short" }) : null;
+    const full = m.full?.cached;
     const cache = m.cached
-      ? `${m.n ?? "?"} polígonos de edifício obtidos${when ? ` em ${when}` : ""}`
-      : "ainda não obtida (é obtida ao processar os candidatos)";
+      ? `${m.n ?? "?"} polígonos de edifício nesta área${m.from_full ? " (recortados da cópia do concelho)" : ""}${when ? `, dados de ${when}` : ""}`
+      : full
+        ? "recortada da cópia do concelho ao processar os candidatos (sem pedidos ao geoportal)"
+        : "ainda não obtida (é pedida ao geoportal ao processar os candidatos)";
     const used = m.used_in_candidates === null ? "" : m.used_in_candidates ? " · usada nos candidatos atuais" : " · os candidatos atuais não a usam";
     return `<div class="muni-box small">
       <label class="check"><input type="checkbox" id="p-municipal" ${on ? "checked" : ""}>
@@ -747,8 +753,76 @@ export class DataView {
         candidatos só do LiDAR que não constam dela ficam sinalizados. Área mínima ${m.min_area_m2} m².</span>
       <span>${cache}${used} · <a href="${esc(m.viewer_url)}" target="_blank" rel="noopener">geoportal ↗</a></span>
       <label class="check"><input type="checkbox" id="p-muni-refresh" ${on ? "" : "disabled"} ${this.processOpts.refresh_municipal ? "checked" : ""}>
-        voltar a obter do geoportal (refaz os candidatos)</label>
+        ${full ? "voltar a recortar da cópia do concelho (refaz os candidatos)" : "voltar a obter do geoportal (refaz os candidatos)"}</label>
+      <div id="muni-dl"></div>
     </div>`;
+  }
+
+  renderMuniDownload() {
+    // Cópia de todo o concelho: descarregada uma vez, as áreas recortam-na localmente.
+    const el = this.panelEl.querySelector("#muni-dl");
+    const m = this.areas?.municipal;
+    if (!el || !m) return;
+    const d = this.muniDownload ?? m.download ?? {};
+    const f = m.full ?? {};
+    const when = f.fetched_at ? new Date(f.fetched_at).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "short" }) : null;
+    let body;
+    if (d.running) {
+      const pct = d.total ? Math.min(100, (100 * d.done) / d.total) : 0;
+      body = `<b>A descarregar o concelho…</b>
+        <span class="t-bar"><span style="width:${pct.toFixed(1)}%"></span></span>
+        <span class="muted">${esc(d.message ?? "")}</span>
+        <button class="btn mini-light" id="muni-dl-cancel">Cancelar</button>`;
+    } else {
+      const last = d.finished_at && d.ok === false
+        ? `<span class="${d.error ? "warn-text" : "muted"}">Último download: ${esc(d.message ?? "")}${d.error ? ` — ${esc(d.error)}` : ""}</span>` : "";
+      body = f.cached
+        ? `<span>Cópia do concelho: <b>${(f.n ?? 0).toLocaleString("pt-PT")}</b> polígonos${when ? `, de ${when}` : ""} (${mb(f.bytes ?? 0)}).
+             Todas as áreas a recortam localmente, sem pedidos ao geoportal.</span>
+           ${last}
+           <button class="btn mini-light" id="muni-dl-start" title="Voltar a descarregar todo o concelho (a cópia atual só é substituída no fim)">Descarregar de novo</button>`
+        : `<span class="muted">Sem cópia do concelho: cada área pede ao geoportal só a sua zona.</span>
+           ${last}
+           <button class="btn mini-light" id="muni-dl-start" title="~110 mil polígonos, ~260 pedidos espaçados, ~5 min. Fica guardado em data/raw/municipal e serve todas as áreas.">Descarregar todo o concelho</button>`;
+    }
+    el.innerHTML = `<div class="muni-full">${body}</div>`;
+    el.querySelector("#muni-dl-start")?.addEventListener("click", () => this.startMuniDownload());
+    el.querySelector("#muni-dl-cancel")?.addEventListener("click", async () => {
+      this.setMuniDownload(await api.cancelMunicipalDownload());
+    });
+  }
+
+  async startMuniDownload() {
+    const f = this.areas?.municipal?.full;
+    const msg = f?.cached
+      ? "Voltar a descarregar toda a cartografia municipal do concelho?\n\nA cópia atual mantém-se até o novo download terminar."
+      : "Descarregar toda a cartografia municipal do concelho?\n\n~110 mil polígonos, ~260 pedidos espaçados ao geoportal (~5 min). Fica guardada e serve todas as áreas: deixam de ser feitos pedidos por área.";
+    if (!confirm(msg)) return;
+    try {
+      this.setMuniDownload(await api.startMunicipalDownload());
+    } catch (e) {
+      this.toast(`Cartografia municipal: ${e.message}`, 6000);
+    }
+  }
+
+  setMuniDownload(state) {
+    const wasRunning = this.muniDownload?.running;
+    this.muniDownload = state;
+    clearTimeout(this.muniTimer);
+    if (state.running) this.muniTimer = setTimeout(() => this.pollMuniDownload(), 1500);
+    this.renderMuniDownload();
+    if (wasRunning && !state.running) {
+      this.toast(state.ok ? "Cartografia municipal do concelho descarregada." : `Cartografia municipal: ${state.message}`, 8000);
+      this.refresh();
+    }
+  }
+
+  async pollMuniDownload() {
+    try {
+      this.setMuniDownload(await api.municipalDownload());
+    } catch {
+      this.muniTimer = setTimeout(() => this.pollMuniDownload(), 4000);
+    }
   }
 
   renderLocal() {

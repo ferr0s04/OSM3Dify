@@ -99,6 +99,7 @@ export:
   height_rounding_m: 0.5
   roof_height_rounding_m: 0.5
   overwrite_existing_tags: false   # nunca sobrescrever tags mapeadas por humanos por omissão
+  roof_colour: true                # false: não acrescentar/alterar roof:colour estimado (a cor escolhida à mão na revisão vai na mesma)
   export_parts_to_osm: false       # Fase 6
   include_pending: false           # só os edifícios aceites na aplicação de revisão
   josm_upload: "true"              # "never" faz o JOSM recusar o upload; "false" só avisa

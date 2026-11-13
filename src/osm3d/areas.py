@@ -127,8 +127,11 @@ class AreaStore:
         return areas[name]
 
     def active(self) -> AreaConfig:
-        name = self._read()["active"]
-        return self.areas().get(name, self.default) if name else self.default
+        # Sem área ativa registada: a inicial, mas na versão guardada (as quadrículas
+        # alteradas na aplicação), como em ``areas()``, e não a do config.yaml.
+        name = self._read()["active"] or self.default.name
+        areas = self.areas()
+        return areas.get(name, areas[self.default.name])
 
     def is_default(self, name: str) -> bool:
         return name == self.default.name

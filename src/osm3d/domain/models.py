@@ -85,6 +85,9 @@ class RoofModel(BaseModel):
     flip: bool = False  # skillion: água virada para −v; side_hipped: hip em −u
     ridge_ratio: float | None = None  # hipped/side_hipped: cumeeira / comprimento
     ridge_offset: float | None = None  # gabled: posição da cumeeira (fração de b)
+    # hipped: centro da cumeeira deslocado ao longo de u (fração de a); as duas pontas
+    # ficam com águas de comprimento diferente (exportado como hipped).
+    ridge_shift: float | None = None
     # gabled/hipped em planta não retangular: telhado por straight skeleton sobre o
     # footprint (como nos renderizadores); os parâmetros do retângulo não se usam.
     skeleton: bool = False

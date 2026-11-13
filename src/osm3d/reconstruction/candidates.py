@@ -22,6 +22,7 @@ revisão como ``new/<id>``. Só os aceites são exportados, como ways novas.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
 import logging
@@ -45,9 +46,11 @@ from shapely.ops import polygonize, unary_union
 from osm3d.acquisition.municipal import MunicipalBuilding
 from osm3d.config import MunicipalSourceConfig
 from osm3d.domain.models import Building, QAFlag
+from osm3d.geometry import remove_spikes
 from osm3d.geospatial.point_clouds import PointSet, read_points
 from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation
 from osm3d.geospatial.tiling import TileKey
+from osm3d.parallel import ordered_map, process_pool, worker_count
 from osm3d.parts import layout_from_polygons, validate_layout
 from osm3d.reconstruction.ortho_outline import (
     OrthoMosaic,
@@ -380,8 +383,9 @@ def detect_candidates(
     land: LandContext | None = None,
     municipal: list[MunicipalBuilding] | None = None,
     municipal_cfg: MunicipalSourceConfig | None = None,
+    workers: int | None = None,
 ) -> list[Building]:
-    """Edifícios em falta no OSM, quadrícula a quadrícula.
+    """Edifícios em falta no OSM, quadrícula a quadrícula (``workers``: processos).
 
     Com ortofoto a cobrir a quadrícula, o contorno vem do ortofoto e as manchas LiDAR
     são divididas em edifícios contíguos (:mod:`osm3d.reconstruction.ortho_outline`).
@@ -393,49 +397,130 @@ def detect_candidates(
     osm_index = shapely.STRtree(osm_buildings) if osm_buildings else None
     municipal_cfg = municipal_cfg or MunicipalSourceConfig()
     muni_index = shapely.STRtree([m.geometry for m in municipal or []])
+    tasks: list[_TileTask] = []
+    for tile in available:
+        bounds = _tile_bounds(tile)
+        near = (
+            [osm_buildings[i] for i in osm_index.query(shapely.box(*bounds))] if osm_index else []
+        )
+        near_m = (
+            None
+            if municipal is None
+            else [municipal[i] for i in muni_index.query(shapely.box(*bounds))]
+        )
+        tasks.append((tile, near, near_m))
+    env = _TileEnv(
+        {t: lidar_tiles[t] for t in available},
+        [dtm_tiles[t] for t in available],
+        list(ortho_paths or []),
+        boundary,
+        land,
+        municipal_cfg,
+    )
+    # Uma quadrícula por processo: o resultado é o mesmo, pela mesma ordem.
     found: dict[int, Building] = {}
-    ortho = OrthoMosaic(ortho_paths) if ortho_paths else None
-    try:
-        with DtmMosaic(dtm_tiles[t] for t in available) as dtm:
-            for tile in available:
-                x0, y0, x1, y1 = TileKey.from_dgt_name(tile).bounds
-                m = TILE_MARGIN_M
-                bounds = (x0 - m, y0 - m, x1 + m, y1 + m)
-                pts = read_points((lidar_tiles[t] for t in available), bounds, [6])
-                if not len(pts):
-                    continue
-                near = (
-                    [osm_buildings[i] for i in osm_index.query(shapely.box(*bounds))]
-                    if osm_index
-                    else []
-                )
-                ctx = _TileContext(tile, (x0, y0, x1, y1), bounds, pts, dtm, near, boundary, land)
-                offset = (0.0, 0.0)
-                if ortho is not None and ortho.covers((x0, y0, x1, y1)):
-                    new, offset = _detect_tile_ortho(ctx, ortho)
-                    how = "ortofoto"
-                else:
-                    new = _detect_tile_lidar(ctx)
-                    how = "só LiDAR (sem ortofoto)"
-                note = ""
-                if municipal is not None:
-                    near_m = [municipal[i] for i in muni_index.query(shapely.box(*bounds))]
-                    new, stats = merge_municipal(ctx, new, near_m, offset, municipal_cfg)
-                    note = (
-                        f"; cartografia municipal: {stats.from_municipal} contornos municipais"
-                        f" confirmados pelo LiDAR, {stats.without_lidar} sem LiDAR (demolidos"
-                        f" ou sob árvores), {stats.replaced} candidatos LiDAR substituídos,"
-                        f" {stats.not_in_municipal} só no LiDAR"
-                    )
-                for b in new:
-                    found[b.osm_id] = b
-                if progress:
-                    progress(f"  quadrícula {tile}: {len(new)} candidatos ({how}{note})")
-    finally:
-        if ortho is not None:
-            ortho.close()
+    with (
+        _OpenedEnv(env) as here,
+        process_pool(
+            worker_count(workers, len(tasks), min_tasks=2), _init_tile_worker, (env,)
+        ) as pool,
+    ):
+        for tile_json, message in ordered_map(
+            pool, _tile_task, tasks, lambda t: _detect_tile(t, here)
+        ):
+            for b in (Building.model_validate_json(j) for j in tile_json):
+                found[b.osm_id] = b
+            if progress and message:
+                progress(message)
     log.info("%d edifícios em falta detetados", len(found))
     return list(found.values())
+
+
+def _tile_bounds(tile: str) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = TileKey.from_dgt_name(tile).bounds
+    m = TILE_MARGIN_M
+    return (x0 - m, y0 - m, x1 + m, y1 + m)
+
+
+@dataclass(frozen=True)
+class _TileEnv:
+    """O que a deteção de uma quadrícula precisa (passa para os processos do pool)."""
+
+    lidar: dict[str, Path]
+    dtm: list[Path]
+    ortho: list[Path]
+    boundary: BaseGeometry | None
+    land: LandContext | None
+    municipal_cfg: MunicipalSourceConfig
+
+
+class _OpenedEnv:
+    """``_TileEnv`` com o MDT e as ortofotos abertos (em cada processo)."""
+
+    def __init__(self, env: _TileEnv) -> None:
+        self.env = env
+        self.dtm = DtmMosaic(env.dtm)
+        self.ortho = OrthoMosaic(env.ortho) if env.ortho else None
+
+    def close(self) -> None:
+        self.dtm.close()
+        if self.ortho is not None:
+            self.ortho.close()
+
+    def __enter__(self) -> _OpenedEnv:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+# (quadrícula, contornos OSM perto, cartografia municipal perto ou None)
+_TileTask = tuple[str, list[BaseGeometry], list[MunicipalBuilding] | None]
+_worker_env: _OpenedEnv | None = None
+
+
+def _init_tile_worker(env: _TileEnv) -> None:
+    global _worker_env
+    _worker_env = _OpenedEnv(env)
+    atexit.register(_worker_env.close)
+
+
+def _tile_task(task: _TileTask) -> tuple[list[str], str]:
+    assert _worker_env is not None
+    return _detect_tile(task, _worker_env)
+
+
+def _detect_tile(task: _TileTask, opened: _OpenedEnv) -> tuple[list[str], str]:
+    """Candidatos de uma quadrícula (em JSON, para passar entre processos) e o resumo."""
+    tile, near, near_m = task
+    env = opened.env
+    x0, y0, x1, y1 = TileKey.from_dgt_name(tile).bounds
+    bounds = _tile_bounds(tile)
+    pts = read_points(env.lidar.values(), bounds, [6])
+    if not len(pts):
+        return [], ""
+    ctx = _TileContext(
+        tile, (x0, y0, x1, y1), bounds, pts, opened.dtm, near, env.boundary, env.land
+    )
+    offset = (0.0, 0.0)
+    ortho = opened.ortho
+    if ortho is not None and ortho.covers((x0, y0, x1, y1)):
+        new, offset = _detect_tile_ortho(ctx, ortho)
+        how = "ortofoto"
+    else:
+        new = _detect_tile_lidar(ctx)
+        how = "só LiDAR (sem ortofoto)"
+    note = ""
+    if near_m is not None:
+        new, stats = merge_municipal(ctx, new, near_m, offset, env.municipal_cfg)
+        note = (
+            f"; cartografia municipal: {stats.from_municipal} contornos municipais"
+            f" confirmados pelo LiDAR, {stats.without_lidar} sem LiDAR (demolidos"
+            f" ou sob árvores), {stats.replaced} candidatos LiDAR substituídos,"
+            f" {stats.not_in_municipal} só no LiDAR"
+        )
+    message = f"  quadrícula {tile}: {len(new)} candidatos ({how}{note})"
+    return [b.model_dump_json() for b in new], message
 
 
 @dataclass
@@ -616,6 +701,9 @@ def _candidate(
         if fitted is None:
             return None
         footprint = fitted
+    # Vértices repetidos e idas-e-voltas (de recortes e uniões) partem a malha 3D e não
+    # devem ir para o OSM.
+    footprint = remove_spikes(footprint)
     if footprint.area < MIN_AREA_M2 or _width(footprint) < MIN_WIDTH_M:
         return None
     if patch is not None and vegetation_fraction(patch, footprint) > MAX_VEGETATION_FRACTION:
@@ -805,7 +893,7 @@ def municipal_candidate(
     tag = m.building_tag
     if tag is None or not ctx.owns(m.geometry.centroid):
         return None
-    footprint = orient(Polygon(m.geometry.exterior), 1.0)
+    footprint = orient(remove_spikes(Polygon(m.geometry.exterior)), 1.0)
     if footprint.area < cfg.min_area_m2:
         return None
     if any(footprint.intersection(g).area > 0.3 * footprint.area for g in ctx.osm):

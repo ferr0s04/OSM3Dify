@@ -92,3 +92,13 @@ def test_merge_identical_is_noop() -> None:
     result = merge_tags({"height": "8.5"}, {"height": "8.5"})
     assert not result.has_changes
     assert not result.conflicts
+
+
+def test_roof_colour_option_off() -> None:
+    # Opção desligada: a cor estimada não é proposta; a escolhida à mão vai na mesma.
+    off = TagPolicy(roof_colour=False)
+    part = make_part()
+    part.roof.colour = Estimate[str](value="brown", confidence=0.95, source=Source.ORTHOPHOTO)
+    assert "roof:colour" not in part_to_tags(part, off)
+    part.roof.colour = Estimate[str](value="#aa3311", confidence=1.0, source=Source.MANUAL)
+    assert part_to_tags(part, off)["roof:colour"] == "#aa3311"

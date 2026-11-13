@@ -23,6 +23,7 @@ function colourSource(c, conf) {
     const min = state.summary?.min_colour_confidence ?? 0;
     s += ` · ${Math.round(conf * 100)}%${c.roof_source === "omissão" && conf < min ? ` < ${Math.round(min * 100)}%: não exportada` : ""}`;
   }
+  if (!$("#opt-roof-colour").checked) s += " · estimada não exportada (opção roof:colour desligada; só a escolhida à mão)";
   return s;
 }
 
@@ -469,6 +470,7 @@ function wire() {
     tab.addEventListener("click", () => showTab(tab.dataset.tab)),
   );
 
+  $("#opt-roof-colour").addEventListener("input", (e) => setRoofColourOption(e.target));
   $("#btn-export").addEventListener("click", async (e) => {
     e.target.disabled = true;
     try {
@@ -752,6 +754,35 @@ async function archiveAction(select) {
   }
 }
 
+async function loadSettings() {
+  try {
+    const s = await api.settings();
+    $("#opt-roof-colour").checked = !!s.export_roof_colour;
+  } catch { /* sem servidor de opções: fica o valor por omissão */ }
+}
+
+async function setRoofColourOption(input) {
+  // A revisão é recarregada no servidor com a nova política de tags.
+  input.disabled = true;
+  try {
+    const s = await api.saveSettings({ export_roof_colour: input.checked });
+    input.checked = !!s.export_roof_colour;
+    const a = await api.areas();
+    state.reviewGeneration = a.review_generation;
+    state.summary = await api.summary();
+    await reload();
+    await map.reload3D(() => api.scene());
+    toast(input.checked
+      ? "roof:colour volta a ser proposto e exportado."
+      : "roof:colour estimado deixa de ser acrescentado ou alterado (o do OSM fica; a cor escolhida à mão vai na mesma).", 6000);
+  } catch (err) {
+    input.checked = !input.checked;
+    toast(`Opção roof:colour: ${err.message}`);
+  } finally {
+    input.disabled = false;
+  }
+}
+
 async function reload() {
   const [rows, geojson] = await Promise.all([api.buildings(), api.geojson()]);
   state.rows = rows;
@@ -764,6 +795,7 @@ async function reload() {
 
 async function init() {
   wire();
+  loadSettings();
   const initial = location.hash.slice(1);
   // Geração da revisão carregada por esta página (ver reviewChanged).
   try {

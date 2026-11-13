@@ -90,6 +90,7 @@ def roof_surface(
     ridge_ratio: float | None = None,
     flip: bool = False,
     ridge_offset: float | None = None,
+    ridge_shift: float | None = None,
 ) -> Array:
     """Cota do telhado para cada ponto (u, v) do referencial local.
 
@@ -102,6 +103,9 @@ def roof_surface(
 
     ``ridge_offset`` (só ``gabled``): posição da cumeeira em v, como fração de ``b``
     (0 = a meio). Os beirais ficam à mesma cota; as águas têm inclinações diferentes.
+
+    ``ridge_shift`` (só ``hipped``): centro da cumeeira em u, como fração de ``a``. As
+    águas das duas pontas ficam com comprimentos diferentes (uma curta, outra longa).
     """
     if a <= 0 or b <= 0:
         raise ValueError("Dimensões do referencial têm de ser positivas")
@@ -128,7 +132,14 @@ def roof_surface(
         case RoofShape.HIPPED:
             # Cumeeira de meia-largura r; as águas das pontas sobem de |u| = a até |u| = r.
             r = max(a - b, 0.0) if ridge_ratio is None else ridge_ratio * a
-            rel = np.minimum(1 - av / b, (a - au) / (a - r))
+            if not ridge_shift:
+                rel = np.minimum(1 - av / b, (a - au) / (a - r))
+            else:
+                c = ridge_shift * a
+                hip_pos, hip_neg = a - (c + r), a + (c - r)  # comprimento de cada ponta
+                if hip_pos <= 0 or hip_neg <= 0:
+                    raise ValueError("Cumeeira do hipped fora do edifício")
+                rel = np.minimum(1 - av / b, np.minimum((a - u) / hip_pos, (a + u) / hip_neg))
         case RoofShape.SIDE_HIPPED:
             # Três águas: empena em u = −a, ponta em hip em u = +a. A cumeeira vai de
             # u = −a até u_r; a água da ponta sobe de u = a até u_r.
@@ -179,4 +190,5 @@ def model_surface_z(
         ridge_ratio=model.ridge_ratio,
         flip=model.flip,
         ridge_offset=model.ridge_offset,
+        ridge_shift=model.ridge_shift,
     )

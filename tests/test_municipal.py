@@ -128,3 +128,51 @@ def test_merge_municipal_needs_height(monkeypatch: pytest.MonkeyPatch) -> None:
         ctx, [], [MunicipalBuilding(1, house, "Vivenda Casa")], (0.0, 0.0), MunicipalSourceConfig()
     )
     assert out == [] and stats.without_lidar == 1
+
+
+class _FakeFullClient(_FakeClient):
+    def extent(self) -> tuple[float, float, float, float]:
+        return (0.0, 0.0, 1500.0, 900.0)
+
+
+def test_full_municipality_and_crop(tmp_path: Path) -> None:
+    from osm3d.acquisition.municipal import (
+        crop_municipal,
+        fetch_full_municipality,
+        read_fetch_meta,
+    )
+
+    cfg = MunicipalSourceConfig(enabled=True, delay_s=0.2, cache_dir=tmp_path / "raw")
+    client = _FakeFullClient()
+    seen: list[tuple[int, int, int]] = []
+    path = fetch_full_municipality(
+        cfg,
+        client,  # type: ignore[arg-type]
+        on_box=lambda d, t, n: seen.append((d, t, n)),
+    )
+    assert path == cfg.full_path and path.exists()
+    assert len(client.boxes) == 2  # caixas de 1 km: 2 × 1
+    assert seen[-1] == (2, 2, 2)
+    assert read_fetch_meta(path)["full"] is True
+    # Recorte local de uma área: sem pedidos, com a data do download do concelho.
+    area = tmp_path / "area.geojson"
+    crop_municipal(path, (11.0, 0.0, 20.0, 5.0), area, cfg)
+    assert [b.gid for b in load_municipal_buildings(area)] == [111792]
+    meta = read_fetch_meta(area)
+    assert meta["from_full"] is True and meta["fetched_at"] == read_fetch_meta(path)["fetched_at"]
+    assert len(client.boxes) == 2
+
+
+def test_cancelled_full_download_keeps_previous_copy(tmp_path: Path) -> None:
+    import threading
+
+    from osm3d.acquisition.municipal import MunicipalCancelled, fetch_full_municipality
+
+    cfg = MunicipalSourceConfig(enabled=True, delay_s=0.2, cache_dir=tmp_path / "raw")
+    cfg.full_path.parent.mkdir(parents=True)
+    cfg.full_path.write_text("anterior", encoding="utf-8")
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(MunicipalCancelled):
+        fetch_full_municipality(cfg, _FakeFullClient(), cancel=cancel)  # type: ignore[arg-type]
+    assert cfg.full_path.read_text(encoding="utf-8") == "anterior"

@@ -57,6 +57,7 @@ def tag_policy(config: Config) -> TagPolicy:
         min_colour_confidence=config.appearance.min_colour_confidence,
         height_rounding_m=config.export.height_rounding_m,
         roof_height_rounding_m=config.export.roof_height_rounding_m,
+        roof_colour=config.export.roof_colour,
     )
 
 
@@ -131,6 +132,9 @@ def stage_state(config: Config, stage: Stage) -> tuple[StageState, str]:
         mpath = municipal_path(config)
         if wanted and (not mpath.exists() or mpath.stat().st_mtime > made):
             return "stale", "cartografia municipal por obter ou mais recente"
+        full = config.sources.municipal.full_path
+        if wanted and full.exists() and full.stat().st_mtime > made:
+            return "stale", "cartografia municipal do concelho descarregada de novo"
     else:
         prev = _previous(config, stage)
         before = artefact_path(config, prev)
@@ -386,19 +390,25 @@ def _run_candidates(
     municipal = None
     if config.sources.municipal.enabled:
         from osm3d.acquisition.municipal import (
+            crop_municipal,
             fetch_municipal_buildings,
             load_municipal_buildings,
         )
 
+        mcfg = config.sources.municipal
         mpath = municipal_path(config)
         mx0, my0, mx1, my1 = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
-        fetch_municipal_buildings(
-            (mx0, my0, mx1, my1),
-            config.sources.municipal,
-            mpath,
-            force=force or not cache_matches(mpath, tiles),
-            progress=progress,
-        )
+        stale = force or not mpath.exists() or not cache_matches(mpath, tiles)
+        if mcfg.full_path.exists():
+            # Cópia de todo o concelho: recorta-se a área localmente, sem pedidos.
+            if stale or mcfg.full_path.stat().st_mtime > mpath.stat().st_mtime:
+                crop_municipal(mcfg.full_path, (mx0, my0, mx1, my1), mpath, mcfg, progress)
+            elif progress:
+                progress("  cartografia municipal: recorte da cópia do concelho em cache")
+        else:
+            fetch_municipal_buildings(
+                (mx0, my0, mx1, my1), mcfg, mpath, force=stale, progress=progress
+            )
         mark_cache(mpath, tiles)
         municipal = load_municipal_buildings(mpath)
     # Limite = as próprias quadrículas da área (centróide dentro delas, como no prepare).
@@ -415,6 +425,7 @@ def _run_candidates(
         land=load_land(ctx, config.processing_crs),
         municipal=municipal,
         municipal_cfg=config.sources.municipal,
+        workers=config.workers,
     )
     if progress:
         progress(f"  {len(found)} edifícios em falta no OSM (candidatos)")
@@ -462,15 +473,11 @@ def with_municipal(config: Config, enabled: bool) -> Config:
 
 def municipal_status(config: Config) -> dict[str, Any]:
     """Cartografia municipal da área ativa, para a aplicação."""
+    from osm3d.acquisition.municipal import read_fetch_meta
+
     m = config.sources.municipal
     path = municipal_path(config)
-    fetch = path.with_name(path.name + ".fetch.json")
-    meta: dict[str, Any] = {}
-    if path.exists() and fetch.exists():
-        try:
-            meta = json.loads(fetch.read_text(encoding="utf-8"))
-        except ValueError:
-            meta = {}
+    meta: dict[str, Any] = dict(read_fetch_meta(path))
     if path.exists() and meta.get("n") is None:  # caches antigas: contar no ficheiro
         with contextlib.suppress(ValueError, KeyError):
             meta["n"] = len(json.loads(path.read_text(encoding="utf-8"))["features"])
@@ -484,6 +491,24 @@ def municipal_status(config: Config) -> dict[str, Any]:
         "n": meta.get("n"),
         "fetched_at": meta.get("fetched_at"),
         "used_in_candidates": None if used is None else bool(used.get("municipal")),
+        # O recorte da área veio da cópia do concelho (sem pedidos ao geoportal)?
+        "from_full": bool(meta.get("from_full")),
+        "full": municipal_full_status(config),
+    }
+
+
+def municipal_full_status(config: Config) -> dict[str, Any]:
+    """Cópia de todo o concelho (descarregada a pedido, partilhada por todas as áreas)."""
+    from osm3d.acquisition.municipal import read_fetch_meta
+
+    full = config.sources.municipal.full_path
+    meta = read_fetch_meta(full)
+    return {
+        "cached": full.exists(),
+        "path": str(full),
+        "n": meta.get("n"),
+        "fetched_at": meta.get("fetched_at"),
+        "bytes": full.stat().st_size if full.exists() else 0,
     }
 
 
@@ -491,7 +516,7 @@ def clear_municipal_cache(config: Config) -> None:
     """Apaga a cache da cartografia municipal (é obtida de novo na próxima corrida)."""
     path = municipal_path(config)
     for p in (path, _cache_meta(path), path.with_name(path.name + ".fetch.json")):
-        p.unlink(missing_ok=True)
+        p.unlink(missing_ok=True)  # com a cópia do concelho, volta a ser recortada dela
 
 
 def review_store_path(config: Config) -> Path:
