@@ -58,8 +58,6 @@ sources:
     chunk_m: 250       # caixa de cada pedido
     delay_s: 0.5       # pausa entre pedidos (uso responsável)
     min_area_m2: 8.0
-    # Tag "source" dos edifícios novos com contorno municipal (vazio: sem tag).
-    source_tag: Câmara Municipal de Vila do Conde
 
 footprints:
   min_area_m2: 20.0
