@@ -19,6 +19,19 @@ from osm3d.domain.models import Building
 from osm3d.geospatial.point_clouds import PointSet
 from osm3d.reconstruction.candidates import _TileContext, candidate_id, merge_municipal
 
+
+def _source(**kwargs: Any) -> MunicipalSourceConfig:
+    """Geoportal fictício (o config geral não traz nenhum)."""
+    return MunicipalSourceConfig(
+        name="Câmara Municipal de Teste",
+        viewer_url="https://geo.example/geoportal",
+        mapagent_url="https://geo.example/mapagent.fcgi",
+        feature_source="Library://teste.FeatureSource",
+        feature_class="carto:edificios",
+        **kwargs,
+    )
+
+
 FEATURE_SET = """<?xml version="1.0" encoding="UTF-8"?><FeatureSet><Features>
 <Feature><Property><Name>gid</Name><Value>79282</Value></Property>
 <Property><Name>geom</Name><Value>MULTIPOLYGON (((0 0, 10 0, 10 8, 0 8, 0 0)))</Value></Property>
@@ -51,7 +64,7 @@ class _FakeClient:
 
 
 def test_fetch_caches_geojson_and_dedupes(tmp_path: Path) -> None:
-    cfg = MunicipalSourceConfig(enabled=True, chunk_m=250, delay_s=0.2)
+    cfg = _source(enabled=True, chunk_m=250, delay_s=0.2)
     client = _FakeClient()
     out = tmp_path / "m.geojson"
     cfg_fast = cfg.model_copy(update={"delay_s": 0.2})
@@ -107,7 +120,7 @@ def test_merge_municipal(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _ctx(pts, 5.0, osm=[in_osm])
     # Candidato LiDAR que junta casa + anexo (encostados): substituído pelos municipais.
     lidar = [_lidar_candidate(box(0, 0, 14, 8)), _lidar_candidate(recent)]
-    cfg = MunicipalSourceConfig(enabled=True)
+    cfg = _source(enabled=True)
     out, stats = merge_municipal(ctx, lidar, municipal, (0.0, 0.0), cfg)
     assert stats.from_municipal == 2 and stats.without_lidar == 1
     assert stats.replaced == 1 and stats.not_in_municipal == 1
@@ -142,7 +155,7 @@ def test_full_municipality_and_crop(tmp_path: Path) -> None:
         read_fetch_meta,
     )
 
-    cfg = MunicipalSourceConfig(enabled=True, delay_s=0.2, cache_dir=tmp_path / "raw")
+    cfg = _source(enabled=True, delay_s=0.2, cache_dir=tmp_path / "raw")
     client = _FakeFullClient()
     seen: list[tuple[int, int, int]] = []
     path = fetch_full_municipality(
@@ -168,7 +181,7 @@ def test_cancelled_full_download_keeps_previous_copy(tmp_path: Path) -> None:
 
     from osm3d.acquisition.municipal import MunicipalCancelled, fetch_full_municipality
 
-    cfg = MunicipalSourceConfig(enabled=True, delay_s=0.2, cache_dir=tmp_path / "raw")
+    cfg = _source(enabled=True, delay_s=0.2, cache_dir=tmp_path / "raw")
     cfg.full_path.parent.mkdir(parents=True)
     cfg.full_path.write_text("anterior", encoding="utf-8")
     cancel = threading.Event()
@@ -176,3 +189,9 @@ def test_cancelled_full_download_keeps_previous_copy(tmp_path: Path) -> None:
     with pytest.raises(MunicipalCancelled):
         fetch_full_municipality(cfg, _FakeFullClient(), cancel=cancel)  # type: ignore[arg-type]
     assert cfg.full_path.read_text(encoding="utf-8") == "anterior"
+
+
+def test_enabled_needs_a_geoportal() -> None:
+    with pytest.raises(ValueError):
+        MunicipalSourceConfig(enabled=True)
+    assert not MunicipalSourceConfig().configured and _source().configured

@@ -191,6 +191,8 @@ class AppContext:
 
     def download_municipality(self) -> dict[str, Any]:
         """Descarrega (em segundo plano) todos os edifícios do concelho."""
+        if not self.base.sources.municipal.configured:
+            raise ValueError("Sem geoportal municipal configurado (sources.municipal)")
         return self.municipal.start(self.base.sources.municipal)
 
     # ------------------------------------------------------------------ opções
@@ -234,6 +236,8 @@ class AppContext:
         refresh_municipal: bool = False,
     ) -> dict[str, Any]:
         """Processa as fases em falta (e, se pedido, refaz a partir de ``redo_from``)."""
+        if not self.cfg.area.tiles:
+            raise ValueError("A área ativa não tem quadrículas: escolhê-las no mapa primeiro")
         with self._lock:
             return self.pipeline.start(
                 self.cfg,

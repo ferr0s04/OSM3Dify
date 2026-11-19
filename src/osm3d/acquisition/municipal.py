@@ -1,14 +1,14 @@
-"""Cartografia municipal de edifícios (geoportal MapGuide de Vila do Conde).
+"""Cartografia municipal de edifícios a partir de um geoportal Autodesk MapGuide.
 
-O geoportal (https://sig.cm-viladoconde.pt/geoportal) é um visualizador sobre
-Autodesk MapGuide. Os serviços OGC (WMS/WFS) estão publicados sem camadas, mas a
-API HTTP do MapGuide (``mapagent.fcgi``) devolve os polígonos em vetor
-(``SELECTFEATURES``), com a sessão anónima que a página do visualizador cria.
+Muitos geoportais municipais são visualizadores sobre MapGuide. Mesmo quando os
+serviços OGC (WMS/WFS) não publicam camadas, a API HTTP do MapGuide (``mapagent.fcgi``)
+devolve os polígonos em vetor (``SELECTFEATURES``), com a sessão anónima que a página
+do visualizador cria. O geoportal, a camada e o filtro configuram-se em
+``sources.municipal`` (``config.yaml``).
 
-Camada: cartografia topográfica vetorial 1:5000 homologada (~2017), classe
-``muni_5000_h_planimetria_pg``, polígonos com ``objeto = 'const_poligonos'``.
-Atributos úteis: ``gid``, ``descr`` (tipo: "Vivenda Casa", "Garagem",
-"Telheiro, Alpendre"…), ``xiscod``. Sem altura, pisos nem telhado.
+Camada esperada: cartografia topográfica vetorial homologada (1:5000/1:10000), com os
+atributos ``gid``, ``geom`` e ``descr`` (tipo: "Vivenda Casa", "Garagem",
+"Telheiro, Alpendre"…; ver :data:`BUILDING_TAGS`). Sem altura, pisos nem telhado.
 
 **Uso autorizado pelo município.** Não é um serviço publicado: a sessão é obtida
 da página do visualizador e o município pode mudar o acesso sem aviso. Os pedidos
@@ -161,7 +161,9 @@ class MapGuideClient:
         """XML dos polígonos de edifício que intersetam a caixa (EPSG:3763)."""
         x0, y0, x1, y1 = box
         ring = f"{x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}"
-        flt = f"{self.cfg.filter} AND geom ENVELOPEINTERSECTS GeomFromText('POLYGON(({ring}))')"
+        flt = f"geom ENVELOPEINTERSECTS GeomFromText('POLYGON(({ring}))')"
+        if self.cfg.filter:
+            flt = f"{self.cfg.filter} AND {flt}"
         return self._request(
             {
                 "OPERATION": "SELECTFEATURES",
@@ -177,7 +179,7 @@ class MapGuideClient:
                 "OPERATION": "SELECTAGGREGATES",
                 "RESOURCEID": self.cfg.feature_source,
                 "CLASSNAME": self.cfg.feature_class,
-                "FILTER": self.cfg.filter,
+                **({"FILTER": self.cfg.filter} if self.cfg.filter else {}),
                 "COMPUTED_ALIASES": "x",
                 "COMPUTED_PROPERTIES": expression,
             }

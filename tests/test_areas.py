@@ -76,8 +76,9 @@ def test_area_is_a_set_of_tiles() -> None:
     assert a.polygon().area == pytest.approx(2e6)
     w, s, e, n = a.bbox
     assert -8.70 < w < e < -8.64 and 41.27 < s < n < 41.29
-    with pytest.raises(ValidationError):
-        AreaConfig(name="x", tiles=[])
+    # Sem quadrículas (área inicial por omissão): válida, enquadra Portugal continental.
+    empty = AreaConfig(name="x")
+    assert empty.tiles == [] and empty.bbox[0] < -9 and empty.polygon().is_empty
     with pytest.raises(ValidationError):
         AreaConfig(name="x", tiles=["12345"])
     with pytest.raises(ValidationError):
@@ -190,16 +191,16 @@ def test_store(tmp_path: Path) -> None:
 
 
 def test_migrates_place_named_ids(tmp_path: Path) -> None:
-    # Registo antigo: a área inicial "vilar-e-mosteiro" alterada para outra quadrícula
+    # Registo antigo: a área inicial "freguesia-antiga" alterada para outra quadrícula
     # (e processada), com o nome herdado. O config.yaml passou a ter id area-1.
     processed = tmp_path / "processed"
-    (processed / "vilar-e-mosteiro").mkdir(parents=True)
-    (processed / "vilar-e-mosteiro" / "06_qa.gpkg").write_bytes(b"x")
+    (processed / "freguesia-antiga").mkdir(parents=True)
+    (processed / "freguesia-antiga" / "06_qa.gpkg").write_bytes(b"x")
     old = {
         "active": None,
         "areas": {
-            "vilar-e-mosteiro": {
-                "name": "vilar-e-mosteiro",
+            "freguesia-antiga": {
+                "name": "freguesia-antiga",
                 "label": "Inicial",  # = nome da área inicial: herdado
                 "tiles": ["156482"],
                 "updated_at": "2026-11-12T11:07:28+00:00",
@@ -215,7 +216,7 @@ def test_migrates_place_named_ids(tmp_path: Path) -> None:
     assert areas["area-2"].tiles == ["156482"] and areas["area-2"].label is None
     assert areas["area-3"].label == "VdC"  # nome próprio: fica
     assert (processed / "area-2" / "06_qa.gpkg").exists()
-    assert not (processed / "vilar-e-mosteiro").exists()
+    assert not (processed / "freguesia-antiga").exists()
     assert store.active().name == "area-2"  # era a área em uso
     assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
     assert list(AreaStore(path, BASE, processed).areas()) == list(areas)  # só uma vez

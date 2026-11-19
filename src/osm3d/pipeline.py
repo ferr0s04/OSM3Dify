@@ -158,6 +158,11 @@ def run_stage(
     progress: Callable[[str], None] | None = None,
 ) -> Path:
     """Executa uma fase e devolve o caminho do artefacto produzido."""
+    if not config.area.tiles and stage is not Stage.EXPORT:
+        raise ValueError(
+            f"A área {config.area.name} não tem quadrículas: escolhê-las no separador Dados "
+            "da aplicação ou com `osm3d area --tiles`"
+        )
     out = artefact_path(config, stage)
     if _is_passthrough(config, stage):
         return _input_of(config, stage)
@@ -484,6 +489,8 @@ def municipal_status(config: Config) -> dict[str, Any]:
     used = candidates_sources(config)
     return {
         "name": m.name,
+        # Há um geoportal configurado (config/local.yaml)? Sem ele, a opção não aparece.
+        "configured": m.configured,
         "enabled": m.enabled,
         "viewer_url": m.viewer_url,
         "min_area_m2": m.min_area_m2,

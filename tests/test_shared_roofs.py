@@ -10,7 +10,7 @@ from osm3d.reconstruction.building import apply_shared_roofs, attached_clusters,
 from osm3d.reconstruction.roof_fitting import fit_roof
 from tests.synthetic import CX, CY, make_roof
 
-CFG = load_config(Path(__file__).resolve().parents[1] / "config" / "config.yaml")
+CFG = load_config(Path(__file__).resolve().parents[1] / "config" / "config.yaml", local=False)
 
 
 def _halves(shape: RoofShape) -> tuple[list[Building], list, list]:  # type: ignore[type-arg]

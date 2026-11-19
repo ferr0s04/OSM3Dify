@@ -1,18 +1,13 @@
-# Área de estudo
+# Validação em dados reais
 
-## Área inicial: Vilar e Mosteiró (Vila do Conde)
+O sistema funciona para qualquer área com dados LiDAR da DGT: uma área é só um conjunto
+de quadrículas de 1 km, escolhidas na aplicação. Este documento regista as medições e
+calibrações feitas durante o desenvolvimento, numa **área de teste** de 18 quadrículas
+(~5,4 × 2,5 km, uma união de freguesias do litoral norte) e no concelho que a contém.
+São um registo de resultados, não configuração: os limiares calibrados aqui estão
+indicados no código e podem precisar de ajuste noutras regiões.
 
-Mosteiró deixou de ser freguesia autónoma na reorganização administrativa de 2013.
-Hoje faz parte da **União das Freguesias de Vilar e Mosteiró**, que é a unidade
-administrativa usada aqui.
-
-| | |
-| --- | --- |
-| Relação OSM | [5989576](https://www.openstreetmap.org/relation/5989576) (`admin_level=8`) |
-| Bbox WGS84 | `-8.69911, 41.27348, -8.63541, 41.29553` |
-| Bbox EPSG:3763 | `-47423, 178371, -42072, 180853` |
-| Extensão | ~5,4 × 2,5 km |
-| Quadrículas LiDAR (1 km) | ~18 na bbox (menos dentro do polígono) |
+## Área de teste
 
 ### Quadrícula de desenvolvimento
 
@@ -313,29 +308,27 @@ altura por piso implícita tem mediana de 3,33 m, P10 de 2,39 m e P90 de 5,18 m;
   | `roof:orientation` | 29 |
 
 - **8 conflitos com tags existentes**, quase todos `roof:shape`. O valor OSM é
-  mantido e o conflito fica registado em `data/output/vilar-e-mosteiro_export.csv`.
-- **O ficheiro `data/output/vilar-e-mosteiro_josm.osm` permite upload no JOSM.** A
+  mantido e o conflito fica registado em `data/output/<área>_export.csv`.
+- **O ficheiro `data/output/<área>_josm.osm` permite upload no JOSM.** A
   licença está resolvida; o upload é sempre feito à mão, depois da revisão.
 
-**Ver no QGIS:** abrir `data/processed/vilar-e-mosteiro/06_qa.gpkg`.
+**Ver no QGIS:** abrir `data/processed/<área>/06_qa.gpkg`.
 
 - Camada `building_parts`: simbolizar por `roof_shape`. Na vista 3D, extrudir por
   `height`.
 - Camada `buildings`: filtrar `needs_review = 1` para ver o que precisa de revisão.
-- Detalhe por edifício: `data/output/vilar-e-mosteiro_avaliacao.csv`.
+- Detalhe por edifício: `data/output/<área>_avaliacao.csv`.
 
-## Área futura: concelho de Vila do Conde
+## Escala: um concelho inteiro
 
 | | |
 | --- | --- |
-| Relação OSM | [3892769](https://www.openstreetmap.org/relation/3892769) (`admin_level=7`) |
-| Bbox WGS84 | `-8.76805, 41.25549, -8.61062, 41.42571` |
 | Extensão | ~13,3 × 19,0 km |
-| Quadrículas LiDAR (1 km) | ~300 na bbox |
+| Quadrículas LiDAR (1 km) | ~300 na bbox (~190 dentro do limite) |
 
 ## Estado atual do OSM (levantamento Overpass, 2026-11-11)
 
-| | Vilar e Mosteiró | Concelho |
+| | Área de teste | Concelho |
 | --- | ---: | ---: |
 | Edifícios | 2 679 | 28 246 |
 | com `height` | 4 | 13 |
@@ -350,7 +343,7 @@ altura por piso implícita tem mediana de 3,33 m, P10 de 2,39 m e P90 de 5,18 m;
   outras referências:
   - `building:levels`, como referência fraca (pisos × ~3 m + telhado);
   - medições manuais sobre o próprio LiDAR para um subconjunto.
-- **Há 173 `roof:shape` mapeados à mão na área inicial e 3 831 no concelho.** Formam
+- **Há 173 `roof:shape` mapeados à mão na área de teste e 3 831 no concelho.** Formam
   um conjunto de referência para avaliar a classificação de telhados sem custo de
   anotação.
 - **A taxa de `building:levels` é alta**, o que indica mapeadores locais ativos em 3D.
@@ -359,7 +352,7 @@ altura por piso implícita tem mediana de 3,33 m, P10 de 2,39 m e P90 de 5,18 m;
   - vale a pena contactar estes mapeadores antes de qualquer edição automatizada.
 - **A dimensão está acima do MVP de 50–100 edifícios.** Proposta:
   1. desenvolver numa quadrícula de 1 km com a maior mistura de formas;
-  2. avaliar na união de freguesias completa (~2 700 edifícios).
+  2. avaliar na área de teste completa (~2 700 edifícios).
 
 ### Implicações de escala (concelho)
 

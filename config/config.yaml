@@ -1,21 +1,28 @@
-# Configuração por omissão do pipeline.
-# Para alterações locais, copiar para config/local.yaml (ignorado pelo git)
-# e usar `osm3d --config config/local.yaml ...`.
+# Configuração por omissão do pipeline (geral: não depende de nenhuma área).
+# O que é de uma instalação vai para config/local.yaml (ignorado pelo git), só com as
+# chaves que mudam: é junto por cima deste ficheiro automaticamente. Exemplo:
+#
+#   area:
+#     label: Nome da minha área
+#     tiles: [155480, 156480]
+#   sources:
+#     municipal:
+#       enabled: true
+#       name: Câmara Municipal de …
+#       viewer_url: https://…/geoportal
+#       ...
 
 area:
-  # Área inicial. As outras áreas criam-se na aplicação (separador "Dados") ou com
-  # `osm3d area`, e ficam em data/areas.json.
+  # Área inicial, sem quadrículas: escolhem-se na aplicação (separador "Dados": clicar
+  # no mapa ou juntar o limite de uma relação OSM) ou com `osm3d area --tiles`. As
+  # outras áreas ficam em data/areas.json.
   #
   # Uma área é só uma lista de quadrículas LiDAR de 1 km (identificadores DGT). As
   # mesmas quadrículas definem o LAZ/MDT a descarregar e os edifícios OSM processados
   # (centróide dentro das quadrículas).
-  # Estas são as 18 que cobrem a União das Freguesias de Vilar e Mosteiró
-  # (relação OSM 5989576). Ver docs/area-de-estudo.md.
   # O id é neutro (dá a pasta data/processed/<id>); o nome a mostrar é só uma etiqueta.
   name: area-1
-  label: Vilar e Mosteiró
-  tiles: [152479, 152480, 152481, 153479, 153480, 153481, 154479, 154480, 154481,
-          155479, 155480, 155481, 156479, 156480, 156481, 157479, 157480, 157481]
+  tiles: []
 
 # Todo o processamento é feito num CRS métrico; só a exportação OSM reprojeta para WGS84.
 processing_crs: "EPSG:3763"  # PT-TM06/ETRS89
@@ -39,25 +46,25 @@ sources:
     orthophoto: ORTOS-2025
   dgt_delay_s: 2.0                 # pausa entre pedidos ao portal (uso responsável)
   # Grelha oficial das quadrículas LiDAR 2024–2025 (separador "Dados" da aplicação).
-  # A coluna DISPONIVEL está desatualizada: só informativa (ver docs/area-de-estudo.md).
+  # A coluna DISPONIVEL está desatualizada: só informativa (ver docs/validacao.md).
   dgt_tile_index: data/raw/dgt/LiDAR2024_2025_Seccionamento.gpkg
   lidar_dir: data/raw/lidar        # ficheiros LAZ (quadrículas 1 km x 1 km)
   dtm_dir: data/raw/dtm            # MDT GeoTIFF do mesmo levantamento LiDAR
   dsm_dir: data/raw/dsm            # MDS GeoTIFF (opcional)
   orthophoto_dir: data/raw/orthophotos
-  # Cartografia municipal de edifícios (1:5000 homologada, ~2017) do geoportal
-  # MapGuide da Câmara, usada na fase candidates (uso autorizado pelo município).
-  # Polígonos confirmados pelo LiDAR passam a candidatos com o contorno municipal;
-  # candidatos só do LiDAR que não constam dela são sinalizados.
+  # Cartografia municipal de edifícios (opcional) de um geoportal MapGuide, usada na
+  # fase candidates. Só com autorização do município. Polígonos confirmados pelo LiDAR
+  # passam a candidatos com o contorno municipal; candidatos só do LiDAR que não constam
+  # dela são sinalizados. O geoportal e a camada configuram-se no config/local.yaml
+  # (name, viewer_url, mapagent_url, feature_source, feature_class, filter).
   # Ver src/osm3d/acquisition/municipal.py.
   municipal:
-    enabled: true
-    name: Câmara Municipal de Vila do Conde
-    viewer_url: https://sig.cm-viladoconde.pt/geoportal
-    mapagent_url: https://sig.cm-viladoconde.pt/mapguide/mapagent/mapagent.fcgi
-    chunk_m: 250       # caixa de cada pedido
+    enabled: false
+    chunk_m: 250       # caixa de cada pedido (por área)
+    full_chunk_m: 1000 # caixa de cada pedido (todo o concelho)
     delay_s: 0.5       # pausa entre pedidos (uso responsável)
     min_area_m2: 8.0
+    cache_dir: data/raw/municipal  # cópia de todo o concelho (descarregada a pedido)
 
 footprints:
   min_area_m2: 20.0

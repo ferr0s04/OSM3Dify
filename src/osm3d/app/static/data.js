@@ -10,7 +10,7 @@ const ACTIVE = ["queued", "searching", "downloading"];
 
 // Grelha só a partir deste zoom (a ~z9 o ecrã tem ~2–3 mil quadrículas de 1 km).
 const GRID_MIN_ZOOM = 9;
-// Tamanhos típicos por quadrícula (Vila do Conde, 2025), só para estimar o download.
+// Tamanhos típicos por quadrícula (levantamento DGT 2024–2025), só para estimar o download.
 const TYPICAL_MB = { lidar: 155, dtm: 13, dsm: 13 };
 const SHORT = { lidar: "LAZ", dtm: "MDT", dsm: "MDS", orthophoto: "Orto" };
 const REQUIRED = ["lidar", "dtm"];
@@ -60,7 +60,7 @@ export class DataView {
 
   async init() {
     this.map = new maplibregl.Map({
-      container: this.mapEl, style: BASEMAP, center: [-8.66, 41.284], zoom: 12,
+      container: this.mapEl, style: BASEMAP, center: [-8.0, 39.6], zoom: 6, // enquadrado na área a seguir
       boxZoom: false, dragRotate: false, pitchWithRotate: false,
     });
     this.map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
@@ -276,7 +276,7 @@ export class DataView {
   async addRelation() {
     const input = this.panelEl.querySelector("#a-relation");
     const id = Number(input?.value);
-    if (!id) return this.toast("Indicar o id da relação OSM do limite (p.ex. 5989576).");
+    if (!id) return this.toast("Indicar o id da relação OSM do limite administrativo (número em openstreetmap.org/relation/…).");
     this.toast("A obter o limite no OSM…", 2000);
     try {
       const r = await api.osmRelation(id);
@@ -628,7 +628,7 @@ export class DataView {
         : `${a.label ? esc(a.label) : "Área"} <span class="chip" title="Identificador (pasta data/processed/${esc(a.name)})">${esc(a.name)}</span> <span class="chip ok">ativa</span>
            <button class="btn mini-light" id="a-rename" title="Mudar o nome a mostrar">✎</button>`}</h2>
       ${this.creating !== null
-        ? `<div class="form"><label class="full">nome (opcional; o id area-… é gerado)<input id="a-name" value="${esc(this.creating)}" placeholder="p.ex. Vila do Conde"></label></div>`
+        ? `<div class="form"><label class="full">nome (opcional; o id area-… é gerado)<input id="a-name" value="${esc(this.creating)}" placeholder="p.ex. nome da freguesia ou do concelho"></label></div>`
         : `<div class="small area-meta">
             <b>${a.tiles.length}</b> quadrículas (${a.tiles.length} km²) · LAZ + MDT em <b>${a.tiles_complete.length}</b> ·
             ${a.processed ? `processada em ${when(a.processed_at)}` : "<b>ainda não processada</b>"}
@@ -637,7 +637,7 @@ export class DataView {
       <p class="small muted">A área é o conjunto de quadrículas a azul: o LAZ/MDT descarregado e os edifícios OSM processados são sempre os dessas quadrículas.
         Clique numa quadrícula para a pôr ou tirar; <kbd>Shift</kbd>+arrastar acrescenta, <kbd>Alt</kbd>+arrastar retira.</p>
       <div class="area-row">
-        <input id="a-relation" type="number" min="1" placeholder="relação OSM do limite (p.ex. 3892769)" title="Acrescenta as quadrículas que cobrem um limite administrativo do OSM">
+        <input id="a-relation" type="number" min="1" placeholder="id da relação OSM do limite" title="Acrescenta as quadrículas que cobrem um limite administrativo do OSM">
         <button class="btn" id="a-add-relation">Juntar limite</button>
         <button class="btn" id="a-clear" ${this.draft.size ? "" : "disabled"}>Limpar</button>
       </div>
@@ -736,7 +736,7 @@ export class DataView {
   renderMunicipal() {
     // Cartografia municipal de edifícios (fase candidatos): usar ou não, estado, refazer.
     const m = this.areas?.municipal;
-    if (!m) return "";
+    if (!m || !m.configured) return "";  // sem geoportal municipal configurado
     const on = !!this.processOpts.municipal;
     const when = m.fetched_at ? new Date(m.fetched_at).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "short" }) : null;
     const full = m.full?.cached;

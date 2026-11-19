@@ -4,7 +4,7 @@ A grelha (``LiDAR2024_2025_Seccionamento.gpkg``, camada ``tiles``) tem uma linha
 quadrícula de 1 km com ``NAME`` (identificador DGT), ``LOTE`` e ``DISPONIVEL``. A
 geometria não é lida: as quadrículas estão todas alinhadas a 1000 m em EPSG:3763 e
 saem do identificador (``TileKey.from_dgt_name``). ``DISPONIVEL`` é só informativo:
-na versão de 04/07/2025 está desatualizado (ver ``docs/area-de-estudo.md``).
+na versão de 04/07/2025 está desatualizado (ver ``docs/validacao.md``).
 """
 
 from __future__ import annotations

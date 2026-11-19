@@ -2,7 +2,7 @@
 
 Rasteriza os footprints e os pontos de edifício (classe 6) e procura a translação
 (dx, dy) que maximiza o IoU das duas máscaras. A otimização edifício a edifício foi
-testada e descartada (ver docs/area-de-estudo.md): é instável e o ganho é marginal.
+testada e descartada (ver docs/validacao.md): é instável e o ganho é marginal.
 O deslocamento só é usado para selecionar pontos; a geometria OSM não é alterada.
 """
 

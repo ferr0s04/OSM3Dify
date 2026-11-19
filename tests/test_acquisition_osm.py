@@ -26,8 +26,8 @@ def test_bbox_query_uses_south_west_north_east_order() -> None:
 
 
 def test_relation_query_filters_by_area() -> None:
-    query = build_query(BBOX, osm_relation_id=5989576)
-    assert "area(3605989576)->.a;" in query
+    query = build_query(BBOX, osm_relation_id=1234567)
+    assert "area(3601234567)->.a;" in query
     assert 'way["building"](area.a)(41.27348,-8.69911,41.29553,-8.63541);' in query
 
 

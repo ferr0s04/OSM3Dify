@@ -25,7 +25,7 @@ se o telhado é *mesmo* de uma só cor (painéis, remendos, materiais mistos bai
 e não o ruído ponto a ponto nem a diferença de iluminação entre águas.
 
 Limiares calibrados em Vila do Conde (área-2, 249 telhados etiquetados à vista
-sobre o ORTOS-2025): ver docs/area-de-estudo.md.
+sobre o ORTOS-2025): ver docs/validacao.md.
 
 A cor das fachadas não é estimada: o LiDAR aéreo não tem pontos nas fachadas.
 """

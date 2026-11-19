@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from osm3d.app.server import create_app
-from osm3d.config import AreaConfig, Config, PathsConfig, SourcesConfig
+from osm3d.config import AreaConfig, Config, MunicipalSourceConfig, PathsConfig, SourcesConfig
 from osm3d.domain.models import RoofShape
 from osm3d.export.geopackage import write_buildings
 from osm3d.geospatial.footprints import load_footprints
@@ -434,6 +434,17 @@ def test_municipal_full_download(client: TestClient) -> None:
 
     ctx = client.app.state.ctx  # type: ignore[attr-defined]
     ctx.municipal = MunicipalDownload(fetcher=fake)
+    # Sem geoportal configurado (o config geral não tem nenhum): recusado.
+    assert client.post("/api/municipal/download").status_code == 422
+    source = MunicipalSourceConfig(
+        name="Câmara Municipal de Teste",
+        viewer_url="https://geo.example/geoportal",
+        mapagent_url="https://geo.example/mapagent.fcgi",
+        feature_source="Library://teste.FeatureSource",
+        feature_class="carto:edificios",
+    )
+    sources = ctx.base.sources.model_copy(update={"municipal": source})
+    ctx.base = ctx.base.model_copy(update={"sources": sources})
     r = client.post("/api/municipal/download")
     assert r.status_code == 200
     assert ctx.municipal.wait(5)

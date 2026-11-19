@@ -18,17 +18,25 @@ if TYPE_CHECKING:
     from osm3d.geospatial.tiling import TileKey
 
 
+# Extensão da grelha LiDAR da DGT (Portugal continental), WGS84.
+MAINLAND_PORTUGAL_WGS84 = (-9.6, 36.9, -6.1, 42.2)
+
+
 class AreaConfig(BaseModel):
     """Área de estudo = um conjunto de quadrículas LiDAR de 1 km (grelha DGT).
 
     As mesmas quadrículas definem o LAZ/MDT a descarregar e os edifícios OSM a
     processar (os que têm o centróide dentro delas). Não há outra definição de área.
+    Sem quadrículas (área inicial por omissão), escolhem-se na aplicação; o pipeline
+    recusa-se a correr até lá.
     """
 
     # Usado em caminhos (data/processed/<nome>): só minúsculas, dígitos, "-" e "_".
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
     label: str | None = Field(default=None, max_length=200, description="Nome a mostrar.")
-    tiles: list[str] = Field(min_length=1, description="Identificadores DGT (p.ex. 155480).")
+    tiles: list[str] = Field(
+        default_factory=list, description="Identificadores DGT (p.ex. 155480)."
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -65,9 +73,14 @@ class AreaConfig(BaseModel):
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:
-        """Caixa envolvente WGS84 das quadrículas (min_lon, min_lat, max_lon, max_lat)."""
+        """Caixa envolvente WGS84 das quadrículas (min_lon, min_lat, max_lon, max_lat).
+
+        Sem quadrículas: Portugal continental (onde há LiDAR da DGT), para enquadrar o mapa.
+        """
         from osm3d.geospatial.tiling import tile_rings_wgs84
 
+        if not self.tiles:
+            return MAINLAND_PORTUGAL_WGS84
         pts = [p for ring in tile_rings_wgs84(self.tile_keys) for p in ring]
         lons, lats = [p[0] for p in pts], [p[1] for p in pts]
         return (min(lons), min(lats), max(lons), max(lats))
@@ -89,16 +102,17 @@ class PathsConfig(BaseModel):
 class MunicipalSourceConfig(BaseModel):
     """Cartografia municipal de edifícios (geoportal MapGuide), para os candidatos.
 
-    Ver ``acquisition/municipal.py``. Só com autorização do município.
+    Ver ``acquisition/municipal.py``. Só com autorização do município. Cada município
+    tem o seu geoportal: os endereços e a camada vêm do ``config.yaml`` (sem omissão).
     """
 
     enabled: bool = False
-    name: str = "Câmara Municipal de Vila do Conde"
-    viewer_url: str = "https://sig.cm-viladoconde.pt/geoportal"
-    mapagent_url: str = "https://sig.cm-viladoconde.pt/mapguide/mapagent/mapagent.fcgi"
-    feature_source: str = "Library://geoportal/Data/pg_viladoconde.FeatureSource"
-    feature_class: str = "cartografia_simplificada:muni_5000_h_planimetria_pg"
-    filter: str = "objeto = 'const_poligonos'"
+    name: str = ""  # p.ex. "Câmara Municipal de …" (mostrado na aplicação)
+    viewer_url: str = ""  # página do visualizador (dá a sessão anónima)
+    mapagent_url: str = ""  # …/mapguide/mapagent/mapagent.fcgi
+    feature_source: str = ""  # Library://…/….FeatureSource
+    feature_class: str = ""  # esquema:classe da camada de edifícios
+    filter: str = ""  # filtro MapGuide dos polígonos de edifício (vazio: todos)
     chunk_m: float = Field(default=250.0, gt=10, le=1000)
     delay_s: float = Field(default=0.5, ge=0.2, description="Pausa entre pedidos.")
     min_area_m2: float = Field(default=8.0, ge=0)
@@ -106,6 +120,20 @@ class MunicipalSourceConfig(BaseModel):
     # localmente em vez de pedirem ao geoportal. Pedidos de 1 km (~700 polígonos cada).
     cache_dir: Path = Path("data/raw/municipal")
     full_chunk_m: float = Field(default=1000.0, gt=10, le=1000)
+
+    @property
+    def configured(self) -> bool:
+        """Há um geoportal configurado (endereços e camada)?"""
+        return all((self.viewer_url, self.mapagent_url, self.feature_source, self.feature_class))
+
+    @model_validator(mode="after")
+    def _needs_source(self) -> MunicipalSourceConfig:
+        if self.enabled and not self.configured:
+            raise ValueError(
+                "sources.municipal.enabled exige viewer_url, mapagent_url, feature_source e "
+                "feature_class (ver config.yaml)"
+            )
+        return self
 
     @property
     def full_path(self) -> Path:
@@ -199,7 +227,8 @@ class ExportConfig(BaseModel):
 
 
 class Config(BaseModel):
-    area: AreaConfig
+    # Área inicial. Sem ``area`` no YAML: sem quadrículas, escolhidas na aplicação.
+    area: AreaConfig = Field(default_factory=lambda: AreaConfig(name="area-1"))
     processing_crs: str = "EPSG:3763"
     # Processos para o ajuste dos telhados e a deteção de candidatos (resultados iguais
     # aos de um só processo). None: núcleos − 1, até 8; 1: em série.
@@ -213,7 +242,31 @@ class Config(BaseModel):
     export: ExportConfig = ExportConfig()
 
 
-def load_config(path: Path) -> Config:
+LOCAL_CONFIG_NAME = "local.yaml"
+
+
+def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """``override`` sobre ``base``, chave a chave (os dicionários juntam-se)."""
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_config(path: Path, *, local: bool = True) -> Config:
+    """Lê ``path``; com ``local``, junta por cima o ``local.yaml`` da mesma pasta.
+
+    O ``config.yaml`` (versionado) é geral. O que é de uma instalação (a área, o
+    geoportal municipal autorizado, ...) vai para ``config/local.yaml``, ignorado pelo
+    git, com só as chaves que mudam.
+    """
     with path.open(encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
+    extra = path.with_name(LOCAL_CONFIG_NAME)
+    if local and path.name != LOCAL_CONFIG_NAME and extra.exists():
+        with extra.open(encoding="utf-8") as fh:
+            raw = _merge(raw, yaml.safe_load(fh) or {})
     return Config.model_validate(raw)

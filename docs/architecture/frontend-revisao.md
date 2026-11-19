@@ -187,7 +187,7 @@ aplicadas (`export.include_pending: false`, por omissão desde 2026-11-11).
   inferidas**, numa camada three.js dentro do MapLibre (`/api/scene`):
   - malhas geradas no backend a partir dos mesmos modelos da vista de detalhe;
   - plantas em L com esqueleto, partes com as suas cores;
-  - Vilar e Mosteiró: ~300 mil triângulos, 7 MB, ~3 s na primeira vez, depois em cache;
+  - área de teste (18 quadrículas): ~300 mil triângulos, 7 MB, ~3 s na primeira vez, depois em cache;
   - cada edifício é atualizado quando a sua revisão muda.
 - **Partes (`building:part`).**
   - **Sugestão:** quando o pipeline encontra um volume secundário, guarda uma divisão
@@ -257,7 +257,7 @@ aplicadas (`export.include_pending: false`, por omissão desde 2026-11-11).
     pode ser ajustada mas não removida;
   - edição no mapa: clique, `Shift`+arrastar (acrescenta) ou `Alt`+arrastar (retira).
     "Juntar limite" acrescenta as quadrículas que cobrem uma relação OSM (polígono pelo
-    Nominatim). Exemplos: Vilar e Mosteiró ocupa 16 quadrículas, Vila do Conde 187. As
+    Nominatim). Exemplos: uma união de freguesias ocupa ~16 quadrículas, um concelho ~190. As
     alterações ficam por guardar até "Guardar área";
   - se as quadrículas mudarem depois do processamento, a área fica marcada como
     desatualizada até ser processada de novo;

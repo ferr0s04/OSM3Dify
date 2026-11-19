@@ -239,7 +239,7 @@ export class BuildingMap {
     this.mode = "real";
     this.visibleKeys = null;
     this.roofs = null;
-    this.map = new maplibregl.Map({ container, style: BASEMAP, center: [-8.66, 41.284], zoom: 15, maxPitch: 70 });
+    this.map = new maplibregl.Map({ container, style: BASEMAP, center: [-8.0, 39.6], zoom: 6, maxPitch: 70 }); // enquadrado nos edifícios ao carregar
     this.map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
     this.ready = new Promise((resolve) => this.map.on("load", resolve));
   }

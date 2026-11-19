@@ -10,12 +10,13 @@ O resultado não é um modelo fotorealista nem uma malha 3D: são **tags
 OSM2World, Streets GL…) interpretam.
 
 > **Estado:** em desenvolvimento. O pipeline corre de ponta a ponta sobre dados
-> reais de Vila do Conde, até à exportação `.osm` para o JOSM.
+> reais da DGT (numa área de teste no norte de Portugal), até à exportação `.osm`
+> para o JOSM.
 >
 > - Exatidão de `roof:shape` face às tags do OSM: **87 %**, com 67 % de cobertura.
 >   Os casos incertos ficam para revisão.
 >
-> Ver [resultados](docs/area-de-estudo.md#primeiros-resultados-quadrículas-155480--156480-2026-11-11).
+> Ver [resultados](docs/validacao.md#primeiros-resultados-quadrículas-155480--156480-2026-11-11).
 >
 > Por fazer:
 > - validação manual de `flat` e `skillion`;
@@ -30,8 +31,8 @@ OSM2World, Streets GL…) interpretam.
   ferramentas, licenciamento, plano revisto).
 - [Frontend: aplicação de revisão](docs/architecture/frontend-revisao.md) — âmbito,
   arquitetura e faseamento do futuro frontend (proposta adiada).
-- [Área de estudo](docs/area-de-estudo.md) — Vilar e Mosteiró (Vila do Conde),
-  quadrículas LiDAR, dados verificados e alinhamento com o OSM.
+- [Validação em dados reais](docs/validacao.md) — medições e calibrações numa área de
+  teste: dados LiDAR verificados, alinhamento com o OSM, exatidão dos telhados.
 
 ## Pipeline
 
@@ -66,7 +67,7 @@ uv sync --extra osm        # + leitura de extratos PBF (pyosmium)
 ```bash
 uv run osm3d info                      # área ativa e estado dos artefactos
 uv run osm3d area                      # listar áreas; `osm3d area area-2` ativa outra
-uv run osm3d area --new --relation 3892769 # nova área (id area-N): quadrículas de um limite OSM
+uv run osm3d area --new --relation <id>  # nova área (id area-N): quadrículas de um limite OSM
 uv run osm3d area --new --tiles 155480,156480 --label Teste  # nova área: quadrículas indicadas
 uv run osm3d stage fetch               # edifícios OSM da área (Overpass)
 uv run osm3d tiles                     # edifícios por quadrícula LiDAR (com id DGT)

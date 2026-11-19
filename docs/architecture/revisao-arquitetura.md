@@ -121,7 +121,7 @@ com o eixo do edifício (o S3DB renderiza mal telhados inclinados em partes irre
   vizinho ou no chão. É preciso estimar um deslocamento (por zona e/ou por edifício)
   maximizando a sobreposição entre o footprint e a máscara de pontos classe 6 do LiDAR.
   Novo módulo: `geospatial/registration.py`.
-  *Medido em Vila do Conde (ver [área de estudo](../area-de-estudo.md)):* o desvio é
+  *Medido em Vila do Conde (ver [validação](../validacao.md)):* o desvio é
   pequeno (≈ 0,5 m, IoU 0,78 → 0,80). Basta **um deslocamento global por
   quadrícula**. A otimização edifício a edifício não é fiável e foi descartada.
 - **Sistemas de referência.** OSM está em WGS84 (EPSG:4326); a DGT em PT-TM06/ETRS89
