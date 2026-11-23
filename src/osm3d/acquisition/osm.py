@@ -266,8 +266,13 @@ def relation_boundary(relation_id: int, *, timeout_s: float = 20.0) -> tuple[str
     return found[0].get("name") or None, found[0]["geojson"]
 
 
-# Versão do conteúdo do contexto (2: + landuse e estradas). Caches antigas refazem-se.
-CONTEXT_VERSION = 2
+# Versão do conteúdo do contexto (2: + landuse e estradas; 3: + muros e vedações).
+# Caches antigas refazem-se.
+CONTEXT_VERSION = 3
+
+
+# Barreiras lineares que delimitam propriedades (o limite do landuse costuma segui-las).
+BARRIER_VALUES = "^(wall|fence|retaining_wall|hedge|city_wall|guard_rail|handrail)$"
 
 
 def context_is_current(path: Path) -> bool:
@@ -297,11 +302,12 @@ def fetch_context(
     force: bool = False,
     progress: Progress | None = None,
 ) -> Path:
-    """Edifícios, ``landuse`` e estradas OSM de toda a ``bbox`` + limite da área, em JSON.
+    """Edifícios, ``landuse``, vias e muros/vedações OSM da ``bbox`` + limite da área (JSON).
 
     Serve a deteção de edifícios em falta: as quadrículas LiDAR passam os limites
     administrativos, e um edifício mapeado na freguesia vizinha não está "em falta".
-    ``landuse`` e estradas (desenhados sobre imagem) ajudam a encaixar os contornos.
+    ``landuse`` e estradas (desenhados sobre imagem) ajudam a encaixar os contornos;
+    ``landuse``, vias, muros e edifícios aparecem no mapa da revisão.
     """
     if out.exists() and not force:
         return out
@@ -313,7 +319,7 @@ def fetch_context(
         f"[out:json][timeout:{timeout}];"
         f'(way["building"]{b};relation["building"]{b};'
         f'way["landuse"]{b};relation["landuse"]["type"="multipolygon"]{b};'
-        f'way["highway"]{b};);'
+        f'way["highway"]{b};way["barrier"~"{BARRIER_VALUES}"]{b};);'
         f"out geom;{boundary}"
     )
     data = _overpass_json(query, overpass_url, timeout_s=timeout, progress=progress)

@@ -280,7 +280,6 @@ export class DataView {
     this.toast("A obter o limite no OSM…", 2000);
     try {
       const r = await api.osmRelation(id);
-      if (this.creating !== null && !this.creating) this.creating = r.label ?? "";
       await this.edit(r.tiles, "add");
       const fc = { features: r.tiles.map((t) => this.known.get(t)).filter(Boolean) };
       const pts = fc.features.flatMap((f) => f.geometry.coordinates[0]);
@@ -317,7 +316,7 @@ export class DataView {
         return this.reloadPage();
       }
       const a = this.active();
-      await api.updateArea(a.name, { label: a.label, tiles });
+      await api.updateArea(a.name, { label: a.label_manual, tiles });
       this.toast(a.processed ? "Área guardada. Processar de novo para atualizar os resultados." : "Área guardada.", 5000);
       await this.refresh();
     } catch (e) {
@@ -327,7 +326,7 @@ export class DataView {
 
   async rename() {
     const a = this.active();
-    const label = prompt(`Nome a mostrar da área ${a.name} (vazio = sem nome):`, a.label ?? "");
+    const label = prompt(`Nome a mostrar da área ${a.name} (vazio = nome automático: as freguesias cobertas):`, a.label_manual ?? "");
     if (label === null) return;
     try {
       await api.updateArea(a.name, { label: label.trim() || null, tiles: a.tiles });

@@ -30,6 +30,7 @@ from pyproj import Transformer
 from shapely.geometry import Polygon
 
 from osm3d.domain.models import Building, BuildingPart, PartsLayout
+from osm3d.export.osm_edits import OsmEdits
 from osm3d.export.s3db_tags import TagPolicy, format_metres, merge_tags, part_to_tags
 from osm3d.parts import SNAP_M, on_segment
 
@@ -44,6 +45,8 @@ class ExportRecord:
     added: dict[str, str] = field(default_factory=dict)
     changed: dict[str, tuple[str, str]] = field(default_factory=dict)
     conflicts: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # Edifícios novos: recortes feitos e sobreposições/cruzamentos por resolver.
+    topology: str = ""
 
 
 def plan_export(
@@ -269,6 +272,19 @@ def _write_rings(
         new_ways.append(el)
 
 
+def _replace_nodes(way: ET.Element, refs: list[str]) -> None:
+    for nd in way.findall("nd"):
+        way.remove(nd)
+    tags = way.findall("tag")
+    for t in tags:
+        way.remove(t)
+    for r in refs:
+        ET.SubElement(way, "nd", ref=r)
+    for t in tags:
+        way.append(t)
+    way.set("action", "modify")
+
+
 def _index(root: ET.Element) -> dict[tuple[str, int], ET.Element]:
     return {
         (el.tag, int(el.attrib["id"])): el for el in root if el.tag in ("node", "way", "relation")
@@ -290,8 +306,12 @@ def write_josm_file(
     upload: UploadPolicy = "true",
     policy: TagPolicy | None = None,
     crs: str = "EPSG:3763",
+    edits: OsmEdits | None = None,
 ) -> Path:
-    """Escreve os edifícios selecionados (com as tags finais) num ``.osm`` para o JOSM."""
+    """Escreve os edifícios selecionados (com as tags finais) num ``.osm`` para o JOSM.
+
+    ``edits``: ``landuse``/edifícios do OSM ajustados à volta dos edifícios novos.
+    """
     policy = policy or TagPolicy()
     index = _index(ET.parse(source_osm).getroot())
     nodes: dict[int, ET.Element] = {}
@@ -338,6 +358,16 @@ def write_josm_file(
                 if m.attrib["type"] == "way" and int(m.attrib["ref"]) not in ways:
                     add_way(int(m.attrib["ref"]))
 
+    if edits is not None:
+        # Versões atuais (pedidas na exportação): substituem as do ficheiro da fase fetch.
+        nodes.update(edits.nodes)
+        for wid, el in edits.ways.items():
+            if wid in ways:
+                # Edifício com tags 3D e também ajustado: as tags já calculadas e os nós
+                # novos (mesma versão, verificada no plano dos ajustes).
+                _replace_nodes(ways[wid], [nd.attrib["ref"] for nd in el.findall("nd")])
+            else:
+                ways[wid] = el
     root = ET.Element("osm", version="0.6", generator="osm3d")
     if upload != "true":  # "true" é o comportamento por omissão do JOSM: sem atributo
         root.set("upload", upload)
@@ -365,7 +395,9 @@ def write_report(records: list[ExportRecord], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["osm_key", "exportado", "motivo", "adicionadas", "alteradas", "conflitos"])
+        w.writerow(
+            ["osm_key", "exportado", "motivo", "adicionadas", "alteradas", "conflitos", "topologia"]
+        )
         for r in records:
             w.writerow(
                 [
@@ -375,6 +407,7 @@ def write_report(records: list[ExportRecord], path: Path) -> Path:
                     fmt(dict(r.added)),
                     fmt({k: f"{a}->{b}" for k, (a, b) in r.changed.items()}),
                     fmt({k: f"OSM {a} / proposto {b}" for k, (a, b) in r.conflicts.items()}),
+                    r.topology,
                 ]
             )
     return path

@@ -102,6 +102,17 @@ appearance:
   enabled: true
   min_colour_confidence: 0.6
 
+topology:
+  # Edifícios novos (candidatos) face ao que já está no OSM, na fase candidates e outra
+  # vez na exportação: vias que os atravessam, limites de landuse e edifícios OSM ou
+  # novos sobrepostos. Recortam-se só lascas (finas e pequenas), com uma folga ao
+  # elemento do OSM; o resto fica sinalizado (overlaps_osm_building, crosses_highway,
+  # overlaps_new_building, straddles_landuse). Ver src/osm3d/validation/topology.py.
+  clearance_m: 0.1
+  max_trim_m: 1.0           # espessura máxima de uma lasca
+  max_trim_fraction: 0.15   # da área do edifício
+  landuse: true
+
 export:
   height_rounding_m: 0.5
   roof_height_rounding_m: 0.5

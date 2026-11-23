@@ -33,6 +33,7 @@ from osm3d.domain.models import (
     RoofModel,
     RoofShape,
     Source,
+    TopologyMode,
 )
 from osm3d.geometry import axis_difference_deg, direction_difference_deg
 from osm3d.reconstruction.roof_models import LocalFrame
@@ -89,6 +90,8 @@ class Overrides(BaseModel):
     ground: GroundChoice | None = None
     # Só para partes: base da parte acima do terreno (volumes suspensos/sobrepostos).
     min_height: float | None = Field(default=None, ge=0, le=200)
+    # Só em edifícios novos: sobreposições com o OSM (ajustar o OSM, recortar, manter).
+    topology: TopologyMode | None = None
 
     @field_validator("building")
     @classmethod
@@ -431,7 +434,9 @@ def apply_corrections(b: Building, ov: Overrides) -> Building:
         b = apply_ground(b, ov.ground)
     if ov.building is not None and b.osm_type == "new":
         b = b.model_copy(update={"existing_tags": {**b.existing_tags, "building": ov.building}})
-    if b.parts and not ov.model_copy(update={"building": None}).is_empty():
+    if ov.topology is not None and b.osm_type == "new":
+        b = b.model_copy(update={"topology_mode": ov.topology})
+    if b.parts and not ov.model_copy(update={"building": None, "topology": None}).is_empty():
         b = b.model_copy(update={"parts": [apply_overrides(b, b.parts[0], ov), *b.parts[1:]]})
     return b
 

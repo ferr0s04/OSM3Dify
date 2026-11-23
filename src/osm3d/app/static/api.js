@@ -30,6 +30,8 @@ export const api = {
     request("PUT", `${path(key)}/review`, { status, note, overrides, parts }),
   resetReview: (key) => request("DELETE", `${path(key)}/review`),
   export: () => request("POST", "/api/export"),
+  osmContext: () => request("GET", "/api/osm-context"),
+  refreshOsmContext: () => request("POST", "/api/osm-context/refresh"),
   settings: () => request("GET", "/api/settings"),
   saveSettings: (settings) => request("PUT", "/api/settings", settings),
   archive: (status, archived = true) => request("POST", "/api/reviews/archive", { status, archived }),

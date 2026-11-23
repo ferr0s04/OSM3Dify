@@ -155,6 +155,9 @@ class QAFlag(BaseModel):
 
 
 ReviewStatus = Literal["pending", "accepted", "rejected"]
+# Edifício novo sobreposto a algo do OSM (landuse, edifício): ajustar o elemento do OSM,
+# recortar o edifício novo ou deixar como está (ver osm3d.validation.topology).
+TopologyMode = Literal["osm", "trim", "keep"]
 GroundChoice = Literal["low", "high"]
 # Origem da escolha: terreno plano; pisos; beiral (encaixado); sem evidência; manual.
 GroundBasis = Literal["flat", "levels", "eave", "none", "manual"]
@@ -209,6 +212,8 @@ class Building(BaseModel):
     review_status: ReviewStatus = "pending"
     review_note: str | None = None
     review_archived: bool = False  # aceite já submetido / rejeitado arquivado
+    # Só em edifícios novos; None = o padrão da origem do contorno (ver topology.py).
+    topology_mode: TopologyMode | None = None
 
     @property
     def key(self) -> str:

@@ -33,10 +33,30 @@ class AreaConfig(BaseModel):
 
     # Usado em caminhos (data/processed/<nome>): só minúsculas, dígitos, "-" e "_".
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
+    # Nome escrito pelo utilizador. Sem ele, mostra-se o das freguesias cobertas.
     label: str | None = Field(default=None, max_length=200, description="Nome a mostrar.")
     tiles: list[str] = Field(
         default_factory=list, description="Identificadores DGT (p.ex. 155480)."
     )
+    # Freguesias cobertas (da mais à menos representativa) e as quadrículas para que
+    # foram calculadas: mudando as quadrículas, voltam a calcular-se.
+    places: list[str] = Field(default_factory=list)
+    places_tiles: list[str] = Field(default_factory=list)
+
+    @property
+    def places_current(self) -> bool:
+        return bool(self.places) and self.places_tiles == self.tiles
+
+    @property
+    def display_label(self) -> str | None:
+        """O nome escrito; senão, as freguesias ("Azurara, Árvore e Vila do Conde")."""
+        if self.label:
+            return self.label
+        if self.places_current:
+            from osm3d.acquisition.places import places_label
+
+            return places_label(self.places)
+        return None
 
     @model_validator(mode="before")
     @classmethod
@@ -226,6 +246,18 @@ class ExportConfig(BaseModel):
     josm_upload: Literal["never", "false", "true"] = "true"
 
 
+class TopologyConfig(BaseModel):
+    """Edifícios novos vs. o que já está no OSM (ver osm3d.validation.topology)."""
+
+    # Folga às vias, limites de landuse e edifícios do OSM depois de um recorte.
+    clearance_m: float = Field(default=0.1, ge=0.0, le=1.0)
+    # Só se recortam lascas: nada mais largo do que isto, até esta fração da área.
+    max_trim_m: float = Field(default=1.0, ge=0.0, le=5.0)
+    max_trim_fraction: float = Field(default=0.15, ge=0.0, le=0.5)
+    # Encaixar nos limites de landuse (os edifícios e as vias são sempre verificados).
+    landuse: bool = True
+
+
 class Config(BaseModel):
     # Área inicial. Sem ``area`` no YAML: sem quadrículas, escolhidas na aplicação.
     area: AreaConfig = Field(default_factory=lambda: AreaConfig(name="area-1"))
@@ -240,6 +272,7 @@ class Config(BaseModel):
     roofs: RoofsConfig = RoofsConfig()
     appearance: AppearanceConfig = AppearanceConfig()
     export: ExportConfig = ExportConfig()
+    topology: TopologyConfig = TopologyConfig()
 
 
 LOCAL_CONFIG_NAME = "local.yaml"

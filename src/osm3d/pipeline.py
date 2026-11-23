@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -19,7 +20,9 @@ from osm3d.export.s3db_tags import TagPolicy
 
 if TYPE_CHECKING:
     from osm3d.domain.models import Building
+    from osm3d.export.osm_edits import OsmEdits
     from osm3d.export.osm_xml import ExportRecord
+    from osm3d.validation.topology import TopologyResult
 
 
 class Stage(StrEnum):
@@ -240,7 +243,7 @@ def run_stage(
 
             reviews = ReviewStore(review_store_path(config)).all()
             buildings = [apply_review(b, reviews.get(b.key)) for b in review_buildings(config)]
-            path, n_selected, records = export_area(config, buildings)
+            path, n_selected, records, topo = export_area(config, buildings, progress)
             if progress:
                 n_conf = sum(bool(r.conflicts) for r in records)
                 n_rev = sum(b.review_status != "pending" for b in buildings)
@@ -248,6 +251,8 @@ def run_stage(
                     f"  {n_selected} de {len(buildings)} edifícios exportados ({n_rev} revistos), "
                     f"{n_conf} com conflitos de tags (mantido o valor OSM)"
                 )
+                if topo is not None:
+                    progress(f"  topologia: {topo.summary()} (ver o relatório CSV)")
             return path
         case _:
             raise NotImplementedError(f"Fase '{stage.value}' ainda não implementada")
@@ -342,14 +347,51 @@ def municipal_path(config: Config) -> Path:
 TILE_CONTEXT_MARGIN_M = 30.0
 
 
+def refresh_context(
+    config: Config,
+    tiles: list[str] | None = None,
+    *,
+    force: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> Path:
+    """Contexto OSM das quadrículas (+30 m): edifícios, landuse, vias, muros (em cache).
+
+    ``tiles``: as quadrículas com LAZ e MDT (as da fase candidates); por omissão, as da
+    área. Volta a pedir ao Overpass se a cache é de outras quadrículas, de uma versão
+    antiga ou com ``force``.
+    """
+    import shapely
+    from pyproj import Transformer
+
+    from osm3d.acquisition.osm import context_is_current, fetch_context
+    from osm3d.geospatial.tiling import TileKey
+
+    if tiles is None:
+        lidar, dtm = _raw_tiles(config)
+        tiles = sorted(set(lidar) & set(dtm)) or sorted(config.area.tiles)
+    if not tiles:
+        raise FileNotFoundError("A área não tem quadrículas")
+    extent = shapely.union_all([shapely.box(*TileKey.from_dgt_name(t).bounds) for t in tiles])
+    to_wgs = Transformer.from_crs(config.processing_crs, "EPSG:4326", always_xy=True)
+    x0, y0, x1, y1 = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
+    lons, lats = to_wgs.transform([x0, x1, x0, x1], [y0, y0, y1, y1])
+    bbox = (min(lons), min(lats), max(lons), max(lats))
+    path = context_path(config)
+    stale = not cache_matches(path, tiles) or not context_is_current(path)
+    ctx = fetch_context(
+        bbox, config.sources.overpass_url, path, force=force or stale, progress=progress
+    )
+    mark_cache(ctx, tiles)
+    return ctx
+
+
 def _run_candidates(
     config: Config, out: Path, force: bool, progress: Callable[[str], None] | None
 ) -> Path:
     """Deteta edifícios em falta no OSM e ajusta-lhes o telhado e a cor como aos restantes."""
     import shapely
-    from pyproj import Transformer
 
-    from osm3d.acquisition.osm import context_is_current, context_timestamp, fetch_context
+    from osm3d.acquisition.osm import context_timestamp
     from osm3d.export.geopackage import write_buildings
     from osm3d.geospatial.tiling import TileKey
     from osm3d.reconstruction.building import reconstruct_area
@@ -364,21 +406,7 @@ def _run_candidates(
     # Edifícios OSM das quadrículas (+30 m): um edifício já mapeado logo do outro lado do
     # limite da área não é "em falta".
     extent = shapely.union_all([shapely.box(*TileKey.from_dgt_name(t).bounds) for t in tiles])
-    to_wgs = Transformer.from_crs(config.processing_crs, "EPSG:4326", always_xy=True)
-    x0, y0, x1, y1 = extent.buffer(30).bounds
-    lons, lats = to_wgs.transform([x0, x1, x0, x1], [y0, y0, y1, y1])
-    bbox = (min(lons), min(lats), max(lons), max(lats))
-    stale = not cache_matches(context_path(config), tiles) or not context_is_current(
-        context_path(config)
-    )
-    ctx = fetch_context(
-        bbox,
-        config.sources.overpass_url,
-        context_path(config),
-        force=force or stale,
-        progress=progress,
-    )
-    mark_cache(ctx, tiles)
+    ctx = refresh_context(config, tiles, force=force, progress=progress)
     osm, _ = load_context(ctx, config.processing_crs, None)
     # Os edifícios da fase fetch também contam: um servidor Overpass alternativo pode
     # estar desatualizado, e um edifício já mapeado não pode voltar como "em falta".
@@ -531,8 +559,152 @@ def review_store_path(config: Config) -> Path:
     return area_dir(config) / "reviews.sqlite"
 
 
-def export_area(config: Config, buildings: list[Building]) -> tuple[Path, int, list[ExportRecord]]:
-    """Escreve o ``.osm`` para o JOSM e o relatório CSV. Devolve (caminho, n.º, registos)."""
+@dataclass
+class ExportTopology:
+    """Verificação da topologia dos edifícios novos na exportação."""
+
+    result: TopologyResult
+    ways_adjusted: int = 0  # landuse/edifícios do OSM ajustados no ficheiro
+    not_adjusted: int = 0  # edifícios cujos ajustes ao OSM não se fizeram
+    error: str | None = None  # p.ex. Overpass sem resposta: nada ajustado
+    context_date: str = "?"
+
+    def summary(self) -> str:
+        r = self.result
+        text = (
+            f"{r.checked} edifícios novos verificados: {r.trimmed} recortados, "
+            f"{self.ways_adjusted} elementos do OSM ajustados (à volta de "
+            f"{r.adjusting - self.not_adjusted} edifícios), {r.conflicts} com conflitos"
+        )
+        if self.not_adjusted:
+            text += f"; {self.not_adjusted} edifícios ficaram sem o ajuste ao OSM"
+        return text + (f" — {self.error}" if self.error else "")
+
+
+def export_topology(
+    config: Config,
+    selected: list[tuple[Building, dict[str, str]]],
+    records: list[ExportRecord],
+    progress: Callable[[str], None] | None = None,
+) -> tuple[list[tuple[Building, dict[str, str]]], ExportTopology | None, OsmEdits | None]:
+    """Verifica os edifícios novos a exportar contra o OSM e entre si.
+
+    Só agora se sabe quais vão juntos (os aceites) e o modo escolhido para cada um. Os
+    recortes saem nos contornos; os ajustes a ``landuse``/edifícios do OSM (modo
+    ``osm``) são feitos sobre os dados atuais, pedidos ao Overpass. O que se fez e os
+    conflitos que ficam vão para o relatório.
+    """
+    from osm3d.export.osm_edits import fetch_for_edit, plan_edits
+    from osm3d.export.osm_xml import ExportRecord, has_parts
+    from osm3d.validation.topology import (
+        CONFLICT_CODES,
+        TRIMMED,
+        TopologyRules,
+        load_surroundings,
+        resolve_topology,
+    )
+
+    ctx = context_path(config)
+    if not any(b.osm_type == "new" for b, _ in selected) or not ctx.exists():
+        return selected, None, None
+    rules = TopologyRules.from_config(config.topology)
+    env = load_surroundings(ctx, config.processing_crs, artefact_path(config, Stage.FETCH))
+    fixed, result = resolve_topology([b for b, _ in selected], env, rules)
+    info = ExportTopology(result, context_date=env.timestamp)
+    edits: OsmEdits | None = None
+    if result.adjustments:
+        way_ids = [a.feature.osm_id for a in result.adjustments]
+        if progress:
+            progress(f"  a obter do Overpass as {len(set(way_ids))} ways do OSM a ajustar")
+        try:
+            xml = fetch_for_edit(way_ids, config.sources.overpass_url, progress)
+        except Exception as exc:  # rede/Overpass: exporta-se na mesma, sem ajustes
+            first = (str(exc).splitlines() or [type(exc).__name__])[0]
+            info.error = f"sem ajustes ao OSM (Overpass: {first})"
+        else:
+            # Fica junto ao .osm, para se saber sobre que dados se ajustou.
+            source = artefact_path(config, Stage.EXPORT).with_name(
+                f"{config.area.name}_osm_ajustado_origem.osm"
+            )
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(xml)
+            ways = [b for b, _ in selected if b.osm_type == "way"]
+            edits = plan_edits(
+                result.adjustments,
+                xml,
+                config.processing_crs,
+                rules,
+                skip_ways={b.osm_id for b in ways if has_parts(b)},
+                versions={b.osm_id: b.osm_version for b in ways},
+            )
+            info.ways_adjusted = len(edits.ways)
+    by_key = {r.key: r for r in records}
+    out: list[tuple[Building, dict[str, str]]] = []
+    for b, (before, tags) in zip(fixed, selected, strict=True):
+        if b.osm_type == "new":
+            b = _mark_adjust_failures(b, result, edits, info)
+            r = by_key.get(b.key)
+            if r is not None:
+                notes = []
+                if b.footprint is not before.footprint:
+                    notes += [f.message for f in b.qa_flags if f.code == TRIMMED]
+                if edits is not None and b.key in edits.applied:
+                    notes.append("OSM ajustado: " + "; ".join(edits.applied[b.key]))
+                notes += [
+                    f.message
+                    for f in b.qa_flags
+                    if f.code in CONFLICT_CODES or f.code == ADJUST_FAILED
+                ]
+                r.topology = " | ".join(notes)
+        out.append((b, tags))
+    if edits is not None:
+        for wid, notes in sorted(edits.way_notes.items()):
+            records.append(
+                ExportRecord(
+                    f"way/{wid}",
+                    True,
+                    "geometria ajustada a edifícios novos",
+                    topology="; ".join(notes),
+                )
+            )
+    return out, info, edits
+
+
+ADJUST_FAILED = "osm_adjust_failed"
+
+
+def _mark_adjust_failures(
+    b: Building, result: TopologyResult, edits: OsmEdits | None, info: ExportTopology
+) -> Building:
+    """Ajuste ao OSM que não se fez: o edifício sai sobreposto, sinalizado como conflito."""
+    from osm3d.domain.models import QAFlag
+    from osm3d.validation.topology import ADJUSTS_OSM
+
+    planned = any(a.building_key == b.key for a in result.adjustments)
+    if not planned:
+        return b
+    failed = edits.failed.get(b.key) if edits is not None else [info.error or "?"]
+    if not failed:
+        return b
+    info.not_adjusted += 1
+    flags = [f for f in b.qa_flags if f.code != ADJUSTS_OSM]
+    flags.append(
+        QAFlag(
+            code=ADJUST_FAILED,
+            message="Ajuste ao OSM por fazer: " + "; ".join(failed),
+            severity="warning",
+        )
+    )
+    return b.model_copy(update={"qa_flags": flags})
+
+
+def export_area(
+    config: Config, buildings: list[Building], progress: Callable[[str], None] | None = None
+) -> tuple[Path, int, list[ExportRecord], ExportTopology | None]:
+    """Escreve o ``.osm`` para o JOSM e o relatório CSV.
+
+    Devolve (caminho, n.º exportado, registos, verificação da topologia dos novos).
+    """
     from osm3d.export.osm_xml import plan_export, write_josm_file, write_report
 
     out = artefact_path(config, Stage.EXPORT)
@@ -542,6 +714,7 @@ def export_area(config: Config, buildings: list[Building]) -> tuple[Path, int, l
         include_pending=config.export.include_pending,
         overwrite=config.export.overwrite_existing_tags,
     )
+    selected, topo, edits = export_topology(config, selected, records, progress)
     write_report(records, out.with_name(f"{config.area.name}_export.csv"))
     source = _require(artefact_path(config, Stage.FETCH), Stage.FETCH)
     write_josm_file(
@@ -551,5 +724,6 @@ def export_area(config: Config, buildings: list[Building]) -> tuple[Path, int, l
         upload=config.export.josm_upload,
         policy=tag_policy(config),
         crs=config.processing_crs,
+        edits=edits,
     )
-    return out, len(selected), records
+    return out, len(selected), records, topo

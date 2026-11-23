@@ -249,6 +249,19 @@ def create_app(
     def export() -> dict[str, Any]:
         return rs().export()
 
+    @app.get("/api/osm-context")
+    def osm_context() -> dict[str, Any]:
+        """Landuse, vias, muros/vedações e edifícios do OSM (camada do mapa)."""
+        return rs().osm_context()
+
+    @app.post("/api/osm-context/refresh")
+    def osm_context_refresh() -> dict[str, Any]:
+        """Volta a obter o contexto OSM do Overpass."""
+        try:
+            return rs().refresh_osm_context()
+        except (RuntimeError, FileNotFoundError) as exc:  # Overpass sem resposta, sem quadrículas
+            raise HTTPException(502, str(exc)) from exc
+
     @app.get("/api/settings")
     def settings() -> dict[str, Any]:
         """Opções da aplicação (p.ex. propor ou não roof:colour)."""

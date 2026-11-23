@@ -30,8 +30,10 @@ from osm3d.pipeline import (
     Stage,
     area_dir,
     artefact_path,
+    context_path,
     export_area,
     ortho_files,
+    refresh_context,
     review_store_path,
     tag_policy,
 )
@@ -49,6 +51,18 @@ from osm3d.review import (
     apply_parts,
     apply_review,
     orientation_of,
+)
+from osm3d.validation.topology import (
+    CODES as TOPOLOGY_CODES,
+)
+from osm3d.validation.topology import (
+    Surroundings,
+    TopologyRules,
+    blocks_buildings,
+    default_mode,
+    load_surroundings,
+    mode_of,
+    resolve_topology,
 )
 
 MAX_BUILDING_POINTS = 40_000
@@ -130,6 +144,12 @@ class ReviewService:
         self._scene_origin: tuple[float, float] | None = None
         self._scene_cache: dict[str, dict[str, Any] | None] = {}
         self._wgs84: dict[str, Any] = {}
+        # Contexto OSM (landuse, vias, muros, edifícios) e a topologia dos edifícios novos
+        # face a ele, com o modo escolhido na revisão; refeita quando a revisão muda.
+        self._env: Surroundings | None = None
+        self._env_mtime: float | None = None
+        self._topo: dict[str, Building] | None = None
+        self._ctx_geojson: tuple[float, dict[str, Any]] | None = None
 
     def refresh_points(self) -> None:
         """Volta a indexar os LAZ (ficheiros raw descarregados ou apagados)."""
@@ -147,14 +167,78 @@ class ReviewService:
     def building(self, key: str) -> Building:
         if key not in self.base:
             raise NotFound(key)
+        if self.base[key].osm_type == "new" and (hit := self._topology().get(key)) is not None:
+            return hit
         return apply_review(self.base[key], self.reviews.get(key))
+
+    # ---------------------------------------------------------- topologia/OSM
+
+    def _surroundings(self) -> Surroundings | None:
+        path = context_path(self.cfg)
+        if not path.exists():
+            return None
+        mtime = path.stat().st_mtime
+        if self._env is None or self._env_mtime != mtime:
+            fetched = artefact_path(self.cfg, Stage.FETCH)
+            self._env = load_surroundings(path, self.cfg.processing_crs, fetched)
+            self._env_mtime = mtime
+            self._topo = None
+        return self._env
+
+    def _topology(self) -> dict[str, Building]:
+        """Edifícios novos (com a revisão) depois dos recortes e com as sinalizações.
+
+        Os rejeitados e os arquivados não entram (não vão ser exportados).
+        """
+        env = self._surroundings()
+        if self._topo is None:
+            active = [
+                b
+                for k, base in self.base.items()
+                if base.osm_type == "new"
+                and not (b := apply_review(base, self.reviews.get(k))).review_archived
+                and b.review_status != "rejected"
+            ]
+            if env is not None:
+                rules = TopologyRules.from_config(self.cfg.topology)
+                active = resolve_topology(active, env, rules)[0]
+            self._topo = {b.key: b for b in active}
+            self._wgs84 = {k: v for k, v in self._wgs84.items() if not k.startswith("new/")}
+        return self._topo
+
+    def _topology_changed(self) -> None:
+        self._topo = None
+
+    def osm_context(self) -> dict[str, Any]:
+        """Landuse, vias, muros/vedações e edifícios do OSM à volta da área (GeoJSON)."""
+        path = context_path(self.cfg)
+        if not path.exists():
+            return {
+                "type": "FeatureCollection",
+                "features": [],
+                "date": None,
+                "outdated": True,
+                "missing": ["contexto OSM (correr a fase candidates ou atualizar)"],
+            }
+        mtime = path.stat().st_mtime
+        if self._ctx_geojson is None or self._ctx_geojson[0] != mtime:
+            self._ctx_geojson = (mtime, osm_context_geojson(path))
+        return self._ctx_geojson[1]
+
+    def refresh_osm_context(self) -> dict[str, Any]:
+        """Volta a pedir o contexto OSM ao Overpass (p.ex. depois de editar no OSM)."""
+        refresh_context(self.cfg, force=True)
+        self._topology_changed()
+        ctx = self.osm_context()
+        return {"date": ctx.get("date"), "n": len(ctx["features"])}
 
     def all_buildings(self) -> list[Building]:
         return [self.building(k) for k in self.base]
 
     def _geom_wgs84(self, key: str) -> Any:
         if key not in self._wgs84:
-            g = self.base[key].footprint
+            # Edifícios novos: o contorno que vai ser exportado (recortes incluídos).
+            g = (self.building(key) if key.startswith("new/") else self.base[key]).footprint
             self._wgs84[key] = shapely.transform(
                 g, lambda c: np.column_stack(self._to_wgs84.transform(c[:, 0], c[:, 1]))
             )
@@ -381,6 +465,18 @@ class ReviewService:
             "n_parts": len(b.parts),
             "offset": list(b.registration_offset_m),
             "bbox": list(self._geom_wgs84(key).bounds),
+            # Sobreposições com o OSM: o modo em uso e o padrão da origem do contorno.
+            "topology": (
+                None
+                if b.osm_type != "new"
+                else {
+                    "mode": mode_of(b),
+                    "default": default_mode(base),
+                    "chosen": b.topology_mode,
+                    "relevant": any(f.code in TOPOLOGY_CODES for f in b.qa_flags),
+                    "trimmed_m2": _num(base.footprint.area - b.footprint.area, 1),
+                }
+            ),
         }
 
     # ---------------------------------------------------------------------- 3D
@@ -767,6 +863,7 @@ class ReviewService:
         self.store.save(review)
         self.reviews[key] = review
         self._scene_cache.pop(key, None)
+        self._topology_changed()
         return self.detail(key)
 
     def archive(self, status: ReviewStatus, archived: bool = True) -> dict[str, Any]:
@@ -775,6 +872,7 @@ class ReviewService:
             raise ValueError("Só se arquivam aceites ou rejeitados")
         changed = self.store.set_archived(status, archived)
         self.reviews = self.store.all()
+        self._topology_changed()
         return {"status": status, "archived": archived, "changed": changed}
 
     def reset_review(self, key: str) -> dict[str, Any]:
@@ -783,6 +881,7 @@ class ReviewService:
         self.store.delete(key)
         self.reviews.pop(key, None)
         self._scene_cache.pop(key, None)
+        self._topology_changed()
         return self.detail(key)
 
     # ----------------------------------------------------------------- resumo
@@ -842,9 +941,85 @@ class ReviewService:
         }
 
     def export(self) -> dict[str, Any]:
-        path, selected, records = export_area(self.cfg, self.all_buildings())
+        path, selected, records, topo = export_area(self.cfg, self.all_buildings())
         return {
             "path": str(Path(path).resolve()),
             "exported": selected,
             "conflicts": sum(bool(r.conflicts) for r in records),
+            # Edifícios novos: recortes, landuse/edifícios do OSM ajustados e conflitos que
+            # ficam (pormenor no relatório CSV).
+            "trimmed": topo.result.trimmed if topo else 0,
+            "osm_adjusted": topo.ways_adjusted if topo else 0,
+            "topology_conflicts": (topo.result.conflicts + topo.not_adjusted) if topo else 0,
+            "topology": topo.summary() if topo else None,
         }
+
+
+def _context_kind(tags: dict[str, str]) -> tuple[str, str] | None:
+    """(camada, valor) de um elemento do contexto OSM no mapa."""
+    for key in ("building", "landuse", "highway", "barrier"):
+        if key in tags:
+            return key, tags[key]
+    return None
+
+
+def osm_context_geojson(path: Path) -> dict[str, Any]:
+    """GeoJSON (WGS84) do contexto OSM da fase candidates, para o mapa da revisão.
+
+    ``kind``: building, landuse, highway ou barrier; ``value``: o valor da tag;
+    ``crossing``: a via não pode atravessar edifícios (como nos validadores).
+    """
+    import json
+
+    from shapely.geometry import LineString, Polygon
+
+    from osm3d.validation.topology import _members_polygon
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    feats: list[dict[str, Any]] = []
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        kv = _context_kind(tags)
+        if kv is None:
+            continue
+        kind, value = kv
+        geom: Any = None
+        coords = [(p["lon"], p["lat"]) for p in el.get("geometry", []) if p]
+        if el["type"] == "way" and len(coords) >= 2:
+            closed = len(coords) >= 4 and coords[0] == coords[-1]
+            area = kind in ("building", "landuse") or tags.get("area") == "yes"
+            geom = Polygon(coords) if closed and area else LineString(coords)
+        elif el["type"] == "relation" and tags.get("type") == "multipolygon":
+            geom = _members_polygon(el.get("members", []))
+        if geom is None or geom.is_empty:
+            continue
+        feats.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(geom),
+                "properties": {
+                    "kind": kind,
+                    "value": value,
+                    "id": f"{el['type']}/{el['id']}",
+                    "name": tags.get("name"),
+                    "crossing": kind == "highway" and blocks_buildings(tags),
+                },
+            }
+        )
+    from osm3d.acquisition.osm import CONTEXT_VERSION
+
+    date = data.get("osm3s", {}).get("timestamp_osm_base")
+    version = data.get("osm3d_context", 1)
+    missing = []
+    if version < 3:
+        missing.append("muros e vedações (barrier)")
+    if version < 2:
+        missing.append("landuse e vias")
+    return {
+        "type": "FeatureCollection",
+        "features": feats,
+        "date": date,
+        # Contexto obtido por uma versão anterior: faltam dados que agora se usam.
+        "outdated": version != CONTEXT_VERSION,
+        "missing": missing,
+    }

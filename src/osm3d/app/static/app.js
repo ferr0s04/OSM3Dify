@@ -11,7 +11,7 @@ const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 const fmt = (v, unit = "") => (v === null || v === undefined ? "—" : `${v}${unit}`);
 const SHAPES = ["flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "round", "unknown"];
-const OVERRIDE_FIELDS = ["ground", "building", "roof_shape", "height", "roof_height", "roof_orientation", "roof_direction", "roof_colour", "building_colour"];
+const OVERRIDE_FIELDS = ["topology", "ground", "building", "roof_shape", "height", "roof_height", "roof_orientation", "roof_direction", "roof_colour", "building_colour"];
 const COLOUR_SOURCE = { "omissão": "sem tag: cor por omissão", OSM: "já no OSM", estimada: "estimada", manual: "corrigida" };
 const COLOUR_VIA = { orthophoto: "ortofoto + LiDAR", lidar: "só LiDAR" };
 
@@ -107,7 +107,7 @@ function chosen(group) {
 
 function renderFilterLabels() {
   // Texto de cada dropdown: "estado: todos", "estado: aceites", "estado: 2 de 3".
-  document.querySelectorAll(".msel").forEach((d) => {
+  document.querySelectorAll(".msel:not(.mlayers)").forEach((d) => {
     const boxes = [...d.querySelectorAll("input")];
     const on = boxes.filter((b) => b.checked);
     const names = on.map((b) => b.parentElement.textContent.trim());
@@ -215,6 +215,29 @@ function renderGround(d, val, t) {
       </select></label>`;
 }
 
+const TOPOLOGY_MODES = {
+  osm: "ajustar o OSM (landuse / edifício existente contornam este edifício)",
+  trim: "recortar este edifício (sai a lasca que sobrepõe o OSM)",
+  keep: "manter como está (o afastamento/sobreposição é verdadeiro)",
+};
+
+function renderTopology(d, val, t) {
+  // Edifício novo sobreposto a landuse/edifícios do OSM: o que fazer na exportação.
+  const topo = d.topology;
+  if (!topo || !topo.relevant) return "";
+  const sel = val("topology", topo.mode);
+  const opts = Object.entries(TOPOLOGY_MODES)
+    .map(([k, label]) => `<option value="${k}" ${sel === k ? "selected" : ""}>${label}${k === topo.default ? " — padrão" : ""}</option>`)
+    .join("");
+  const msgs = d.qa_flags.filter((f) => ["adjusts_osm", "topology_trimmed", "straddles_landuse", "overlaps_osm_building", "crosses_highway", "overlaps_new_building"].includes(f.code));
+  return `<div class="full topology-box ${t("topology")}">
+      <b>Sobreposição com o OSM</b> <span class="est">padrão: ${topo.default === "osm" ? "contorno municipal manda" : "contorno do LiDAR é recortado"}</span>
+      ${msgs.map((f) => `<div class="small">${esc(f.message)}</div>`).join("")}
+      <select name="topology">${opts}</select>
+      <div class="small muted">Ver as camadas OSM no mapa (landuse, muros, vias). Muda ao aceitar.</div>
+    </div>`;
+}
+
 function renderOsmChange(d) {
   // Destaque da relação com o OSM: já há 3D mapeado? a análise acrescenta ou diverge?
   const c = d.osm_change;
@@ -293,6 +316,7 @@ function renderDetail() {
 
     <h3>Correções</h3>
     <form class="form" id="edit-form" autocomplete="off">
+      ${renderTopology(d, val, t)}
       ${renderGround(d, val, t)}
       ${d.candidate ? `<label class="full ${t("building")}">building (tipo do edifício novo) <span class="est">${d.candidate_source === "municipal" ? "da cartografia municipal" : "estimado"}: ${esc(d.estimated_building ?? "yes")}</span>
         <select name="building">${buildingTypeOptions(val("building", d.building_type ?? "yes"))}</select></label>` : ""}
@@ -425,7 +449,11 @@ async function resetReview() {
 // ------------------------------------------------------------- arranque
 
 function wire() {
-  document.querySelectorAll(".msel input").forEach((i) => i.addEventListener("input", applyFilters));
+  document.querySelectorAll(".msel:not(.mlayers) input").forEach((i) => i.addEventListener("input", applyFilters));
+  document.querySelectorAll("#m-osm input").forEach((i) =>
+    i.addEventListener("input", () => map.setOsmLayers(new Set([...document.querySelectorAll("#m-osm input:checked")].map((x) => x.value)))),
+  );
+  $("#m-osm-refresh").addEventListener("click", refreshOsmContext);
   document.querySelectorAll(".msel").forEach((d) =>
     d.addEventListener("toggle", () => {
       // Só um menu aberto de cada vez.
@@ -436,7 +464,7 @@ function wire() {
     if (!e.target.closest(".msel")) document.querySelectorAll(".msel[open]").forEach((o) => (o.open = false));
   });
   $("#f-clear").addEventListener("click", () => {
-    document.querySelectorAll(".msel input").forEach((i) => (i.checked = false));
+    document.querySelectorAll(".msel:not(.mlayers) input").forEach((i) => (i.checked = false));
     $("#f-search").value = "";
     applyFilters();
   });
@@ -475,7 +503,8 @@ function wire() {
     e.target.disabled = true;
     try {
       const r = await api.export();
-      toast(`${r.exported} edifícios exportados (${r.conflicts} com conflitos) → ${r.path}`, 8000);
+      const topo = r.topology ? ` · Topologia: ${r.topology} (pormenor no CSV)` : "";
+      toast(`${r.exported} edifícios exportados (${r.conflicts} com conflitos de tags) → ${r.path}${topo}`, 14000);
     } catch (err) {
       toast(`Exportação falhou: ${err.message}`);
     } finally {
@@ -783,6 +812,39 @@ async function setRoofColourOption(input) {
   }
 }
 
+async function loadOsmContext() {
+  // Landuse, vias, muros e edifícios do OSM (camada do mapa). Avisa se faltam dados.
+  try {
+    const ctx = await api.osmContext();
+    await map.setOsmContext(ctx);
+    const date = ctx.date ? `dados OSM de ${ctx.date.slice(0, 10)}` : "sem contexto OSM";
+    $("#m-osm-date").textContent = ctx.missing.length ? `${date} · em falta: ${ctx.missing.join(", ")}` : date;
+    $("#m-osm").classList.toggle("warn", ctx.missing.length > 0);
+    if (ctx.missing.length) {
+      toast(`Contexto OSM incompleto (obtido por uma versão anterior): faltam ${ctx.missing.join(", ")}. Usar "camadas OSM → atualizar do OSM".`, 9000);
+    }
+  } catch (e) {
+    toast(`Camadas OSM: ${e.message}`);
+  }
+}
+
+async function refreshOsmContext(e) {
+  const btn = e.target;
+  btn.disabled = true;
+  btn.textContent = "a obter do Overpass…";
+  try {
+    const r = await api.refreshOsmContext();
+    toast(`Contexto OSM atualizado (${r.n} elementos, dados de ${(r.date ?? "?").slice(0, 10)})`, 4000);
+    await loadOsmContext();
+    await reload();
+  } catch (err) {
+    toast(`Não foi possível atualizar do OSM: ${err.message}`, 8000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "atualizar do OSM";
+  }
+}
+
 async function reload() {
   const [rows, geojson] = await Promise.all([api.buildings(), api.geojson()]);
   state.rows = rows;
@@ -815,6 +877,7 @@ async function init() {
     renderProgress();
     applyFilters();
     await map.setData(geojson);
+    loadOsmContext();
     if (state.filtered.length) select(state.filtered[0].key);
   } catch (e) {
     if (e.status === 503) {

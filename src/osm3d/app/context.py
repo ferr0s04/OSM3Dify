@@ -6,6 +6,7 @@ fim de um processamento dessa área, a revisão é recarregada a partir dos resu
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -24,6 +25,8 @@ from osm3d.areas import area_store, with_area
 from osm3d.config import AreaConfig, Config
 from osm3d.geospatial.tiling import tiles_in_geometry
 from osm3d.pipeline import Stage, artefact_path, municipal_status, stage_state
+
+log = logging.getLogger(__name__)
 
 # relation_id → (nome, polígono GeoJSON WGS84)
 RelationLookup = Callable[[int], tuple[str | None, Any]]
@@ -66,6 +69,7 @@ class AppContext:
         # Muda sempre que a revisão é recarregada (outra área ou novos resultados): o
         # frontend compara-o para saber que tem de recarregar os edifícios.
         self.review_generation = 0
+        self._places_busy = False
         if service is None:
             self._load_review()
 
@@ -111,6 +115,9 @@ class AppContext:
         ]
         return {
             **area.model_dump(mode="json"),
+            # Nome a mostrar: o escrito, ou as freguesias cobertas (calculadas à parte).
+            "label": area.display_label,
+            "label_manual": area.label,
             "bbox": list(area.bbox),
             "active": area.name == self.cfg.area.name,
             "from_config": self.store.is_default(area.name),
@@ -121,7 +128,37 @@ class AppContext:
             "tiles_complete": complete,
         }
 
+    def _update_places(self) -> None:
+        """Calcula, em segundo plano, as freguesias das áreas que ainda não as têm."""
+        todo = [a for a in self.store.areas().values() if a.tiles and not a.places_current]
+        if not todo or self._places_busy:
+            return
+        self._places_busy = True
+
+        def work() -> None:
+            from osm3d.acquisition.places import area_places
+
+            try:
+                for a in todo:
+                    try:
+                        names = area_places(
+                            a.tiles, self.base.processing_crs, self.base.sources.overpass_url
+                        )
+                    except Exception as exc:  # Overpass ocupado: tenta-se no próximo pedido
+                        log.info("Freguesias de %s por calcular: %s", a.name, exc)
+                        continue
+                    self.store.set_places(a.name, a.tiles, names)
+                    if a.name == self.cfg.area.name:
+                        with self._lock:
+                            self.cfg = with_area(self.base, self.store.get(a.name))
+                            self.data.cfg = self.cfg
+            finally:
+                self._places_busy = False
+
+        threading.Thread(target=work, name="area-places", daemon=True).start()
+
     def areas(self) -> dict[str, Any]:
+        self._update_places()
         local = by_tile(scan_local(self.cfg.sources))
         return {
             "active": self.cfg.area.name,

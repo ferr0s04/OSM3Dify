@@ -71,22 +71,37 @@ def on_segment(p: np.ndarray, a: np.ndarray, b: np.ndarray, tol: float) -> float
 def layout_from_polygons(
     polygons: list[Polygon], source: Literal["suggested", "manual"] = "manual"
 ) -> PartsLayout:
-    """Partes com vértices partilhados (fusão a 1 cm) e sem junções em T."""
-    vertices: list[np.ndarray] = []
-    rings: list[list[int]] = []
+    """Partes com vértices partilhados (fusão a 1 cm) e sem junções em T.
 
-    def vertex_id(p: np.ndarray) -> int:
-        for i, v in enumerate(vertices):
-            if float(np.linalg.norm(v - p)) <= SNAP_M:
-                return i
-        vertices.append(p)
+    Na exportação recebe todos os candidatos aceites da área de uma vez (milhares de
+    vértices), por isso a procura de vizinhos usa uma grelha (fusão) e uma STRtree
+    (junções em T) em vez de comparar todos com todos.
+    """
+    vertices: list[tuple[float, float]] = []
+    rings: list[list[int]] = []
+    # Grelha com células de SNAP_M: um vértice a ≤ SNAP_M está nas 3×3 células vizinhas.
+    grid: dict[tuple[int, int], list[int]] = {}
+
+    def vertex_id(x: float, y: float) -> int:
+        cx, cy = math.floor(x / SNAP_M), math.floor(y / SNAP_M)
+        near = [
+            i
+            for gx in (cx - 1, cx, cx + 1)
+            for gy in (cy - 1, cy, cy + 1)
+            for i in grid.get((gx, gy), ())
+            if math.hypot(vertices[i][0] - x, vertices[i][1] - y) <= SNAP_M
+        ]
+        if near:
+            return min(near)  # o primeiro criado, como na procura sequencial
+        vertices.append((x, y))
+        grid.setdefault((cx, cy), []).append(len(vertices) - 1)
         return len(vertices) - 1
 
     for poly in polygons:
         poly = orient(poly, sign=1.0)
         ring: list[int] = []
-        for xy in np.asarray(poly.exterior.coords)[:-1]:
-            k = vertex_id(np.asarray(xy, dtype=float))
+        for x, y in np.asarray(poly.exterior.coords, dtype=float)[:-1]:
+            k = vertex_id(float(x), float(y))
             if not ring or ring[-1] != k:
                 ring.append(k)
         if len(ring) > 1 and ring[0] == ring[-1]:
@@ -94,15 +109,23 @@ def layout_from_polygons(
         rings.append(ring)
 
     # Junções em T: inserir em cada lado os vértices que estão sobre ele.
+    pts = np.asarray(vertices, dtype=float).reshape(-1, 2)
+    tree = shapely.STRtree(shapely.points(pts))
     for ring in rings:
         i = 0
         while i < len(ring):
-            a, b = vertices[ring[i]], vertices[ring[(i + 1) % len(ring)]]
+            ka, kb = ring[i], ring[(i + 1) % len(ring)]
+            a, b = pts[ka], pts[kb]
+            box = shapely.box(
+                min(a[0], b[0]) - SNAP_M,
+                min(a[1], b[1]) - SNAP_M,
+                max(a[0], b[0]) + SNAP_M,
+                max(a[1], b[1]) + SNAP_M,
+            )
             on = [
-                (t, k)
-                for k, p in enumerate(vertices)
-                if k not in (ring[i], ring[(i + 1) % len(ring)])
-                and (t := on_segment(p, a, b, SNAP_M)) is not None
+                (t, int(k))
+                for k in tree.query(box)
+                if k != ka and k != kb and (t := on_segment(pts[k], a, b, SNAP_M)) is not None
             ]
             if on:
                 on.sort()

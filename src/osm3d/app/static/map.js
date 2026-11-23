@@ -19,6 +19,23 @@ const CANDIDATE_LINE = "#ea580c";
 
 const EARTH_CIRCUMFERENCE = 2 * Math.PI * 6378137;
 
+// Contexto OSM (landuse, vias, muros, edifícios), por baixo dos edifícios em revisão.
+const BUILT_LANDUSE = ["residential", "industrial", "commercial", "retail", "farmyard", "construction", "religious", "institutional", "education", "garages", "military"];
+const GREEN_LANDUSE = ["farmland", "meadow", "grass", "orchard", "vineyard", "allotments", "greenhouse_horticulture", "plant_nursery", "village_green", "recreation_ground"];
+export const OSM_CTX_COLORS = { built: "#d97706", green: "#4d7c0f", forest: "#14532d", other: "#7c3aed", wall: "#44403c", fence: "#9a3412", hedge: "#15803d", highway: "#f8fafc", building: "#dc2626" };
+const LANDUSE_COLOR = ["case",
+  ["in", ["get", "value"], ["literal", BUILT_LANDUSE]], OSM_CTX_COLORS.built,
+  ["in", ["get", "value"], ["literal", GREEN_LANDUSE]], OSM_CTX_COLORS.green,
+  ["==", ["get", "value"], "forest"], OSM_CTX_COLORS.forest,
+  OSM_CTX_COLORS.other];
+const BARRIER_COLOR = ["match", ["get", "value"], "fence", OSM_CTX_COLORS.fence, "hedge", OSM_CTX_COLORS.hedge, OSM_CTX_COLORS.wall];
+const CTX_LAYERS = {
+  landuse: ["ctx-landuse-fill", "ctx-landuse-line"],
+  highway: ["ctx-highway-casing", "ctx-highway", "ctx-highway-other"],
+  barrier: ["ctx-barrier", "ctx-fence"],
+  building: ["ctx-building"],
+};
+
 // Camada personalizada do MapLibre que desenha, com three.js, os telhados e paredes de
 // todos os edifícios tal como os renderizadores os vão mostrar a partir das tags.
 // Geometria em metros Web Mercator relativos a uma origem; z em metros reais.
@@ -244,6 +261,59 @@ export class BuildingMap {
     this.ready = new Promise((resolve) => this.map.on("load", resolve));
   }
 
+  async setOsmContext(geojson) {
+    // Landuse, vias, muros/vedações e edifícios do OSM, por baixo dos edifícios em revisão.
+    await this.ready;
+    const src = this.map.getSource("osm-ctx");
+    if (src) return src.setData(geojson);
+    this.map.addSource("osm-ctx", { type: "geojson", data: geojson });
+    const before = this.map.getLayer("b-fill") ? "b-fill" : undefined;
+    const kind = (k) => ["==", ["get", "kind"], k];
+    const add = (layer) => this.map.addLayer(layer, before);
+    add({ id: "ctx-landuse-fill", type: "fill", source: "osm-ctx", filter: ["all", kind("landuse"), ["==", ["geometry-type"], "Polygon"]],
+      paint: { "fill-color": LANDUSE_COLOR, "fill-opacity": 0.12 } });
+    add({ id: "ctx-landuse-line", type: "line", source: "osm-ctx", filter: kind("landuse"),
+      paint: { "line-color": LANDUSE_COLOR, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 1, 19, 2.5], "line-opacity": 0.9 } });
+    add({ id: "ctx-highway-casing", type: "line", source: "osm-ctx", filter: kind("highway"),
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": "#334155", "line-width": ["interpolate", ["linear"], ["zoom"], 15, 2.5, 19, 7] } });
+    add({ id: "ctx-highway", type: "line", source: "osm-ctx", filter: ["all", kind("highway"), ["get", "crossing"]],
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": OSM_CTX_COLORS.highway, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 1.2, 19, 4.5] } });
+    add({ id: "ctx-highway-other", type: "line", source: "osm-ctx", filter: ["all", kind("highway"), ["!", ["get", "crossing"]]],
+      paint: { "line-color": "#94a3b8", "line-width": ["interpolate", ["linear"], ["zoom"], 15, 1.2, 19, 4.5], "line-dasharray": [2, 2] } });
+    add({ id: "ctx-barrier", type: "line", source: "osm-ctx", filter: ["all", kind("barrier"), ["!=", ["get", "value"], "fence"]],
+      paint: { "line-color": BARRIER_COLOR, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 1.2, 19, 3.5] } });
+    add({ id: "ctx-fence", type: "line", source: "osm-ctx", filter: ["all", kind("barrier"), ["==", ["get", "value"], "fence"]],
+      paint: { "line-color": OSM_CTX_COLORS.fence, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 1.2, 19, 3], "line-dasharray": [2, 1.5] } });
+    add({ id: "ctx-building", type: "line", source: "osm-ctx", filter: kind("building"),
+      paint: { "line-color": OSM_CTX_COLORS.building, "line-width": 1.2, "line-dasharray": [3, 1.5] } });
+    this.applyOsmLayers();
+    const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, className: "ctx-popup" });
+    for (const id of ["ctx-landuse-line", "ctx-highway", "ctx-highway-other", "ctx-barrier", "ctx-fence", "ctx-building"]) {
+      this.map.on("mousemove", id, (e) => {
+        const p = e.features[0]?.properties;
+        if (!p) return;
+        popup.setLngLat(e.lngLat).setHTML(`${p.kind}=${p.value}${p.name ? ` · ${p.name}` : ""}<br><span class="muted">${p.id}</span>`).addTo(this.map);
+      });
+      this.map.on("mouseleave", id, () => popup.remove());
+    }
+    this.renderLegend();
+  }
+
+  setOsmLayers(kinds) {
+    this.osmKinds = kinds;
+    this.applyOsmLayers();
+    this.renderLegend();
+  }
+
+  applyOsmLayers() {
+    const kinds = this.osmKinds ?? new Set(Object.keys(CTX_LAYERS));
+    for (const [k, ids] of Object.entries(CTX_LAYERS)) {
+      for (const id of ids) if (this.map.getLayer(id)) this.map.setLayoutProperty(id, "visibility", kinds.has(k) ? "visible" : "none");
+    }
+  }
+
   async setData(geojson) {
     await this.ready;
     this.keyToId = new Map(geojson.features.map((f) => [f.properties.key, f.id]));
@@ -369,6 +439,19 @@ export class BuildingMap {
       .map(([k, c]) => `<div><span class="sw" style="background:${c}"></span>${labels[k] ?? k}</div>`)
       .join("") +
       `<div><span class="sw" style="background:none;border:2.5px solid ${OSM3D_LINE}"></span>já com 3D no OSM</div>` +
-      `<div><span class="sw" style="background:none;border:2.5px solid ${CANDIDATE_LINE}"></span>em falta no OSM (cartografia municipal ou LiDAR)</div>`;
+      `<div><span class="sw" style="background:none;border:2.5px solid ${CANDIDATE_LINE}"></span>em falta no OSM (cartografia municipal ou LiDAR)</div>` +
+      this.osmLegend();
+  }
+
+  osmLegend() {
+    if (!this.map.getSource("osm-ctx")) return "";
+    const kinds = this.osmKinds ?? new Set(Object.keys(CTX_LAYERS));
+    const line = (c, label, dash = false) => `<div><span class="sw line" style="border-bottom:3px ${dash ? "dashed" : "solid"} ${c}"></span>${label}</div>`;
+    const c = OSM_CTX_COLORS;
+    return `<div class="legend-sep">OSM</div>` +
+      (kinds.has("landuse") ? line(c.built, "landuse construído") + line(c.green, "landuse agrícola/verde") : "") +
+      (kinds.has("highway") ? line("#334155", "via (não pode atravessar edifícios)") : "") +
+      (kinds.has("barrier") ? line(c.wall, "muro") + line(c.fence, "vedação", true) : "") +
+      (kinds.has("building") ? line(c.building, "edifício do OSM", true) : "");
   }
 }

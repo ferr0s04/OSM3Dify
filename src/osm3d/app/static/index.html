@@ -91,6 +91,17 @@
           <option value="origin">Cor: origem (OSM / municipal / LiDAR)</option>
         </select>
         <label class="check"><input id="m-3d" type="checkbox"> 3D</label>
+        <details class="msel mlayers" id="m-osm" title="Elementos do OSM à volta dos edifícios (contexto da fase candidates)">
+          <summary>camadas OSM</summary>
+          <div class="msel-menu">
+            <label><input type="checkbox" value="landuse" checked> landuse</label>
+            <label><input type="checkbox" value="highway" checked> vias</label>
+            <label><input type="checkbox" value="barrier" checked> muros e vedações</label>
+            <label><input type="checkbox" value="building" checked> edifícios do OSM</label>
+            <button class="btn mini-light" id="m-osm-refresh" type="button" title="Voltar a obter landuse, vias, muros e edifícios do Overpass">atualizar do OSM</button>
+            <div class="small muted" id="m-osm-date"></div>
+          </div>
+        </details>
         <select id="m-base" title="Fundo do mapa"><option value="osm">Fundo: mapa OSM</option></select>
       </div>
       </div>

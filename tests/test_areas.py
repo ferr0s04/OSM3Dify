@@ -14,7 +14,7 @@ from shapely.geometry import Polygon, box, mapping
 
 from osm3d.app.processing import PipelineJob
 from osm3d.app.server import create_app
-from osm3d.areas import AreaStore, area_store, next_id, with_active_area
+from osm3d.areas import STORE_VERSION, AreaStore, area_store, next_id, with_active_area
 from osm3d.config import AreaConfig, Config, PathsConfig, SourcesConfig
 from osm3d.domain.models import Building, RoofShape
 from osm3d.export.geopackage import write_buildings
@@ -214,11 +214,13 @@ def test_migrates_place_named_ids(tmp_path: Path) -> None:
     areas = store.areas()
     assert list(areas) == ["area-1", "area-2", "area-3"]
     assert areas["area-2"].tiles == ["156482"] and areas["area-2"].label is None
-    assert areas["area-3"].label == "VdC"  # nome próprio: fica
+    # Versão 3: os nomes guardados (herdados ou de uma relação, com as quadrículas já
+    # mudadas) passam a automáticos: as freguesias cobertas.
+    assert areas["area-3"].label is None
     assert (processed / "area-2" / "06_qa.gpkg").exists()
     assert not (processed / "freguesia-antiga").exists()
     assert store.active().name == "area-2"  # era a área em uso
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == STORE_VERSION
     assert list(AreaStore(path, BASE, processed).areas()) == list(areas)  # só uma vez
 
 

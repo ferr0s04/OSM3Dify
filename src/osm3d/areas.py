@@ -2,7 +2,8 @@
 
 Uma área é um conjunto de quadrículas de 1 km. O identificador é neutro e gerado
 (``area-1``, ``area-2``, …) e dá a pasta ``data/processed/<id>``. O nome a mostrar
-(``label``) é opcional e pode mudar, porque as quadrículas também podem mudar.
+(``label``) é opcional e pode mudar, porque as quadrículas também podem mudar. Sem
+nome escrito, mostra-se o das freguesias que as quadrículas cobrem (``places``).
 
 A área do ``config.yaml`` é só a área inicial. As outras são criadas na aplicação
 (separador "Dados") ou com ``osm3d area --new``, e ficam em ``data/areas.json`` com a
@@ -23,7 +24,7 @@ from osm3d.config import AreaConfig, Config
 
 log = logging.getLogger(__name__)
 
-STORE_VERSION = 2
+STORE_VERSION = 3
 _ID_RE = re.compile(r"^area-(\d+)$")
 
 
@@ -65,6 +66,16 @@ class AreaStore:
         tmp.replace(self.path)
 
     def _migrate(self, data: dict[str, Any]) -> dict[str, Any]:
+        if data.get("version", 1) < 2:
+            data = self._migrate_ids(data)
+        if data.get("version", 1) < 3:
+            # Os nomes guardados até aqui vinham da área inicial do config.yaml, não do
+            # utilizador ("Vilar e Mosteiró" em qualquer área): passam a ser as freguesias.
+            for raw in data["areas"].values():
+                raw["label"] = None
+        return data
+
+    def _migrate_ids(self, data: dict[str, Any]) -> dict[str, Any]:
         """Registo antigo (ids derivados de nomes de lugares) → ids neutros ``area-<n>``.
 
         A pasta ``data/processed/<id antigo>`` muda de nome com a área. Um nome herdado da
@@ -160,6 +171,9 @@ class AreaStore:
             before = self.areas().get(area.name)
             now = datetime.now(UTC).isoformat()  # precisão para comparar com o mtime
             raw = area.model_dump(mode="json")
+            if not area.places and previous.get("places"):
+                raw["places"] = previous["places"]
+                raw["places_tiles"] = previous.get("places_tiles", [])
             raw["updated_at"] = now
             changed = before is None or before.tiles != area.tiles
             raw["tiles_changed_at"] = now if changed else previous.get("tiles_changed_at")
@@ -176,6 +190,23 @@ class AreaStore:
             data["active"] = name
             self._write(data)
         return area
+
+    def set_places(self, name: str, tiles: list[str], places: list[str]) -> None:
+        """Guarda as freguesias calculadas para as quadrículas ``tiles`` da área."""
+        with self._lock:
+            data = self._read()
+            raw = data["areas"].get(name)
+            if raw is None:
+                area = self.areas().get(name)
+                if area is None:
+                    return
+                raw = area.model_dump(mode="json")
+                data["areas"][name] = raw
+            if sorted(raw.get("tiles", [])) != sorted(tiles):
+                return  # as quadrículas mudaram entretanto: fica para o próximo cálculo
+            raw["places"] = places
+            raw["places_tiles"] = sorted(tiles)
+            self._write(data)
 
     def delete(self, name: str) -> None:
         """Remove do registo (os dados processados ficam em ``data/processed/<id>``)."""
