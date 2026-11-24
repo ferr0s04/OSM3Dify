@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 import requests
 
+from osm3d.acquisition import osm as osm_module
 from osm3d.acquisition.osm import (
     FALLBACK_OVERPASS_URLS,
     USER_AGENT,
@@ -12,10 +13,32 @@ from osm3d.acquisition.osm import (
     build_query,
     overpass_post,
     query_timeout_s,
+    server_order,
 )
 
 BBOX = (-8.69911, 41.27348, -8.63541, 41.29553)
 MAIN = "https://overpass-api.de/api/interpreter"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_health() -> Any:
+    # A saúde dos servidores é do processo: cada teste começa sem histórico.
+    osm_module._HEALTH.clear()
+    yield
+    osm_module._HEALTH.clear()
+
+
+def test_server_order_prefers_last_success_and_demotes_hung() -> None:
+    urls = [MAIN, *FALLBACK_OVERPASS_URLS]
+    assert server_order(urls) == urls  # sem histórico: a ordem configurada
+    mail, coffee = FALLBACK_OVERPASS_URLS
+    osm_module._health("maps.mail.ru").last_ok = 100.0
+    osm_module._health("overpass-api.de").last_busy = 150.0
+    assert server_order(urls, now=200.0) == [mail, coffee, MAIN]  # ocupado há 50 s
+    osm_module._health("maps.mail.ru").last_hung = 190.0  # pendurou depois do último ok
+    assert server_order(urls, now=200.0) == [coffee, MAIN, mail]
+    # Passadas as penalizações, volta à frente o último que respondeu.
+    assert server_order(urls, now=200.0 + 3600) == [mail, MAIN, coffee]
 
 
 def test_bbox_query_uses_south_west_north_east_order() -> None:

@@ -46,7 +46,7 @@ from osm3d.geospatial.point_clouds import PointSet
 from osm3d.reconstruction.roof_models import model_surface_z
 
 if TYPE_CHECKING:
-    from osm3d.reconstruction.ortho_outline import OrthoMosaic
+    from osm3d.geospatial.orthophoto import OrthoMosaic
 
 BUILDING_CLASS = 6
 EDGE_EROSION_M = 0.75
@@ -343,7 +343,7 @@ def sample_ortho(
     Fora: sem dados (preto), vegetação (NDVI > 0,2) e sombras (L* muito abaixo da
     mediana). ``None`` se nenhum ortofoto cobre os pontos.
     """
-    from osm3d.reconstruction.ortho_outline import RES_M, snap_bounds
+    from osm3d.geospatial.orthophoto import RES_M, snap_bounds
 
     if not len(x):
         return None

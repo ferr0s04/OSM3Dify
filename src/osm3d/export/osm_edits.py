@@ -13,6 +13,10 @@ nós** (``way(bn)``). Assim:
 - dois ``landuse`` colados (com nós partilhados) ajustados à volta do mesmo edifício
   ganham os mesmos nós novos onde o limite comum é cortado, e continuam colados.
 
+Edições manuais da revisão (landuse com nós movidos, acrescentados ou tirados no mapa)
+aplicam-se primeiro, sobre os dados atuais; os ajustes automáticos vêm por cima. Uma
+edição manual de uma way que mudou no OSM desde o contexto não se faz.
+
 O resultado vai no mesmo ``.osm`` do JOSM, com ``action="modify"``/``"delete"``, para
 ser revisto antes do upload.
 """
@@ -28,12 +32,17 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 from pyproj import Transformer
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, Polygon
 from shapely.geometry.polygon import orient
 
 from osm3d.validation.topology import Adjustment, TopologyRules, adjusted_feature
 
 SAME_NODE_M = 0.001  # mesma posição (a reprojeção não é exata ao bit)
+MOVED_DEG = 1e-8  # ~1 mm: nó editado à mão que mudou de posição
+
+# Landuse editado à mão: (nós da way no OSM quando se editou, anel novo sem repetir o
+# primeiro com (id do nó ou None se novo, x, y) no CRS de processamento).
+ManualRing = tuple[list[int], list[tuple[int | None, float, float]]]
 FIRST_NEW_ID = -1_000_001  # ids negativos longe dos do resto da exportação
 
 EDIT_QUERY = """[out:xml][timeout:{timeout}];
@@ -71,6 +80,7 @@ def fetch_for_edit(
 class OsmEdits:
     ways: dict[int, ET.Element] = field(default_factory=dict)  # ways alteradas (completas)
     nodes: dict[int, ET.Element] = field(default_factory=dict)  # nós usados/novos/apagados
+    new_ways: list[ET.Element] = field(default_factory=list)  # muros novos
     applied: dict[str, list[str]] = field(default_factory=dict)  # edifício → ajustes feitos
     failed: dict[str, list[str]] = field(default_factory=dict)  # edifício → ajustes falhados
     way_notes: dict[int, list[str]] = field(default_factory=dict)  # way → o que mudou
@@ -111,13 +121,21 @@ def plan_edits(
     *,
     skip_ways: set[int] | None = None,
     versions: dict[int, int] | None = None,
+    lines: list[tuple[str, LineString, dict[str, str]]] | None = None,
+    manual: dict[int, ManualRing] | None = None,
 ) -> OsmEdits:
     """Novas geometrias das ways a ajustar, a partir dos dados atuais do OSM.
+
+    ``lines``: (chave, linha, tags) de ways novas (muros), com os nós partilhados com as
+    ways ajustadas onde coincidem (a menos de 1 mm).
 
     ``skip_ways``: ways que não se ajustam (p.ex. contornos a que a exportação liga
     ``building:part``). ``versions``: ways que a exportação também altera (tags 3D),
     com a versão em que as tags foram calculadas; só se ajustam se o OSM ainda está
     nessa versão (as duas alterações juntam-se na mesma way).
+
+    ``manual``: landuse editados à mão na revisão (ver :data:`ManualRing`), aplicados
+    antes dos ajustes automáticos.
     """
     edits = OsmEdits()
     root = ET.fromstring(osm_xml)
@@ -125,6 +143,36 @@ def plan_edits(
     way_el = {int(w.attrib["id"]): w for w in root.iter("way")}
     to_crs = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
     to_wgs = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    original_refs = {
+        wid: [int(nd.attrib["ref"]) for nd in w.findall("nd")] for wid, w in way_el.items()
+    }
+    next_id = FIRST_NEW_ID
+    manual_refs: dict[int, list[int]] = {}
+    for wid, (before, hand_ring) in sorted((manual or {}).items()):
+        why = _manual_problem(wid, before, hand_ring, original_refs, node_el)
+        if why is not None:
+            edits.failed.setdefault(f"way/{wid}", []).append(f"edição manual não feita: {why}")
+            continue
+        refs_new: list[int] = []
+        for nid, x, y in hand_ring:
+            lon, lat = to_wgs.transform(x, y)
+            if nid is None:
+                nid, next_id = next_id, next_id - 1
+                node_el[nid] = ET.Element(
+                    "node", id=str(nid), action="modify", visible="true",
+                    lat=f"{lat:.7f}", lon=f"{lon:.7f}",
+                )  # fmt: skip
+            else:
+                el = node_el[nid]
+                if (
+                    abs(float(el.attrib["lon"]) - lon) > MOVED_DEG
+                    or abs(float(el.attrib["lat"]) - lat) > MOVED_DEG
+                ):
+                    el.set("lat", f"{lat:.7f}")
+                    el.set("lon", f"{lon:.7f}")
+                    el.set("action", "modify")
+            refs_new.append(nid)
+        manual_refs[wid] = [*refs_new, refs_new[0]]
     ids = list(node_el)
     xs, ys = to_crs.transform(
         np.array([float(node_el[i].attrib["lon"]) for i in ids]),
@@ -139,9 +187,9 @@ def plan_edits(
         index.add(nid, x, y)
     parents: dict[int, set[int]] = defaultdict(set)
     refs_of: dict[int, list[int]] = {}
-    for wid, w in way_el.items():
-        refs_of[wid] = [int(nd.attrib["ref"]) for nd in w.findall("nd")]
-        for r in refs_of[wid]:
+    for wid in way_el:
+        refs_of[wid] = manual_refs.get(wid, original_refs[wid])
+        for r in original_refs[wid]:
             parents[r].add(wid)
 
     by_way: dict[int, list[Adjustment]] = defaultdict(list)
@@ -161,7 +209,8 @@ def plan_edits(
         current = Polygon([xy[r] for r in refs])
         if not current.is_valid:
             return "a geometria atual no OSM é inválida"
-        new = adjusted_feature(current, [(a.obstacle, a.include) for a in adjs], rules)
+        width = max((a.max_width_m or 0.0 for a in adjs), default=0.0) or None
+        new = adjusted_feature(current, [(a.obstacle, a.include) for a in adjs], rules, width)
         if new is None:
             return "no OSM atual o ajuste já não é uma lasca"
         return orient(new, 1.0 if current.exterior.is_ccw else -1.0)
@@ -196,7 +245,6 @@ def plan_edits(
                 f"{a.description} — não ajustado ({failed[a.group]})"
             )
 
-    next_id = FIRST_NEW_ID
     new_nodes: dict[int, tuple[float, float]] = {}
     new_refs: dict[int, list[int]] = {}
     for wid, (new, adjs) in planned.items():
@@ -222,8 +270,37 @@ def plan_edits(
         for a in adjs:
             edits.applied.setdefault(a.building_key, []).append(a.description)
         edits.way_notes[wid] = [a.description for a in adjs]
+    for wid, refs in manual_refs.items():  # editados à mão (e sem ajustes automáticos)
+        new_refs.setdefault(wid, refs)
+        edits.way_notes.setdefault(wid, []).insert(0, "geometria editada à mão na revisão")
 
-    used = {r for rs in new_refs.values() for r in rs}
+    # Ways novas (muros): depois dos anéis, para usarem os nós deles.
+    new_line_refs: list[tuple[list[int], dict[str, str]]] = []
+    for _key, line, line_tags in lines or []:
+        refs_line: list[int] = []
+        for x, y in line.coords:
+            found = index.find(x, y, set())
+            if found is None:
+                nid, next_id = next_id, next_id - 1
+                index.add(nid, x, y)
+                new_nodes[nid] = (x, y)
+            else:
+                nid = found
+            if not refs_line or refs_line[-1] != nid:
+                refs_line.append(nid)
+        if len(refs_line) >= 2:
+            new_line_refs.append((refs_line, line_tags))
+    way_id = FIRST_NEW_ID * 2  # ids das ways novas, longe dos nós
+    for refs_line, line_tags in new_line_refs:
+        el = ET.Element("way", id=str(way_id), action="modify", visible="true")
+        way_id -= 1
+        for r in refs_line:
+            ET.SubElement(el, "nd", ref=str(r))
+        for key, value in sorted(line_tags.items()):
+            ET.SubElement(el, "tag", k=key, v=value)
+        edits.new_ways.append(el)
+
+    used = {r for rs in new_refs.values() for r in rs} | {r for rs, _ in new_line_refs for r in rs}
     for wid, rs in new_refs.items():
         el = copy.deepcopy(way_el[wid])
         for nd in el.findall("nd"):
@@ -251,7 +328,7 @@ def plan_edits(
         else:
             edits.nodes[r] = copy.deepcopy(node_el[r])
     # Nós que saíram do anel: apagam-se se mais nada os usa (nem têm tags).
-    dropped = {r for wid in new_refs for r in refs_of[wid]} - used
+    dropped = {r for wid in new_refs for r in original_refs[wid]} - used
     for r in dropped:
         others = parents[r] - set(new_refs)
         if not others and node_el[r].find("tag") is None:
@@ -259,3 +336,25 @@ def plan_edits(
             el.set("action", "delete")
             edits.nodes[r] = el
     return edits
+
+
+def _manual_problem(
+    wid: int,
+    before: list[int],
+    ring: list[tuple[int | None, float, float]],
+    refs: dict[int, list[int]],
+    node_el: dict[int, ET.Element],
+) -> str | None:
+    """Porque é que a edição manual de ``wid`` não se pode aplicar (ou ``None``)."""
+    if wid not in refs:
+        return "a way já não existe no OSM"
+    if refs[wid] != before:
+        return "a way mudou no OSM desde a edição: rever e editar de novo"
+    if len(ring) < 3:
+        return "o anel editado tem menos de 3 nós"
+    missing = [n for n, _, _ in ring if n is not None and n not in node_el]
+    if missing:
+        return f"nós que já não existem no OSM: {missing[:3]}"
+    if not Polygon([(x, y) for _, x, y in ring]).is_valid:
+        return "o anel editado não é um polígono válido"
+    return None

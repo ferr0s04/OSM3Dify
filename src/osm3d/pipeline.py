@@ -8,7 +8,9 @@ Cada fase lê o artefacto da anterior e escreve o seu em
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -19,10 +21,14 @@ from osm3d.config import Config
 from osm3d.export.s3db_tags import TagPolicy
 
 if TYPE_CHECKING:
+    from shapely.geometry.base import BaseGeometry
+
     from osm3d.domain.models import Building
-    from osm3d.export.osm_edits import OsmEdits
+    from osm3d.export.osm_edits import ManualRing, OsmEdits
     from osm3d.export.osm_xml import ExportRecord
-    from osm3d.validation.topology import TopologyResult
+    from osm3d.geometry_edits import GeometryEdits
+    from osm3d.reconstruction.walls import WallProposal
+    from osm3d.validation.topology import Adjustment, TopologyResult
 
 
 class Stage(StrEnum):
@@ -33,7 +39,7 @@ class Stage(StrEnum):
     ROOFS = "roofs"
     COLOURS = "colours"
     QA = "qa"
-    CANDIDATES = "candidates"  # edifícios em falta no OSM (LiDAR); opcional
+    CANDIDATES = "candidates"  # edifícios da cartografia municipal em falta no OSM; opcional
     EXPORT = "export"
 
 
@@ -127,16 +133,13 @@ def stage_state(config: Config, stage: Stage) -> tuple[StageState, str]:
         if not cache_matches(context_path(config), sorted(set(lidar) & set(dtm))):
             return "stale", "as quadrículas com LAZ e MDT mudaram"
         used = candidates_sources(config) or {}
-        wanted = config.sources.municipal.enabled
-        if bool(used.get("municipal")) != wanted:
-            return "stale", (
-                "cartografia municipal ativada" if wanted else "cartografia municipal desativada"
-            )
+        if used.get("version") != CANDIDATES_VERSION:
+            return "stale", "candidatos de uma versão anterior (com deteção só pelo LiDAR)"
         mpath = municipal_path(config)
-        if wanted and (not mpath.exists() or mpath.stat().st_mtime > made):
+        if not mpath.exists() or mpath.stat().st_mtime > made:
             return "stale", "cartografia municipal por obter ou mais recente"
         full = config.sources.municipal.full_path
-        if wanted and full.exists() and full.stat().st_mtime > made:
+        if full.exists() and full.stat().st_mtime > made:
             return "stale", "cartografia municipal do concelho descarregada de novo"
     else:
         prev = _previous(config, stage)
@@ -243,7 +246,8 @@ def run_stage(
 
             reviews = ReviewStore(review_store_path(config)).all()
             buildings = [apply_review(b, reviews.get(b.key)) for b in review_buildings(config)]
-            path, n_selected, records, topo = export_area(config, buildings, progress)
+            walls = accepted_walls(config, reviews)
+            path, n_selected, records, topo = export_area(config, buildings, progress, walls)
             if progress:
                 n_conf = sum(bool(r.conflicts) for r in records)
                 n_rev = sum(b.review_status != "pending" for b in buildings)
@@ -330,12 +334,90 @@ def review_buildings(config: Config) -> list[Building]:
     buildings = read_buildings(qa)
     candidates = artefact_path(config, Stage.CANDIDATES)
     if candidates.exists():
-        buildings += read_buildings(candidates)
+        buildings += [b for b in read_buildings(candidates) if is_municipal(b)]
     return buildings
+
+
+def is_municipal(b: Building) -> bool:
+    """Edifício novo com contorno da cartografia municipal. Artefactos antigos ainda podem
+    ter candidatos só do LiDAR: não entram na revisão nem na exportação."""
+    return "municipal_gid" in b.diagnostics
 
 
 def context_path(config: Config) -> Path:
     return area_dir(config) / "osm_context.json"
+
+
+def geometry_edits(config: Config) -> GeometryEdits:
+    """Edições de geometria feitas no mapa da revisão (landuse do OSM e muros)."""
+    from osm3d.review import ReviewStore
+
+    return ReviewStore(review_store_path(config)).geometry_edits()
+
+
+# A aplicação serve pedidos em paralelo (threads): estes ficheiros são escritos por uma
+# thread de cada vez. No Windows, substituir um ficheiro que outra thread está a ler falha.
+_CONTEXT_LOCK = threading.Lock()
+_WALLS_LOCK = threading.Lock()
+
+
+def effective_context_path(config: Config, edits: GeometryEdits | None = None) -> Path:
+    """Contexto OSM com as edições manuais de landuse (o próprio, se não as há).
+
+    Cada versão (contexto + edições) tem o seu ficheiro, que nunca é reescrito: um pedido
+    que o está a ler não colide com outro que gera a versão seguinte.
+    """
+    path = context_path(config)
+    edits = geometry_edits(config) if edits is None else edits
+    if edits.landuse_empty or not path.exists():
+        return path
+    from osm3d.geometry_edits import apply_to_context
+
+    sig = f"{path.stat().st_mtime_ns}:{edits.signature()}"
+    out = path.with_name(f"osm_context.edited.{hashlib.sha1(sig.encode()).hexdigest()[:12]}.json")
+    if out.exists():
+        return out
+    with _CONTEXT_LOCK:
+        if out.exists():
+            return out
+        data = json.loads(path.read_text(encoding="utf-8"))
+        tmp = out.with_name(out.name + ".part")
+        tmp.write_text(json.dumps(apply_to_context(data, edits)), encoding="utf-8")
+        tmp.replace(out)
+        # Versões anteriores (as que ainda estão a ser lidas ficam para a próxima vez).
+        for old in path.parent.glob("osm_context.edited*"):
+            if old != out:
+                with contextlib.suppress(OSError):
+                    old.unlink()
+    return out
+
+
+def barriers_path(config: Config) -> Path:
+    """Cache dos muros e vedações municipais da área (propostas de muros)."""
+    return area_dir(config) / "municipal_barriers.geojson"
+
+
+def fetch_area_barriers(
+    config: Config, *, force: bool = False, progress: Callable[[str], None] | None = None
+) -> Path:
+    """Muros e vedações municipais das quadrículas da área (+30 m), em cache."""
+    import shapely
+
+    from osm3d.acquisition.municipal import fetch_municipal_barriers
+    from osm3d.geospatial.tiling import TileKey
+
+    tiles = config.area.tiles
+    if not tiles:
+        raise FileNotFoundError("A área não tem quadrículas")
+    extent = shapely.union_all([shapely.box(*TileKey.from_dgt_name(t).bounds) for t in tiles])
+    bbox = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
+    out = barriers_path(config)
+    stale = force or not out.exists() or not cache_matches(out, tiles)
+    path = fetch_municipal_barriers(
+        bbox, config.sources.municipal, out, force=stale, progress=progress
+    )
+    mark_cache(path, tiles)
+    return path
 
 
 def municipal_path(config: Config) -> Path:
@@ -385,19 +467,35 @@ def refresh_context(
     return ctx
 
 
+# Versão dos candidatos: outra = refazer (a 2 deixou de detetar edifícios só pelo LiDAR).
+CANDIDATES_VERSION = 2
+
+
 def _run_candidates(
     config: Config, out: Path, force: bool, progress: Callable[[str], None] | None
 ) -> Path:
-    """Deteta edifícios em falta no OSM e ajusta-lhes o telhado e a cor como aos restantes."""
+    """Edifícios da cartografia municipal em falta no OSM e confirmados pelo LiDAR, com o
+    telhado (LiDAR) e a cor ajustados como aos restantes."""
     import shapely
 
+    from osm3d.acquisition.municipal import (
+        crop_municipal,
+        fetch_municipal_buildings,
+        load_municipal_buildings,
+    )
     from osm3d.acquisition.osm import context_timestamp
     from osm3d.export.geopackage import write_buildings
     from osm3d.geospatial.tiling import TileKey
     from osm3d.reconstruction.building import reconstruct_area
-    from osm3d.reconstruction.candidates import detect_candidates, load_context, load_land
+    from osm3d.reconstruction.candidates import detect_candidates, load_context
     from osm3d.validation.quality import check_building
 
+    mcfg = config.sources.municipal
+    if not mcfg.configured:
+        raise ValueError(
+            "Os edifícios em falta no OSM vêm da cartografia municipal: configurar o geoportal "
+            "em sources.municipal (config/local.yaml)"
+        )
     lidar = area_tiles(config, config.sources.lidar_dir, (".laz", ".las"))
     dtm = area_tiles(config, config.sources.dtm_dir, (".tif", ".tiff"))
     tiles = sorted(set(lidar) & set(dtm))
@@ -420,53 +518,45 @@ def _run_candidates(
             f"  contexto OSM ({context_timestamp(ctx)}): {len(osm)} edifícios em "
             f"{len(tiles)} quadrículas"
         )
-    municipal = None
-    if config.sources.municipal.enabled:
-        from osm3d.acquisition.municipal import (
-            crop_municipal,
-            fetch_municipal_buildings,
-            load_municipal_buildings,
-        )
-
-        mcfg = config.sources.municipal
-        mpath = municipal_path(config)
-        mx0, my0, mx1, my1 = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
-        stale = force or not mpath.exists() or not cache_matches(mpath, tiles)
-        if mcfg.full_path.exists():
-            # Cópia de todo o concelho: recorta-se a área localmente, sem pedidos.
-            if stale or mcfg.full_path.stat().st_mtime > mpath.stat().st_mtime:
-                crop_municipal(mcfg.full_path, (mx0, my0, mx1, my1), mpath, mcfg, progress)
-            elif progress:
-                progress("  cartografia municipal: recorte da cópia do concelho em cache")
-        else:
-            fetch_municipal_buildings(
-                (mx0, my0, mx1, my1), mcfg, mpath, force=stale, progress=progress
-            )
-        mark_cache(mpath, tiles)
-        municipal = load_municipal_buildings(mpath)
+    mpath = municipal_path(config)
+    mx0, my0, mx1, my1 = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
+    stale = force or not mpath.exists() or not cache_matches(mpath, tiles)
+    if mcfg.full_path.exists():
+        # Cópia de todo o concelho: recorta-se a área localmente, sem pedidos.
+        if stale or mcfg.full_path.stat().st_mtime > mpath.stat().st_mtime:
+            crop_municipal(mcfg.full_path, (mx0, my0, mx1, my1), mpath, mcfg, progress)
+        elif progress:
+            progress("  cartografia municipal: recorte da cópia do concelho em cache")
+    else:
+        fetch_municipal_buildings((mx0, my0, mx1, my1), mcfg, mpath, force=stale, progress=progress)
+    mark_cache(mpath, tiles)
+    municipal = load_municipal_buildings(mpath)
+    if mcfg.barriers:
+        # Muros e vedações para as propostas de muros (falhar aqui não trava os edifícios).
+        try:
+            fetch_area_barriers(config, force=force, progress=progress)
+        except Exception as exc:
+            if progress:
+                progress(f"  muros municipais por obter ({exc}): obter na aplicação")
     # Limite = as próprias quadrículas da área (centróide dentro delas, como no prepare).
-    orthos = ortho_files(config)
-    if progress and not orthos:
-        progress("  sem ortofotos: contornos só do LiDAR (descarregar ortofotos melhora-os)")
     found = detect_candidates(
         lidar,
         dtm,
         osm,
         config.area.polygon(),
-        ortho_paths=orthos,
+        municipal,
+        mcfg,
         progress=progress,
-        land=load_land(ctx, config.processing_crs),
-        municipal=municipal,
-        municipal_cfg=config.sources.municipal,
         workers=config.workers,
     )
     if progress:
-        progress(f"  {len(found)} edifícios em falta no OSM (candidatos)")
+        progress(f"  {len(found)} edifícios da cartografia municipal em falta no OSM")
+    # O LiDAR dá a forma e a altura do telhado, como aos edifícios do OSM.
     fitted, _ = reconstruct_area(found, lidar, dtm, config, progress)
     # Cor do telhado, como na fase colours dos edifícios OSM.
     from osm3d.appearance.area import colour_area
 
-    fitted = colour_area(fitted, lidar, progress, orthos)
+    fitted = colour_area(fitted, lidar, progress, ortho_files(config))
     checked = []
     for b in fitted:
         known = {f.code for f in b.qa_flags}
@@ -474,7 +564,7 @@ def _run_candidates(
         checked.append(b.model_copy(update={"qa_flags": [*b.qa_flags, *extra]}))
     path = write_buildings(checked, out, config.processing_crs)
     _sources_meta(out).write_text(
-        json.dumps({"municipal": municipal is not None}), encoding="utf-8"
+        json.dumps({"municipal": True, "version": CANDIDATES_VERSION}), encoding="utf-8"
     )
     return path
 
@@ -494,14 +584,6 @@ def candidates_sources(config: Config) -> dict[str, Any] | None:
     except ValueError:
         return None
     return data if isinstance(data, dict) else None
-
-
-def with_municipal(config: Config, enabled: bool) -> Config:
-    """``config`` com a cartografia municipal ligada ou desligada (só desta corrida)."""
-    sources = config.sources.model_copy(
-        update={"municipal": config.sources.municipal.model_copy(update={"enabled": enabled})}
-    )
-    return config.model_copy(update={"sources": sources})
 
 
 def municipal_status(config: Config) -> dict[str, Any]:
@@ -525,7 +607,7 @@ def municipal_status(config: Config) -> dict[str, Any]:
         "cached": path.exists(),
         "n": meta.get("n"),
         "fetched_at": meta.get("fetched_at"),
-        "used_in_candidates": None if used is None else bool(used.get("municipal")),
+        "used_in_candidates": None if used is None else used.get("version") == CANDIDATES_VERSION,
         # O recorte da área veio da cópia do concelho (sem pedidos ao geoportal)?
         "from_full": bool(meta.get("from_full")),
         "full": municipal_full_status(config),
@@ -559,26 +641,159 @@ def review_store_path(config: Config) -> Path:
     return area_dir(config) / "reviews.sqlite"
 
 
+# ------------------------------------------------------------------- muros
+
+WALLS_VERSION = 3  # 2: retaining_wall passa a wall; 3: sem vedações
+
+
+def walls_cache_path(config: Config) -> Path:
+    return area_dir(config) / "wall_proposals.json"
+
+
+def wall_proposals(config: Config) -> list[WallProposal]:
+    """Propostas de muros da área (em cache enquanto os muros municipais e o contexto OSM
+    não mudam). Sem muros municipais obtidos: lista vazia."""
+    with _WALLS_LOCK:
+        return _wall_proposals(config)
+
+
+def _wall_proposals(config: Config) -> list[WallProposal]:
+    from osm3d.acquisition.municipal import load_municipal_barriers
+    from osm3d.reconstruction.walls import (
+        WallContext,
+        WallProposal,
+        load_wall_context,
+        propose_walls,
+    )
+
+    bpath, ctx = barriers_path(config), context_path(config)
+    if not bpath.exists():
+        return []
+    sig = {
+        "version": WALLS_VERSION,
+        "barriers": bpath.stat().st_mtime,
+        "context": ctx.stat().st_mtime if ctx.exists() else None,
+    }
+    cache = walls_cache_path(config)
+    if cache.exists():
+        with contextlib.suppress(ValueError, KeyError):
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            if data["signature"] == sig:
+                return [WallProposal.from_json(d) for d in data["walls"]]
+    wctx = load_wall_context(ctx, config.processing_crs) if ctx.exists() else WallContext()
+    walls = propose_walls(load_municipal_barriers(bpath), wctx)
+    tmp = cache.with_suffix(".json.part")
+    tmp.write_text(
+        json.dumps({"signature": sig, "walls": [w.to_json() for w in walls]}), encoding="utf-8"
+    )
+    tmp.replace(cache)
+    return walls
+
+
+def effective_walls(config: Config, edits: GeometryEdits | None = None) -> list[WallProposal]:
+    """Propostas de muros com as edições do mapa: a geometria editada de cada muro e as
+    ligações ao landuse refeitas nos muros editados e nos que ficam perto de um landuse
+    editado (contra o landuse já editado)."""
+    import dataclasses
+
+    import shapely
+    from pyproj import Transformer
+    from shapely.geometry import LineString
+
+    from osm3d.geometry_edits import ContextIndex, edited_landuse
+    from osm3d.reconstruction.walls import SNAP_M, landuse_runs, load_wall_context
+
+    base = wall_proposals(config)
+    edits = geometry_edits(config) if edits is None else edits
+    if not edits.walls and edits.landuse_empty:
+        return base
+    path = effective_context_path(config, edits)
+    wctx = load_wall_context(path, config.processing_crs) if path.exists() else None
+    near_edited: BaseGeometry | None = None
+    if wctx is not None and not edits.landuse_empty:
+        raw = json.loads(context_path(config).read_text(encoding="utf-8"))
+        changed = set(edited_landuse(ContextIndex.of(raw), edits))
+        rings = [r.polygon.exterior for r in wctx.landuse if r.way_id in changed]
+        near_edited = shapely.union_all(rings).buffer(SNAP_M + 1.0) if rings else None
+    to_crs = Transformer.from_crs("EPSG:4326", config.processing_crs, always_xy=True)
+    tree = shapely.STRtree([r.polygon.exterior for r in wctx.landuse]) if wctx else None
+    out = []
+    for w in base:
+        coords = edits.walls.get(w.key)
+        geom = w.geometry
+        if coords:
+            xs, ys = to_crs.transform([c[0] for c in coords], [c[1] for c in coords])
+            geom = LineString(list(zip(xs, ys, strict=True)))
+        redo = coords is not None or (near_edited is not None and geom.intersects(near_edited))
+        if redo and wctx is not None and tree is not None:
+            runs = landuse_runs(geom, wctx.landuse, tree) if wctx.landuse else []
+            w = dataclasses.replace(w, geometry=geom, runs=runs)
+        elif coords is not None:
+            w = dataclasses.replace(w, geometry=geom, runs=[])
+        out.append(w)
+    return out
+
+
+def _wall_adjustments(config: Config, walls: list[WallProposal]) -> list[Adjustment]:
+    """Ajustes dos landuse para o limite passar exatamente pelos muros aceites."""
+    from osm3d.reconstruction.walls import SNAP_M, load_wall_context, run_faces
+    from osm3d.validation.topology import Adjustment, Feature
+
+    ctx = effective_context_path(config)
+    if not ctx.exists() or not any(w.runs for w in walls):
+        return []
+    rings = {r.way_id: r for r in load_wall_context(ctx, config.processing_crs).landuse}
+    out: list[Adjustment] = []
+    for w in walls:
+        for run in w.runs:
+            ring = rings.get(run.way_id)
+            if ring is None:
+                continue
+            feature = Feature(ring.polygon, ring.label, "way", ring.way_id)
+            for face, include in run_faces(w, ring.polygon, run):
+                out.append(
+                    Adjustment(
+                        w.key,
+                        feature,
+                        face,
+                        include,
+                        f"{ring.label} passa a seguir o muro ({run.end_m - run.start_m:.0f} m, "
+                        f"até {run.max_offset_m:.1f} m)",
+                        max_width_m=SNAP_M + 0.5,
+                    )
+                )
+    return out
+
+
 @dataclass
 class ExportTopology:
-    """Verificação da topologia dos edifícios novos na exportação."""
+    """Verificação da topologia dos edifícios novos e dos muros na exportação."""
 
-    result: TopologyResult
+    result: TopologyResult | None = None
     ways_adjusted: int = 0  # landuse/edifícios do OSM ajustados no ficheiro
-    not_adjusted: int = 0  # edifícios cujos ajustes ao OSM não se fizeram
+    not_adjusted: int = 0  # edifícios/muros cujos ajustes ao OSM não se fizeram
+    walls: int = 0  # muros novos exportados
+    walls_connected: int = 0  # ... ligados ao landuse (limite ajustado ao muro)
     error: str | None = None  # p.ex. Overpass sem resposta: nada ajustado
     context_date: str = "?"
 
     def summary(self) -> str:
+        parts = []
         r = self.result
-        text = (
-            f"{r.checked} edifícios novos verificados: {r.trimmed} recortados, "
-            f"{self.ways_adjusted} elementos do OSM ajustados (à volta de "
-            f"{r.adjusting - self.not_adjusted} edifícios), {r.conflicts} com conflitos"
-        )
+        if r is not None:
+            parts.append(
+                f"{r.checked} edifícios novos verificados: {r.trimmed} recortados, "
+                f"{r.conflicts} com conflitos"
+            )
+        if self.walls:
+            parts.append(f"{self.walls} muros novos ({self.walls_connected} ligados ao landuse)")
+        parts.append(f"{self.ways_adjusted} elementos do OSM ajustados")
         if self.not_adjusted:
-            text += f"; {self.not_adjusted} edifícios ficaram sem o ajuste ao OSM"
-        return text + (f" — {self.error}" if self.error else "")
+            parts.append(f"{self.not_adjusted} edifícios/muros sem o ajuste ao OSM")
+        return "; ".join(parts) + (f" — {self.error}" if self.error else "")
+
+
+ADJUST_FAILED = "osm_adjust_failed"
 
 
 def export_topology(
@@ -586,16 +801,18 @@ def export_topology(
     selected: list[tuple[Building, dict[str, str]]],
     records: list[ExportRecord],
     progress: Callable[[str], None] | None = None,
+    walls: list[WallProposal] | None = None,
 ) -> tuple[list[tuple[Building, dict[str, str]]], ExportTopology | None, OsmEdits | None]:
-    """Verifica os edifícios novos a exportar contra o OSM e entre si.
+    """Verifica os edifícios novos a exportar contra o OSM e entre si, e liga os muros.
 
     Só agora se sabe quais vão juntos (os aceites) e o modo escolhido para cada um. Os
-    recortes saem nos contornos; os ajustes a ``landuse``/edifícios do OSM (modo
-    ``osm``) são feitos sobre os dados atuais, pedidos ao Overpass. O que se fez e os
-    conflitos que ficam vão para o relatório.
+    recortes saem nos contornos; os ajustes a ``landuse``/edifícios do OSM (modo ``osm``
+    e muros ao longo de limites) são feitos sobre os dados atuais, pedidos ao Overpass.
+    O que se fez e os conflitos que ficam vão para o relatório.
     """
     from osm3d.export.osm_edits import fetch_for_edit, plan_edits
     from osm3d.export.osm_xml import ExportRecord, has_parts
+    from osm3d.reconstruction.walls import with_run_vertices
     from osm3d.validation.topology import (
         CONFLICT_CODES,
         TRIMMED,
@@ -604,16 +821,32 @@ def export_topology(
         resolve_topology,
     )
 
-    ctx = context_path(config)
-    if not any(b.osm_type == "new" for b, _ in selected) or not ctx.exists():
+    walls = walls or []
+    ctx = effective_context_path(config)
+    has_new = any(b.osm_type == "new" for b, _ in selected) and ctx.exists()
+    manual = manual_landuse(config)
+    if not has_new and not walls and not manual:
         return selected, None, None
     rules = TopologyRules.from_config(config.topology)
-    env = load_surroundings(ctx, config.processing_crs, artefact_path(config, Stage.FETCH))
-    fixed, result = resolve_topology([b for b, _ in selected], env, rules)
-    info = ExportTopology(result, context_date=env.timestamp)
+    info = ExportTopology()
+    fixed = [b for b, _ in selected]
+    adjustments: list[Adjustment] = []
+    if has_new:
+        env = load_surroundings(ctx, config.processing_crs, artefact_path(config, Stage.FETCH))
+        fixed, info.result = resolve_topology(fixed, env, rules)
+        info.context_date = env.timestamp
+        adjustments += info.result.adjustments
+    adjustments += _wall_adjustments(config, walls)
+    lines = [(w.key, with_run_vertices(w), w.tags) for w in walls]
+    ways = [b for b in fixed if b.osm_type == "way"]
+    plan = {
+        "skip_ways": {b.osm_id for b in ways if has_parts(b)},
+        "versions": {b.osm_id: b.osm_version for b in ways},
+        "lines": lines,
+    }
     edits: OsmEdits | None = None
-    if result.adjustments:
-        way_ids = [a.feature.osm_id for a in result.adjustments]
+    if adjustments or manual:
+        way_ids = [a.feature.osm_id for a in adjustments] + list(manual)
         if progress:
             progress(f"  a obter do Overpass as {len(set(way_ids))} ways do OSM a ajustar")
         try:
@@ -628,21 +861,24 @@ def export_topology(
             )
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_bytes(xml)
-            ways = [b for b, _ in selected if b.osm_type == "way"]
             edits = plan_edits(
-                result.adjustments,
+                adjustments,
                 xml,
                 config.processing_crs,
                 rules,
-                skip_ways={b.osm_id for b in ways if has_parts(b)},
-                versions={b.osm_id: b.osm_version for b in ways},
+                manual=manual,
+                **plan,  # type: ignore[arg-type]
             )
-            info.ways_adjusted = len(edits.ways)
+    if edits is None and lines:
+        # Sem ajustes (ou sem Overpass): os muros vão na mesma, sem ligação ao landuse.
+        edits = plan_edits([], b"<osm version='0.6'/>", config.processing_crs, rules, lines=lines)
+    if edits is not None:
+        info.ways_adjusted = len(edits.ways)
     by_key = {r.key: r for r in records}
     out: list[tuple[Building, dict[str, str]]] = []
     for b, (before, tags) in zip(fixed, selected, strict=True):
-        if b.osm_type == "new":
-            b = _mark_adjust_failures(b, result, edits, info)
+        if b.osm_type == "new" and info.result is not None:
+            b = _mark_adjust_failures(b, adjustments, edits, info)
             r = by_key.get(b.key)
             if r is not None:
                 notes = []
@@ -657,31 +893,69 @@ def export_topology(
                 ]
                 r.topology = " | ".join(notes)
         out.append((b, tags))
+    for w in walls:
+        info.walls += 1
+        applied = edits.applied.get(w.key, []) if edits is not None else []
+        failed = edits.failed.get(w.key, []) if edits is not None else []
+        if w.runs and (failed or (edits is None or not applied)):
+            info.not_adjusted += 1
+            failed = failed or [info.error or "ajuste ao landuse por fazer"]
+        info.walls_connected += bool(applied) and not failed
+        notes = [f"{w.tags.get('barrier')} ({w.layer}, {w.geometry.length:.0f} m)"]
+        notes += [f"landuse ajustado: {a}" for a in applied]
+        notes += [f"por fazer: {f}" for f in failed]
+        records.append(ExportRecord(w.key, True, "muro novo", topology="; ".join(notes)))
     if edits is not None:
+        for key, why in sorted(edits.failed.items()):
+            if key.startswith("way/") and int(key[4:]) in manual:
+                info.not_adjusted += 1
+                records.append(
+                    ExportRecord(key, False, "edição manual não aplicada", topology="; ".join(why))
+                )
         for wid, notes in sorted(edits.way_notes.items()):
             records.append(
                 ExportRecord(
                     f"way/{wid}",
                     True,
-                    "geometria ajustada a edifícios novos",
+                    "geometria ajustada a edifícios/muros novos",
                     topology="; ".join(notes),
                 )
             )
     return out, info, edits
 
 
-ADJUST_FAILED = "osm_adjust_failed"
+def manual_landuse(config: Config) -> dict[int, ManualRing]:
+    """Landuse editados à mão na revisão, para a exportação: (nós no OSM quando se editou,
+    anel novo com (id do nó ou None, x, y) no CRS de processamento)."""
+    from pyproj import Transformer
+
+    from osm3d.geometry_edits import ContextIndex, edited_landuse, landuse_ring
+
+    edits = geometry_edits(config)
+    path = context_path(config)
+    if edits.landuse_empty or not path.exists():
+        return {}
+    ctx = ContextIndex.of(json.loads(path.read_text(encoding="utf-8")))
+    to_crs = Transformer.from_crs("EPSG:4326", config.processing_crs, always_xy=True)
+    out: dict[int, ManualRing] = {}
+    for wid in edited_landuse(ctx, edits):
+        ring = landuse_ring(ctx, edits, wid)
+        xs, ys = to_crs.transform([n[1] for n in ring], [n[2] for n in ring])
+        out[wid] = (
+            list(ctx.refs[wid]),
+            [(n[0], float(x), float(y)) for n, x, y in zip(ring, xs, ys, strict=True)],
+        )
+    return out
 
 
 def _mark_adjust_failures(
-    b: Building, result: TopologyResult, edits: OsmEdits | None, info: ExportTopology
+    b: Building, adjustments: list[Adjustment], edits: OsmEdits | None, info: ExportTopology
 ) -> Building:
     """Ajuste ao OSM que não se fez: o edifício sai sobreposto, sinalizado como conflito."""
     from osm3d.domain.models import QAFlag
     from osm3d.validation.topology import ADJUSTS_OSM
 
-    planned = any(a.building_key == b.key for a in result.adjustments)
-    if not planned:
+    if not any(a.building_key == b.key for a in adjustments):
         return b
     failed = edits.failed.get(b.key) if edits is not None else [info.error or "?"]
     if not failed:
@@ -698,12 +972,26 @@ def _mark_adjust_failures(
     return b.model_copy(update={"qa_flags": flags})
 
 
+def accepted_walls(config: Config, reviews: dict[str, Any]) -> list[WallProposal]:
+    """Muros aceites e não arquivados (as revisões têm a chave ``wall/<id>``), com as
+    edições do mapa."""
+    out = []
+    for w in effective_walls(config):
+        r = reviews.get(w.key)
+        if r is not None and r.status == "accepted" and not r.archived:
+            out.append(w)
+    return out
+
+
 def export_area(
-    config: Config, buildings: list[Building], progress: Callable[[str], None] | None = None
+    config: Config,
+    buildings: list[Building],
+    progress: Callable[[str], None] | None = None,
+    walls: list[WallProposal] | None = None,
 ) -> tuple[Path, int, list[ExportRecord], ExportTopology | None]:
     """Escreve o ``.osm`` para o JOSM e o relatório CSV.
 
-    Devolve (caminho, n.º exportado, registos, verificação da topologia dos novos).
+    Devolve (caminho, n.º de edifícios exportados, registos, topologia/muros).
     """
     from osm3d.export.osm_xml import plan_export, write_josm_file, write_report
 
@@ -714,7 +1002,7 @@ def export_area(
         include_pending=config.export.include_pending,
         overwrite=config.export.overwrite_existing_tags,
     )
-    selected, topo, edits = export_topology(config, selected, records, progress)
+    selected, topo, edits = export_topology(config, selected, records, progress, walls)
     write_report(records, out.with_name(f"{config.area.name}_export.csv"))
     source = _require(artefact_path(config, Stage.FETCH), Stage.FETCH)
     write_josm_file(

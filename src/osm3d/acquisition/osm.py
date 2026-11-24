@@ -14,6 +14,7 @@ import math
 import random
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -39,10 +40,53 @@ out meta;
 _AREA_OFFSET = 3_600_000_000
 
 # Instâncias públicas alternativas, usadas se a principal falhar (502/504 são frequentes).
+# Ordem por omissão pelo custo de falhar (2026-11-23): maps.mail.ru responde depressa,
+# mesmo quando ocupado (504); overpass.private.coffee costuma ficar pendurado até ao fim
+# do tempo de leitura (120–150 s), por isso fica em último.
 FALLBACK_OVERPASS_URLS = [
-    "https://overpass.private.coffee/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
 ]
+
+# Saúde de cada servidor neste processo (a aplicação de revisão corre horas): o que
+# respondeu por último vem primeiro; o que ficou pendurado vai para o fim e, durante
+# HUNG_PENALTY_S, só tem SHORT_READ_TIMEOUT_S para responder.
+HUNG_PENALTY_S = 1800.0
+BUSY_PENALTY_S = 120.0
+SHORT_READ_TIMEOUT_S = 30.0
+
+
+@dataclass
+class _Health:
+    last_ok: float = 0.0
+    last_busy: float = 0.0
+    last_hung: float = 0.0
+
+
+_HEALTH: dict[str, _Health] = {}
+
+
+def _health(host: str) -> _Health:
+    return _HEALTH.setdefault(host, _Health())
+
+
+def server_order(urls: list[str], now: float | None = None) -> list[str]:
+    """Servidores pela probabilidade de responderem já (estável para os empates)."""
+    t = time.monotonic() if now is None else now
+
+    def rank(item: tuple[int, str]) -> tuple[int, float, int]:
+        i, url = item
+        h = _HEALTH.get(_host(url), _Health())
+        if h.last_hung and t - h.last_hung < HUNG_PENALTY_S and h.last_hung > h.last_ok:
+            tier = 2  # pendurou há pouco: só no fim
+        elif h.last_busy and t - h.last_busy < BUSY_PENALTY_S and h.last_busy > h.last_ok:
+            tier = 1
+        else:
+            tier = 0
+        return tier, -h.last_ok, i
+
+    return [u for _, u in sorted(enumerate(urls), key=rank)]
+
 
 # Os servidores públicos exigem um User-Agent próprio: sem ele, overpass-api.de responde
 # 406 e overpass.private.coffee 429 (verificado em 2026-11-12). Os browsers também são
@@ -119,7 +163,7 @@ def overpass_post(
     (timeout) sai da rotação. Erros da própria consulta (400) não são repetidos.
     ``validate(resp)`` devolve o resultado ou levanta :class:`OverpassError`.
     """
-    urls = [overpass_url, *[u for u in FALLBACK_OVERPASS_URLS if u != overpass_url]]
+    urls = server_order([overpass_url, *[u for u in FALLBACK_OVERPASS_URLS if u != overpass_url]])
     errors: list[str] = []
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -134,10 +178,16 @@ def overpass_post(
         wait: float | None = None
         for url in list(urls):
             host = _host(url)
+            h = _health(host)
+            hung_recently = (
+                h.last_hung > h.last_ok and time.monotonic() - h.last_hung < HUNG_PENALTY_S
+            )
+            read = min(read_timeout_s, SHORT_READ_TIMEOUT_S) if hung_recently else read_timeout_s
             try:
-                resp = session.post(url, data={"data": query}, timeout=(15, read_timeout_s))
+                resp = session.post(url, data={"data": query}, timeout=(15, read))
             except requests.Timeout:
-                note(f"{host} não respondeu em {read_timeout_s:.0f} s: deixa de ser usado")
+                h.last_hung = time.monotonic()
+                note(f"{host} não respondeu em {read:.0f} s: deixa de ser usado")
                 if len(urls) > 1:
                     urls.remove(url)
                 continue
@@ -145,6 +195,7 @@ def overpass_post(
                 note(f"{host}: {type(exc).__name__}")
                 continue
             if resp.status_code in _BUSY_STATUS:
+                h.last_busy = time.monotonic()
                 note(f"{host} ocupado ({resp.status_code}): a tentar outro servidor")
                 if (ra := _retry_after(resp)) is not None:
                     wait = max(wait or 0, ra)
@@ -155,9 +206,13 @@ def overpass_post(
                 note(f"{host}: HTTP {resp.status_code}")
                 continue
             try:
-                return validate(resp)
+                result = validate(resp)
             except (OverpassError, ValueError) as exc:
                 note(f"{host}: {exc}")
+                continue
+            h.last_ok = time.monotonic()
+            log.info("Overpass: resposta de %s", host)
+            return result
         if rnd + 1 < rounds:
             backoff = base_pause_s * 2**rnd * random.uniform(0.8, 1.2)
             pause = min(MAX_BACKOFF_S, max(backoff, wait or 0))

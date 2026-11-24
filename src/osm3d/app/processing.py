@@ -23,7 +23,6 @@ from osm3d.pipeline import (
     clear_municipal_cache,
     run_stage,
     stage_state,
-    with_municipal,
 )
 
 log = logging.getLogger(__name__)
@@ -79,25 +78,20 @@ class PipelineJob:
         *,
         candidates: bool = False,
         redo_from: Stage | None = None,
-        municipal: bool | None = None,
         refresh_municipal: bool = False,
     ) -> dict[str, Any]:
         """Processa a área: só as fases em falta ou desatualizadas.
 
         ``redo_from``: refazer também essa fase e as seguintes, mesmo que estejam feitas
-        (``fetch`` volta a pedir o OSM ao Overpass). ``municipal``: usar (ou não) a
-        cartografia municipal nos candidatos (``None``: o do config.yaml);
-        ``refresh_municipal``: voltar a obtê-la (refaz os candidatos).
+        (``fetch`` volta a pedir o OSM ao Overpass). ``candidates``: também os edifícios
+        da cartografia municipal em falta no OSM; ``refresh_municipal``: voltar a obtê-la
+        (refaz os candidatos).
         """
         stages = [*DEFAULT_STAGES, *([Stage.CANDIDATES] if candidates else [])]
         if redo_from is not None and redo_from not in stages:
             raise ValueError(f"Fase '{redo_from.value}' não faz parte deste processamento")
         if refresh_municipal and not candidates:
             raise ValueError("A cartografia municipal só é usada na fase dos candidatos")
-        if municipal is not None:
-            cfg = with_municipal(cfg, municipal)
-        if refresh_municipal and not cfg.sources.municipal.enabled:
-            raise ValueError("Ativar a cartografia municipal para a voltar a obter")
         with self._lock:
             if self._thread is not None:
                 raise RuntimeError("Já há um processamento em curso")

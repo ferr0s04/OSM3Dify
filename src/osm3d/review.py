@@ -11,6 +11,7 @@ revisão e o download atual. Nesse caso volta a "pending" e é sinalizada.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +37,7 @@ from osm3d.domain.models import (
     TopologyMode,
 )
 from osm3d.geometry import axis_difference_deg, direction_difference_deg
+from osm3d.geometry_edits import GeometryEdits
 from osm3d.reconstruction.roof_models import LocalFrame
 from osm3d.reconstruction.skeleton import has_skeleton, renders_as_skeleton
 
@@ -159,6 +161,11 @@ class ReviewStore:
             for col in ("archived_at", "parts"):  # bases de dados de versões anteriores
                 if col not in cols:
                     c.execute(f"ALTER TABLE reviews ADD COLUMN {col} TEXT")
+            # Edições de geometria no mapa (landuse do OSM, muros): ver geometry_edits.py.
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS geometry_edits ("
+                " key TEXT PRIMARY KEY, data TEXT NOT NULL, edited_at TEXT NOT NULL)"
+            )
 
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path)
@@ -211,6 +218,25 @@ class ReviewStore:
     def delete(self, osm_key: str) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM reviews WHERE osm_key = ?", (osm_key,))
+
+    def geometry_edits(self) -> GeometryEdits:
+        """Edições de geometria feitas no mapa (landuse e muros)."""
+        with self._conn() as c:
+            rows = c.execute("SELECT key, data FROM geometry_edits").fetchall()
+        return GeometryEdits.from_records({k: json.loads(d) for k, d in rows})
+
+    def save_geometry_edits(self, edits: GeometryEdits) -> None:
+        """Substitui as edições guardadas (só as chaves que mudaram são reescritas)."""
+        new = {k: json.dumps(v) for k, v in edits.records().items()}
+        now = datetime.now(UTC).isoformat()
+        with self._conn() as c:
+            old = dict(c.execute("SELECT key, data FROM geometry_edits").fetchall())
+            gone = [(k,) for k in old.keys() - new.keys()]
+            c.executemany("DELETE FROM geometry_edits WHERE key = ?", gone)
+            c.executemany(
+                "INSERT OR REPLACE INTO geometry_edits (key, data, edited_at) VALUES (?, ?, ?)",
+                [(k, d, now) for k, d in new.items() if old.get(k) != d],
+            )
 
 
 # ------------------------------------------------------------------- correções

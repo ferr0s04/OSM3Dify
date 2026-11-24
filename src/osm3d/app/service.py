@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import math
 from collections import Counter
 from pathlib import Path
@@ -12,7 +14,7 @@ import shapely
 from PIL import ImageColor
 from pydantic import BaseModel, Field, model_validator
 from pyproj import Transformer
-from shapely.geometry import mapping
+from shapely.geometry import LineString, Polygon, mapping
 
 from osm3d.app.points import BUILDING_CLASS, TilePointCache
 from osm3d.appearance.roof_colours import DEFAULT_FACADE_HEX, DEFAULT_ROOF_HEX, PALETTE
@@ -24,24 +26,42 @@ from osm3d.export.mesh import Mesh, roof_mesh, wall_mesh
 from osm3d.export.osm_changes import ChangeSummary, classify_change
 from osm3d.export.osm_xml import has_parts, outline_tags, part_way_tags, plan_export
 from osm3d.export.s3db_tags import TagMerge, merge_tags
+from osm3d.geometry_edits import (
+    ContextIndex,
+    GeometryEdits,
+    is_edited,
+    landuse_ring,
+    reset_landuse,
+    same_position,
+    set_landuse,
+)
+from osm3d.geospatial.orthophoto import OrthoMosaic
 from osm3d.geospatial.point_clouds import index_tiles
 from osm3d.parts import layout_from_polygons, merge_parts, split_part, validate_layout
 from osm3d.pipeline import (
     Stage,
+    accepted_walls,
     area_dir,
     artefact_path,
+    barriers_path,
+    cache_matches,
     context_path,
+    effective_context_path,
+    effective_walls,
     export_area,
+    fetch_area_barriers,
+    is_municipal,
     ortho_files,
     refresh_context,
     review_store_path,
     tag_policy,
+    wall_proposals,
 )
 from osm3d.reconstruction.building import fit_params
 from osm3d.reconstruction.ground import STEP_THRESHOLD_M
-from osm3d.reconstruction.ortho_outline import OrthoMosaic
 from osm3d.reconstruction.parts import fit_layout
 from osm3d.reconstruction.skeleton import has_skeleton, renders_as_skeleton
+from osm3d.reconstruction.walls import WallProposal
 from osm3d.review import (
     BUILDING_TYPES,
     Overrides,
@@ -128,11 +148,12 @@ class ReviewService:
         if self.source is None:
             raise FileNotFoundError("Sem resultados: correr primeiro `osm3d run --to qa`")
         self.base: dict[str, Building] = {b.key: b for b in read_buildings(self.source)}
-        # Edifícios em falta no OSM (fase candidates, opcional): revistos como os outros,
-        # com a chave "new/<id>".
+        # Edifícios da cartografia municipal em falta no OSM (fase candidates, opcional):
+        # revistos como os outros, com a chave "new/<id>". Candidatos só do LiDAR de
+        # artefactos antigos ficam de fora.
         candidates = artefact_path(cfg, Stage.CANDIDATES)
         if candidates.exists():
-            self.base |= {b.key: b for b in read_buildings(candidates)}
+            self.base |= {b.key: b for b in read_buildings(candidates) if is_municipal(b)}
         self.store = ReviewStore(review_store_path(cfg))
         self.reviews: dict[str, Review] = self.store.all()
         self.points = TilePointCache(
@@ -140,6 +161,7 @@ class ReviewService:
         )
         self.policy = tag_policy(cfg)
         self._to_wgs84 = Transformer.from_crs(cfg.processing_crs, "EPSG:4326", always_xy=True)
+        self._to_crs = Transformer.from_crs("EPSG:4326", cfg.processing_crs, always_xy=True)
         self._to_3857 = Transformer.from_crs(cfg.processing_crs, "EPSG:3857", always_xy=True)
         self._scene_origin: tuple[float, float] | None = None
         self._scene_cache: dict[str, dict[str, Any] | None] = {}
@@ -147,9 +169,14 @@ class ReviewService:
         # Contexto OSM (landuse, vias, muros, edifícios) e a topologia dos edifícios novos
         # face a ele, com o modo escolhido na revisão; refeita quando a revisão muda.
         self._env: Surroundings | None = None
-        self._env_mtime: float | None = None
+        self._env_mtime: tuple[str, float] | None = None
         self._topo: dict[str, Building] | None = None
-        self._ctx_geojson: tuple[float, dict[str, Any]] | None = None
+        self._ctx_geojson: tuple[tuple[str, float], dict[str, Any]] | None = None
+        self._walls: tuple[tuple[Any, ...], list[WallProposal]] | None = None
+        # Edições de geometria no mapa (landuse do OSM e muros) e o contexto OSM original
+        # indexado por nós (para editar nós partilhados, como no iD).
+        self.edits: GeometryEdits = self.store.geometry_edits()
+        self._ctx_index: tuple[float, ContextIndex] | None = None
 
     def refresh_points(self) -> None:
         """Volta a indexar os LAZ (ficheiros raw descarregados ou apagados)."""
@@ -174,10 +201,10 @@ class ReviewService:
     # ---------------------------------------------------------- topologia/OSM
 
     def _surroundings(self) -> Surroundings | None:
-        path = context_path(self.cfg)
+        path = effective_context_path(self.cfg, self.edits)
         if not path.exists():
             return None
-        mtime = path.stat().st_mtime
+        mtime = (str(path), path.stat().st_mtime)
         if self._env is None or self._env_mtime != mtime:
             fetched = artefact_path(self.cfg, Stage.FETCH)
             self._env = load_surroundings(path, self.cfg.processing_crs, fetched)
@@ -210,8 +237,9 @@ class ReviewService:
         self._topo = None
 
     def osm_context(self) -> dict[str, Any]:
-        """Landuse, vias, muros/vedações e edifícios do OSM à volta da área (GeoJSON)."""
-        path = context_path(self.cfg)
+        """Landuse, vias, muros/vedações e edifícios do OSM à volta da área (GeoJSON), com as
+        edições de landuse feitas no mapa."""
+        path = effective_context_path(self.cfg, self.edits)
         if not path.exists():
             return {
                 "type": "FeatureCollection",
@@ -220,10 +248,286 @@ class ReviewService:
                 "outdated": True,
                 "missing": ["contexto OSM (correr a fase candidates ou atualizar)"],
             }
-        mtime = path.stat().st_mtime
+        mtime = (str(path), path.stat().st_mtime)
         if self._ctx_geojson is None or self._ctx_geojson[0] != mtime:
             self._ctx_geojson = (mtime, osm_context_geojson(path))
         return self._ctx_geojson[1]
+
+    # ------------------------------------------------------------------ muros
+
+    def walls(self) -> list[WallProposal]:
+        """Propostas de muros, com as edições do mapa (recalculadas quando os muros
+        municipais, o OSM ou as edições mudam)."""
+        b, c = barriers_path(self.cfg), context_path(self.cfg)
+        sig = (
+            b.stat().st_mtime if b.exists() else None,
+            c.stat().st_mtime if c.exists() else None,
+            self.edits.signature(),
+        )
+        if self._walls is None or self._walls[0] != sig:
+            self._walls = (sig, effective_walls(self.cfg, self.edits))
+        return self._walls[1]
+
+    def _wall(self, key: str) -> WallProposal:
+        for w in self.walls():
+            if w.key == key:
+                return w
+        raise NotFound(key)
+
+    def _wall_status(self, key: str) -> tuple[ReviewStatus, bool]:
+        r = self.reviews.get(key)
+        return (r.status, r.archived) if r else ("pending", False)
+
+    def walls_info(self) -> dict[str, Any]:
+        """Estado das fontes dos muros, avisos de dados em falta e contagens."""
+        from osm3d.acquisition.municipal import barriers_meta
+
+        m = self.cfg.sources.municipal
+        path = barriers_path(self.cfg)
+        warnings = []
+        if not m.barriers:
+            warnings.append(
+                "Sem camadas de muros do geoportal configuradas (sources.municipal.barriers)."
+            )
+        elif not path.exists():
+            warnings.append('Muros municipais por obter: usar "obter do geoportal".')
+        elif not cache_matches(path, self.cfg.area.tiles):
+            warnings.append("Os muros municipais são de outras quadrículas: obter de novo.")
+        ctx = self.osm_context()
+        if ctx["missing"]:
+            warnings.append(
+                "Contexto OSM sem " + ", ".join(ctx["missing"]) + ": os muros já mapeados no "
+                "OSM não são excluídos e o landuse pode faltar. Atualizar as camadas OSM."
+            )
+        meta = barriers_meta(path) if path.exists() else {}
+        counts: Counter[str] = Counter()
+        for w in self.walls():
+            status, archived = self._wall_status(w.key)
+            counts["archived" if archived else status] += 1
+        return {
+            "configured": bool(m.barriers),
+            "source": m.name,
+            "layers": [layer.label or layer.feature_class for layer in m.barriers],
+            "fetched": path.exists(),
+            "fetched_at": meta.get("fetched_at"),
+            "warnings": warnings,
+            "counts": dict(counts),
+        }
+
+    def walls_geojson(self) -> dict[str, Any]:
+        """Muros propostos (linhas) e os limites de landuse que passam para eles."""
+
+        def wgs(g: Any) -> Any:
+            return shapely.transform(
+                g, lambda c: np.column_stack(self._to_wgs84.transform(c[:, 0], c[:, 1]))
+            )
+
+        feats: list[dict[str, Any]] = []
+        for w in self.walls():
+            status, archived = self._wall_status(w.key)
+            props = {
+                "key": w.key,
+                "kind": "wall",
+                "status": status,
+                "archived": archived,
+                "barrier": w.tags.get("barrier"),
+                "layer": w.layer,
+                "length": round(w.geometry.length, 1),
+                "landuse": len(w.runs),
+            }
+            feats.append(
+                {
+                    "type": "Feature",
+                    "id": len(feats),
+                    "geometry": mapping(wgs(w.geometry)),
+                    "properties": props,
+                }
+            )
+            for r in w.runs:
+                feats.append(
+                    {
+                        "type": "Feature",
+                        "id": len(feats),
+                        "geometry": mapping(wgs(r.edge)),
+                        "properties": {
+                            "key": w.key,
+                            "kind": "edge",
+                            "status": status,
+                            "archived": archived,
+                            "offset": round(r.max_offset_m, 2),
+                        },
+                    }
+                )
+        return {"type": "FeatureCollection", "features": feats}
+
+    def wall_detail(self, key: str) -> dict[str, Any]:
+        w = self._wall(key)
+        status, archived = self._wall_status(key)
+        review = self.reviews.get(key)
+        c = w.geometry.interpolate(0.5, normalized=True)
+        lon, lat = self._to_wgs84.transform(c.x, c.y)
+        x0, y0, x1, y1 = w.geometry.bounds
+        (w0, e0), (s0, n0) = self._to_wgs84.transform([x0, x1], [y0, y1])
+        xs, ys = self._to_wgs84.transform(*np.asarray(w.geometry.coords).T)
+        return {
+            "key": key,
+            "status": status,
+            "archived": archived,
+            "note": review.note if review else None,
+            "tags": w.tags,
+            "coords": [[round(x, 8), round(y, 8)] for x, y in zip(xs, ys, strict=True)],
+            "edited": key in self.edits.walls,
+            "layer": w.layer,
+            "sources": w.sources,
+            "length": round(w.geometry.length, 1),
+            "center": [lon, lat],
+            "bbox": [w0, s0, e0, n0],
+            "runs": [
+                {
+                    "label": r.label,
+                    "length": round(r.end_m - r.start_m, 1),
+                    "max_offset": round(r.max_offset_m, 2),
+                }
+                for r in w.runs
+            ],
+        }
+
+    def save_wall_review(self, key: str, status: ReviewStatus, note: str | None) -> dict[str, Any]:
+        self._wall(key)
+        review = Review(osm_key=key, osm_version=0, status=status, note=note or None)
+        self.store.save(review)
+        self.reviews[key] = review
+        return self.wall_detail(key)
+
+    def reset_wall_review(self, key: str) -> dict[str, Any]:
+        self._wall(key)
+        self.store.delete(key)
+        self.reviews.pop(key, None)
+        return self.wall_detail(key)
+
+    # ------------------------------------------------------ edições de geometria
+
+    def _save_edits(self, edits: GeometryEdits) -> None:
+        self.store.save_geometry_edits(edits)
+        self.edits = edits
+        self._topology_changed()
+
+    def save_wall_geometry(self, key: str, coords: list[tuple[float, float]]) -> dict[str, Any]:
+        """Muro com a geometria editada no mapa (lon, lat)."""
+        details: dict[str, dict[str, Any]] = self.save_walls_geometry({key: coords})["details"]
+        return details[key]
+
+    def save_walls_geometry(self, walls: dict[str, list[tuple[float, float]]]) -> dict[str, Any]:
+        """Vários muros editados de uma vez (p.ex. um vértice que os liga, movido no mapa).
+
+        Um muro que volta à geometria municipal deixa de estar editado.
+        """
+        base = {w.key: w.geometry for w in wall_proposals(self.cfg)}
+        edits = copy.deepcopy(self.edits)
+        for key, coords in walls.items():
+            if key not in base:
+                raise NotFound(key)
+            line = self._line_in_crs(coords)
+            if len(coords) < 2 or line.length < 0.5:
+                raise ValueError(f"{key}: um muro precisa de pelo menos 2 vértices (e 0,5 m)")
+            orig = np.asarray(base[key].coords)
+            now = np.asarray(line.coords)
+            if orig.shape == now.shape and np.abs(orig - now).max() < 0.001:
+                edits.walls.pop(key, None)
+            else:
+                edits.walls[key] = [(float(x), float(y)) for x, y in coords]
+        self._save_edits(edits)
+        return {"details": {k: self.wall_detail(k) for k in walls}}
+
+    def reset_wall_geometry(self, key: str) -> dict[str, Any]:
+        self._wall(key)
+        edits = copy.deepcopy(self.edits)
+        edits.walls.pop(key, None)
+        self._save_edits(edits)
+        return self.wall_detail(key)
+
+    def _line_in_crs(self, coords: list[tuple[float, float]]) -> LineString:
+        xs, ys = self._to_crs.transform([c[0] for c in coords], [c[1] for c in coords])
+        return LineString(list(zip(xs, ys, strict=True)))
+
+    def _context_index(self) -> ContextIndex:
+        path = context_path(self.cfg)
+        if not path.exists():
+            raise NotFound("contexto OSM")
+        mtime = path.stat().st_mtime
+        if self._ctx_index is None or self._ctx_index[0] != mtime:
+            self._ctx_index = (mtime, ContextIndex.of(json.loads(path.read_text(encoding="utf-8"))))
+        return self._ctx_index[1]
+
+    def landuse_detail(self, way_id: int) -> dict[str, Any]:
+        """Landuse do OSM editável no mapa: o anel (com as edições) e os nós partilhados."""
+        ctx = self._context_index()
+        if not ctx.is_landuse(way_id):
+            raise NotFound(f"way/{way_id} (landuse)")
+        ring = landuse_ring(ctx, self.edits, way_id)
+        shared: dict[str, list[str]] = {}
+        for nid, _, _ in ring:
+            if nid is None:
+                continue
+            others = [w for w in ctx.parents(nid) if w != way_id]
+            if others:
+                shared[str(nid)] = [_way_label(w, ctx.tags[w]) for w in others]
+        lons, lats = [n[1] for n in ring], [n[2] for n in ring]
+        tags = ctx.tags[way_id]
+        return {
+            "key": f"way/{way_id}",
+            "id": way_id,
+            "label": _way_label(way_id, tags),
+            "tags": tags,
+            "nodes": [[n[0], round(n[1], 8), round(n[2], 8)] for n in ring],
+            "shared": shared,
+            "edited": is_edited(ctx, self.edits, way_id),
+            "osm_url": f"https://www.openstreetmap.org/way/{way_id}",
+            "bbox": [min(lons), min(lats), max(lons), max(lats)],
+        }
+
+    def save_landuse(
+        self, way_id: int, nodes: list[tuple[int | None, float, float]]
+    ) -> dict[str, Any]:
+        """Landuse editado no mapa: nós movidos (em todas as ways que os usam), novos ou
+        tirados. Devolve o detalhe e as outras ways que mudaram (nós partilhados)."""
+        ctx = self._context_index()
+        if not ctx.is_landuse(way_id):
+            raise NotFound(f"way/{way_id} (landuse)")
+        ring = [(None if n is None else int(n), float(x), float(y)) for n, x, y in nodes]
+        if len(ring) >= 2 and ring[0][0] is not None and ring[0][0] == ring[-1][0]:
+            ring = ring[:-1]  # anel fechado: o primeiro nó não se repete
+        ids = [n for n, _, _ in ring if n is not None]
+        if len(ids) != len(set(ids)):
+            raise ValueError("O mesmo nó aparece duas vezes no anel")
+        poly = (
+            Polygon(self._line_in_crs([(x, y) for _, x, y in ring]).coords)
+            if len(ring) >= 3
+            else None
+        )
+        if poly is None or not poly.is_valid or poly.area < 1.0:
+            raise ValueError(
+                "Geometria inválida: o landuse precisa de 3 vértices e não se pode cruzar"
+            )
+        before = landuse_ring(ctx, self.edits, way_id)
+        old = {n: (x, y) for n, x, y in before if n is not None}
+        moved = {n for n, x, y in ring if n in old and not same_position(old[n], (x, y))}
+        self._save_edits(set_landuse(ctx, self.edits, way_id, ring))
+        changed = sorted({w for n in moved for w in ctx.parents(n)} - {way_id})
+        return self.landuse_detail(way_id) | {"changed": [f"way/{w}" for w in changed]}
+
+    def reset_landuse(self, way_id: int) -> dict[str, Any]:
+        ctx = self._context_index()
+        if not ctx.is_landuse(way_id):
+            raise NotFound(f"way/{way_id} (landuse)")
+        self._save_edits(reset_landuse(ctx, self.edits, way_id))
+        return self.landuse_detail(way_id)
+
+    def fetch_walls(self) -> dict[str, Any]:
+        """Volta a obter os muros municipais da área (geoportal)."""
+        fetch_area_barriers(self.cfg, force=True)
+        self._walls = None
+        return self.walls_info()
 
     def refresh_osm_context(self) -> dict[str, Any]:
         """Volta a pedir o contexto OSM ao Overpass (p.ex. depois de editar no OSM)."""
@@ -271,15 +575,8 @@ class ReviewService:
             "n_conflicts": len(change.conflicts),
             "osm_parts": change.osm_parts,
             "key": b.key,
-            "candidate": b.osm_type == "new",  # em falta no OSM, detetado no LiDAR
-            # Origem do contorno do candidato: cartografia municipal ou LiDAR/ortofoto.
-            "candidate_source": (
-                None
-                if b.osm_type != "new"
-                else "municipal"
-                if "municipal_gid" in b.diagnostics
-                else "lidar"
-            ),
+            "candidate": b.osm_type == "new",  # da cartografia municipal, em falta no OSM
+            "candidate_source": "municipal" if b.osm_type == "new" else None,
             "building_type": b.existing_tags.get("building"),
             "status": b.review_status,
             "archived": b.review_archived,
@@ -941,18 +1238,30 @@ class ReviewService:
         }
 
     def export(self) -> dict[str, Any]:
-        path, selected, records, topo = export_area(self.cfg, self.all_buildings())
+        walls = accepted_walls(self.cfg, self.reviews)
+        path, selected, records, topo = export_area(self.cfg, self.all_buildings(), walls=walls)
         return {
             "path": str(Path(path).resolve()),
             "exported": selected,
             "conflicts": sum(bool(r.conflicts) for r in records),
             # Edifícios novos: recortes, landuse/edifícios do OSM ajustados e conflitos que
             # ficam (pormenor no relatório CSV).
-            "trimmed": topo.result.trimmed if topo else 0,
+            "trimmed": topo.result.trimmed if topo and topo.result else 0,
             "osm_adjusted": topo.ways_adjusted if topo else 0,
-            "topology_conflicts": (topo.result.conflicts + topo.not_adjusted) if topo else 0,
+            "topology_conflicts": (
+                (topo.result.conflicts if topo.result else 0) + topo.not_adjusted if topo else 0
+            ),
+            "walls": topo.walls if topo else 0,
             "topology": topo.summary() if topo else None,
         }
+
+
+def _way_label(way_id: int, tags: dict[str, str]) -> str:
+    """ "landuse=residential (way/123)" (a primeira tag que diz o que a way é)."""
+    for key in ("landuse", "highway", "barrier", "building", "natural", "leisure", "amenity"):
+        if key in tags:
+            return f"{key}={tags[key]} (way/{way_id})"
+    return f"way/{way_id}"
 
 
 def _context_kind(tags: dict[str, str]) -> tuple[str, str] | None:
@@ -1003,6 +1312,10 @@ def osm_context_geojson(path: Path) -> dict[str, Any]:
                     "id": f"{el['type']}/{el['id']}",
                     "name": tags.get("name"),
                     "crossing": kind == "highway" and blocks_buildings(tags),
+                    # Nós do OSM de cada vértice (ways): para ligar um landuse editado a eles.
+                    "nodes": [n if n > 0 else None for n in el.get("nodes", [])]
+                    if el["type"] == "way"
+                    else None,
                 },
             }
         )

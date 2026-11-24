@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>osm3d — Revisão</title>
+  <title>OSM3Dify</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
   <link rel="stylesheet" href="/static/style.css">
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
@@ -18,7 +19,7 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">osm3d <span class="muted">revisão</span> <span id="area-name" class="chip"></span></div>
+    <div class="brand"><img class="logo" src="/static/favicon.svg" alt="">OSM3Dify <span id="area-name" class="chip"></span></div>
     <nav class="tabs">
       <button class="tab active" data-tab="review">Revisão</button>
       <button class="tab" data-tab="results">Resultados</button>
@@ -40,69 +41,63 @@
 
     <section class="map-pane">
       <div id="map"></div>
-      <!-- Filtros e controlos do mapa numa só coluna: nunca se sobrepõem. -->
+      <!-- Uma só barra: pesquisa, filtros da lista, cor, camadas do mapa e 3D. A revisão é dos
+           edifícios da cartografia municipal; os do OSM são uma camada ("Camadas"). -->
       <div class="map-toolbar">
       <div class="filterbar" id="filterbar">
-        <input id="f-search" type="search" placeholder="id OSM…" title="Procurar por id OSM">
-        <!-- Dropdowns multi-seleção (nada marcado = todos). -->
-        <details class="msel" data-group="origin" data-label="origem" title="Edifícios do OSM ou em falta no OSM (contorno municipal ou do LiDAR)">
+        <input id="f-search" type="search" placeholder="id…" title="Procurar por id">
+        <details class="msel" id="f-menu" title="Filtros da lista e do mapa (nada marcado num grupo = todos)">
           <summary></summary>
           <div class="msel-menu">
-            <label><input type="checkbox" value="osm"> do OSM</label>
-            <label title="Contorno da cartografia municipal, confirmado pelo LiDAR"><input type="checkbox" value="municipal"> novo: cartografia municipal</label>
-            <label title="Só no LiDAR/ortofoto (com a cartografia ativa: não consta dela)"><input type="checkbox" value="lidar"> novo: só LiDAR</label>
+            <div class="fgroup" data-group="status" data-label="estado">
+              <div class="fgroup-title">estado</div>
+              <label><input type="checkbox" value="pending" checked> por rever</label>
+              <label><input type="checkbox" value="accepted"> aceites</label>
+              <label><input type="checkbox" value="rejected"> rejeitados</label>
+            </div>
+            <div class="fgroup" data-group="extra" data-label="mais">
+              <div class="fgroup-title">mais</div>
+              <label title="Só edifícios com sinalizações (rever primeiro)"><input type="checkbox" value="flagged"> só sinalizados</label>
+              <label title="Mostrar aceites já submetidos e rejeitados arquivados"><input type="checkbox" value="archived"> incluir arquivados</label>
+            </div>
           </div>
         </details>
-        <details class="msel" data-group="change" data-label="relação OSM" title="O que a análise muda no OSM">
-          <summary></summary>
+        <select id="m-color" title="Colorir os edifícios por">
+          <option value="real">Cor: cores reais</option>
+          <option value="status">Cor: estado da revisão</option>
+          <option value="shape">Cor: forma do telhado</option>
+        </select>
+        <details class="msel mlayers" id="m-layers" title="Camadas do mapa: muros propostos, OSM e fundo">
+          <summary>Camadas</summary>
           <div class="msel-menu">
-            <label><input type="checkbox" value="novo"> novo (sem 3D)</label>
-            <label><input type="checkbox" value="complementa"> complementa</label>
-            <label><input type="checkbox" value="diverge"> diverge</label>
-            <label><input type="checkbox" value="igual"> igual</label>
+            <div class="fgroup" id="m-walls">
+              <div class="fgroup-title">muros propostos <span id="m-walls-count"></span></div>
+              <label><input type="checkbox" value="pending" checked> por rever</label>
+              <label><input type="checkbox" value="accepted" checked> aceites</label>
+              <label><input type="checkbox" value="rejected"> rejeitados</label>
+              <label><input type="checkbox" value="archived"> arquivados</label>
+              <button class="btn mini-light" id="m-walls-fetch" type="button" title="Voltar a obter os muros e vedações do geoportal municipal">obter do geoportal</button>
+              <div class="small muted" id="m-walls-info"></div>
+            </div>
+            <div class="fgroup" id="m-osm">
+              <div class="fgroup-title">OSM</div>
+              <label><input type="checkbox" value="landuse" checked> landuse</label>
+              <label><input type="checkbox" value="highway" checked> vias</label>
+              <label><input type="checkbox" value="barrier" checked> muros e vedações</label>
+              <label><input type="checkbox" value="building" checked> edifícios do OSM</label>
+              <button class="btn mini-light" id="m-osm-refresh" type="button" title="Voltar a obter landuse, vias, muros e edifícios do Overpass">atualizar do OSM</button>
+              <div class="small muted" id="m-osm-date"></div>
+            </div>
+            <div class="fgroup">
+              <select id="m-base" title="Fundo do mapa"><option value="osm">mapa OSM</option></select>
+            </div>
           </div>
         </details>
-        <details class="msel" data-group="status" data-label="estado" title="Estado da revisão">
-          <summary></summary>
-          <div class="msel-menu">
-            <label><input type="checkbox" value="pending"> por rever</label>
-            <label><input type="checkbox" value="accepted"> aceites</label>
-            <label><input type="checkbox" value="rejected"> rejeitados</label>
-          </div>
-        </details>
-        <details class="msel" data-group="extra" data-label="mais" title="Sinalizados e arquivados">
-          <summary></summary>
-          <div class="msel-menu">
-            <label title="Só edifícios com sinalizações (rever primeiro)"><input type="checkbox" value="flagged"> só sinalizados</label>
-            <label title="Mostrar aceites já submetidos e rejeitados arquivados"><input type="checkbox" value="archived"> incluir arquivados</label>
-          </div>
-        </details>
-        <button class="btn mini-light" id="f-clear" title="Limpar todos os filtros">✕</button>
+        <label class="check"><input id="m-3d" type="checkbox"> 3D</label>
+        <button class="btn mini-light" id="f-default" title="Filtros por omissão: por rever">↺</button>
+        <button class="btn mini-light" id="f-clear" title="Limpar os filtros (mostrar todos)">✕</button>
         <span id="f-count" class="muted small"></span>
         <span class="hint small muted" title="J/K seguinte/anterior · A aceitar · R rejeitar · U repor"><kbd>J</kbd>/<kbd>K</kbd></span>
-      </div>
-      <div class="map-controls">
-        <select id="m-color" title="Colorir por">
-          <option value="real">Cor: cores reais (roof:colour)</option>
-          <option value="change">Cor: alterações ao OSM</option>
-          <option value="status">Cor: estado da revisão</option>
-          <option value="match">Cor: concordância com OSM</option>
-          <option value="shape">Cor: forma do telhado (análise)</option>
-          <option value="origin">Cor: origem (OSM / municipal / LiDAR)</option>
-        </select>
-        <label class="check"><input id="m-3d" type="checkbox"> 3D</label>
-        <details class="msel mlayers" id="m-osm" title="Elementos do OSM à volta dos edifícios (contexto da fase candidates)">
-          <summary>camadas OSM</summary>
-          <div class="msel-menu">
-            <label><input type="checkbox" value="landuse" checked> landuse</label>
-            <label><input type="checkbox" value="highway" checked> vias</label>
-            <label><input type="checkbox" value="barrier" checked> muros e vedações</label>
-            <label><input type="checkbox" value="building" checked> edifícios do OSM</label>
-            <button class="btn mini-light" id="m-osm-refresh" type="button" title="Voltar a obter landuse, vias, muros e edifícios do Overpass">atualizar do OSM</button>
-            <div class="small muted" id="m-osm-date"></div>
-          </div>
-        </details>
-        <select id="m-base" title="Fundo do mapa"><option value="osm">Fundo: mapa OSM</option></select>
       </div>
       </div>
       <div id="legend" class="legend"></div>

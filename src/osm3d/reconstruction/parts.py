@@ -33,7 +33,7 @@ from osm3d.geospatial.point_clouds import PointSet
 from osm3d.reconstruction.roof_fitting import FitParams, fit_roof
 
 if TYPE_CHECKING:
-    from osm3d.reconstruction.ortho_outline import OrthoMosaic
+    from osm3d.geospatial.orthophoto import OrthoMosaic
 
 MIN_PART_POINTS = 20
 

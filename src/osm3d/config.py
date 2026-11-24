@@ -119,6 +119,28 @@ class PathsConfig(BaseModel):
         return self.areas_file or self.processed.parent / "areas.json"
 
 
+class BarrierRule(BaseModel):
+    """Linhas da camada com estes atributos (todos) → estas tags OSM."""
+
+    match: dict[str, str] = Field(default_factory=dict)
+    tags: dict[str, str]
+
+
+class BarrierLayer(BaseModel):
+    """Camada de muros/vedações do geoportal (linhas). A primeira regra que bate manda."""
+
+    label: str = ""  # p.ex. "cartografia 2024" (mostrado na aplicação)
+    feature_class: str
+    filter: str = ""
+    rules: list[BarrierRule] = Field(default_factory=list)
+
+    def tags_for(self, attrs: dict[str, str | None]) -> dict[str, str] | None:
+        for rule in self.rules:
+            if all((attrs.get(k) or "") == v for k, v in rule.match.items()):
+                return dict(rule.tags) or None
+        return None
+
+
 class MunicipalSourceConfig(BaseModel):
     """Cartografia municipal de edifícios (geoportal MapGuide), para os candidatos.
 
@@ -140,6 +162,9 @@ class MunicipalSourceConfig(BaseModel):
     # localmente em vez de pedirem ao geoportal. Pedidos de 1 km (~700 polígonos cada).
     cache_dir: Path = Path("data/raw/municipal")
     full_chunk_m: float = Field(default=1000.0, gt=10, le=1000)
+    # Muros e vedações (linhas), para as propostas de barrier=wall. Por prioridade: onde
+    # duas camadas têm o mesmo muro, fica o da primeira (p.ex. a cartografia mais recente).
+    barriers: list[BarrierLayer] = Field(default_factory=list)
 
     @property
     def configured(self) -> bool:

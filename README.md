@@ -1,4 +1,4 @@
-# OSM 3D Building Generator
+# OSM3Dify
 
 Gera representações 3D simplificadas de edifícios para o OpenStreetMap — no estilo
 do F4 Map — a partir de LiDAR, modelos digitais de terreno e ortofotos.

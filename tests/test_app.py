@@ -266,7 +266,9 @@ def test_osm_change_and_colours(client: TestClient) -> None:
 
 def test_frontend_served(client: TestClient) -> None:
     html = client.get("/").text
-    assert "osm3d" in html and "/static/app.js" in html
+    assert "OSM3Dify" in html and "/static/app.js" in html
+    assert 'href="/static/favicon.svg"' in html
+    assert client.get("/static/favicon.svg").headers["content-type"] == "image/svg+xml"
     js = client.get("/static/app.js")
     assert js.status_code == 200
     # Frontend sempre revalidado: evita misturar módulos antigos e novos após atualizações.
@@ -278,8 +280,10 @@ def test_frontend_served(client: TestClient) -> None:
 def test_candidates_reviewed_and_exported_as_new_ways(tmp_path: Path) -> None:
     client = TestClient(_app_with_candidate(tmp_path))
     rows = {r["key"]: r for r in client.get("/api/buildings").json()}
-    key = next(k for k in rows if k.startswith("new/"))
+    assert [k for k in rows if k.startswith("new/")] == ["new/123456"]
+    key = "new/123456"
     assert rows[key]["candidate"] and not rows["way/10"]["candidate"]
+    assert rows[key]["candidate_source"] == "municipal"
     gj = client.get("/api/buildings.geojson").json()
     assert any(f["properties"]["candidate"] for f in gj["features"])
 
@@ -338,9 +342,14 @@ def _app_with_candidate(tmp_path: Path) -> FastAPI:
         existing_tags={"building": "yes"},
         qa_flags=[QAFlag(code="missing_in_osm", message="teste", severity="info")],
         parts=[make_part(RoofShape.GABLED).model_copy(update={"geometry": fp})],
+        diagnostics={"municipal_gid": 7.0},
         **upd,
     )
-    write_buildings([cand], artefact_path(cfg, Stage.CANDIDATES), cfg.processing_crs)
+    # Candidato só do LiDAR de um artefacto antigo: fica fora da revisão e da exportação.
+    old = cand.model_copy(
+        update={"osm_id": 654321, "footprint": affinity.translate(fp, 40, 0), "diagnostics": {}}
+    )
+    write_buildings([cand, old], artefact_path(cfg, Stage.CANDIDATES), cfg.processing_crs)
     return create_app(cfg)
 
 

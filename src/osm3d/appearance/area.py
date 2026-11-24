@@ -62,7 +62,7 @@ def colour_area(
     with ExitStack() as stack:
         ortho = None
         if ortho_paths:
-            from osm3d.reconstruction.ortho_outline import OrthoMosaic
+            from osm3d.geospatial.orthophoto import OrthoMosaic
 
             ortho = stack.enter_context(OrthoMosaic(ortho_paths))
         for tile, idxs in sorted(by_tile.items()):

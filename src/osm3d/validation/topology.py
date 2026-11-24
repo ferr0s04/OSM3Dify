@@ -252,7 +252,10 @@ def _trim(
 
 
 def adjusted_feature(
-    geom: BaseGeometry, obstacles: list[tuple[Polygon, bool]], rules: TopologyRules
+    geom: BaseGeometry,
+    obstacles: list[tuple[Polygon, bool]],
+    rules: TopologyRules,
+    max_width_m: float | None = None,
 ) -> Polygon | None:
     """Polígono de um elemento do OSM ajustado: inclui (``True``) ou exclui os obstáculos.
 
@@ -265,7 +268,8 @@ def adjusted_feature(
         return None
     if len(out.interiors) != len(getattr(geom, "interiors", [])):
         return None
-    if not is_sliver(geom.symmetric_difference(out), rules.max_trim_m + 2 * rules.clearance_m):
+    width = max_width_m or rules.max_trim_m + 2 * rules.clearance_m
+    if not is_sliver(geom.symmetric_difference(out), width):
         return None
     return out
 
@@ -279,6 +283,8 @@ class Adjustment:
     obstacle: Polygon  # edifício + folga, no CRS de processamento
     include: bool  # o landuse passa a contornar o edifício por fora (fica dentro dele)
     description: str
+    # Largura máxima da mudança (muros: o limite pode estar a 2 m); None = a das regras.
+    max_width_m: float | None = None
 
     @property
     def group(self) -> tuple[str, str]:

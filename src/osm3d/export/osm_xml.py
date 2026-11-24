@@ -380,6 +380,8 @@ def write_josm_file(
         root.append(ways[key])
     for el in new_ways:
         root.append(el)
+    for el in edits.new_ways if edits is not None else []:
+        root.append(el)
     for key in sorted(relations):
         root.append(relations[key])
     ET.indent(root)

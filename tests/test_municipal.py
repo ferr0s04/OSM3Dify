@@ -15,9 +15,8 @@ from osm3d.acquisition.municipal import (
     parse_features,
 )
 from osm3d.config import MunicipalSourceConfig
-from osm3d.domain.models import Building
 from osm3d.geospatial.point_clouds import PointSet
-from osm3d.reconstruction.candidates import _TileContext, candidate_id, merge_municipal
+from osm3d.reconstruction.candidates import _TileContext, municipal_candidates
 
 
 def _source(**kwargs: Any) -> MunicipalSourceConfig:
@@ -97,12 +96,7 @@ def _grid(poly: Any, step: float = 0.3) -> np.ndarray:
     return np.column_stack([xs.ravel(), ys.ravel()])
 
 
-def _lidar_candidate(poly: Any) -> Building:
-    c = poly.centroid
-    return Building(osm_type="new", osm_id=candidate_id(c.x, c.y), osm_version=0, footprint=poly)
-
-
-def test_merge_municipal(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_municipal_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cand_mod, "sample_ground_elevation", lambda *a, **k: 0.0)
     house, shed = box(0, 0, 10, 8), box(10, 0, 14, 4)
     gone = box(40, 40, 50, 50)  # demolido: sem pontos LiDAR
@@ -115,30 +109,24 @@ def test_merge_municipal(monkeypatch: pytest.MonkeyPatch) -> None:
         MunicipalBuilding(4, pool, "Piscinas"),
         MunicipalBuilding(5, in_osm, "Vivenda Casa"),
     ]
-    recent = box(20, 20, 28, 28)  # só no LiDAR: construção recente
+    recent = box(20, 20, 28, 28)  # só no LiDAR: não há candidatos só do LiDAR
     pts = np.vstack([_grid(house), _grid(shed), _grid(recent), _grid(in_osm)])
     ctx = _ctx(pts, 5.0, osm=[in_osm])
-    # Candidato LiDAR que junta casa + anexo (encostados): substituído pelos municipais.
-    lidar = [_lidar_candidate(box(0, 0, 14, 8)), _lidar_candidate(recent)]
-    cfg = _source(enabled=True)
-    out, stats = merge_municipal(ctx, lidar, municipal, (0.0, 0.0), cfg)
+    out, stats = municipal_candidates(ctx, municipal, (0.0, 0.0), _source(enabled=True))
     assert stats.from_municipal == 2 and stats.without_lidar == 1
-    assert stats.replaced == 1 and stats.not_in_municipal == 1
-    tags = sorted(b.existing_tags["building"] for b in out if "municipal_gid" in b.diagnostics)
-    assert tags == ["house", "shed"]
+    assert sorted(b.existing_tags["building"] for b in out) == ["house", "shed"]
+    assert all("municipal_gid" in b.diagnostics for b in out)
     muni = next(b for b in out if b.diagnostics.get("municipal_gid") == 1.0)
     assert muni.existing_tags == {"building": "house"}  # sem tag source
     assert muni.footprint.equals(house)
-    only_lidar = next(b for b in out if "municipal_gid" not in b.diagnostics)
-    assert "not_in_municipal" in {f.code for f in only_lidar.qa_flags}
 
 
-def test_merge_municipal_needs_height(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_municipal_candidates_need_height(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cand_mod, "sample_ground_elevation", lambda *a, **k: 4.5)
     house = box(0, 0, 10, 8)
     ctx = _ctx(_grid(house), 5.0)  # 0,5 m acima do terreno: muro/sebe, não edifício
-    out, stats = merge_municipal(
-        ctx, [], [MunicipalBuilding(1, house, "Vivenda Casa")], (0.0, 0.0), MunicipalSourceConfig()
+    out, stats = municipal_candidates(
+        ctx, [MunicipalBuilding(1, house, "Vivenda Casa")], (0.0, 0.0), MunicipalSourceConfig()
     )
     assert out == [] and stats.without_lidar == 1
 

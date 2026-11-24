@@ -81,7 +81,9 @@ const state = {
 };
 
 const viewer = new Viewer($("#viewer"));
-const map = new BuildingMap("map", $("#legend"), (key) => select(key));
+const map = new BuildingMap("map", $("#legend"), (key) => select(key), (key) => selectWall(key));
+map.onSelectLanduse = (key) => selectLanduse(key);
+map.onEditCommit = (target, coords, ids, others) => commitEdit(target, coords, ids, others);
 const dataView = new DataView({ mapEl: $("#data-map"), panelEl: $("#data-panel"), hoverEl: $("#data-hover"), baseEl: $("#d-base"), toast: (m, ms) => toast(m, ms) });
 
 function toast(msg, ms = 3500) {
@@ -101,38 +103,33 @@ function priority(r) {
 }
 
 function chosen(group) {
-  // Opções marcadas num dropdown de filtros (nenhuma = todos).
-  return new Set([...document.querySelectorAll(`.msel[data-group="${group}"] input:checked`)].map((i) => i.value));
+  // Opções marcadas num grupo de filtros (nenhuma = todos).
+  return new Set([...document.querySelectorAll(`#f-menu [data-group="${group}"] input:checked`)].map((i) => i.value));
 }
 
 function renderFilterLabels() {
-  // Texto de cada dropdown: "estado: todos", "estado: aceites", "estado: 2 de 3".
-  document.querySelectorAll(".msel:not(.mlayers)").forEach((d) => {
-    const boxes = [...d.querySelectorAll("input")];
-    const on = boxes.filter((b) => b.checked);
-    const names = on.map((b) => b.parentElement.textContent.trim());
-    const value = !on.length ? (d.dataset.group === "extra" ? "—" : "todos") : on.length === 1 ? names[0] : `${on.length} de ${boxes.length}`;
-    d.querySelector("summary").innerHTML = `<span class="flabel">${d.dataset.label}</span> ${value}`;
-    d.classList.toggle("on", on.length > 0);
-    d.dataset.hint ??= d.title;
-    d.title = on.length ? `${d.dataset.label}: ${names.join(", ")}` : d.dataset.hint;
-  });
+  // Resumo do menu "Filtros": o que está ativo ("Filtros: por rever, só sinalizados").
+  const menu = $("#f-menu");
+  const names = [...menu.querySelectorAll("input:checked")].map((b) => b.parentElement.textContent.trim());
+  menu.querySelector("summary").innerHTML = `<span class="flabel">Filtros</span> ${names.length ? esc(names.join(", ")) : "todos"}`;
+  menu.classList.toggle("on", names.length > 0);
 }
+
+// Só os edifícios da cartografia municipal (em falta no OSM) se revêem; os do OSM são
+// uma camada do mapa ("Camadas" → edifícios do OSM).
+const municipalRows = (rows) => rows.filter((r) => r.candidate);
+const municipalGeojson = (gj) => ({ ...gj, features: gj.features.filter((f) => f.properties.candidate) });
 
 function applyFilters() {
   renderFilterLabels();
   const q = $("#f-search").value.trim();
-  const change = chosen("change");
   const status = chosen("status");
-  const origin = chosen("origin");
   const extra = chosen("extra");
   const flagged = extra.has("flagged");
   const showArchived = extra.has("archived");
   const rows = state.rows.filter(
     (r) =>
       (!q || r.key.includes(q)) &&
-      (!origin.size || origin.has(r.candidate ? r.candidate_source ?? "lidar" : "osm")) &&
-      (!change.size || change.has(r.change)) &&
       (!status.size || status.has(r.status)) &&
       (!flagged || r.needs_review) &&
       (showArchived || !r.archived),
@@ -141,6 +138,69 @@ function applyFilters() {
   state.filtered = rows.sort((a, b) => priority(a) - priority(b));
   $("#f-count").textContent = `${rows.length} de ${state.rows.length}`;
   map.setVisibleKeys(new Set(rows.map((r) => r.key)));
+  scheduleSaveFilters();
+}
+
+// ------------------------------------------------------- filtros guardados
+
+// Todos os filtros (barra, cor do mapa, muros e camadas OSM) numa só chave do
+// localStorage: lida uma vez ao arrancar e escrita no máximo uma vez a cada 300 ms, só
+// quando muda. Sem armazenamento (modo privado, bloqueado), ficam os de omissão.
+const FILTERS_KEY = "osm3d.filters";
+const FILTERS_VERSION = 1;
+let savedFilters = null;
+let saveTimer = null;
+
+function checkedValues(root) {
+  return root ? [...root.querySelectorAll("input[type=checkbox]:checked")].map((i) => i.value) : [];
+}
+
+function filterSnapshot() {
+  const groups = {};
+  document.querySelectorAll("#f-menu [data-group]").forEach((d) => (groups[d.dataset.group] = checkedValues(d)));
+  return JSON.stringify({
+    v: FILTERS_VERSION,
+    search: $("#f-search").value,
+    groups,
+    walls: checkedValues($("#m-walls")),
+    osm: checkedValues($("#m-osm")),
+    color: $("#m-color").value,
+  });
+}
+
+function scheduleSaveFilters() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    const snap = filterSnapshot();
+    if (snap === savedFilters) return;
+    try {
+      localStorage.setItem(FILTERS_KEY, snap);
+      savedFilters = snap;
+    } catch { /* sem armazenamento: ficam só nesta página */ }
+  }, 300);
+}
+
+function restoreFilters() {
+  let saved = null;
+  try {
+    savedFilters = localStorage.getItem(FILTERS_KEY);
+    saved = savedFilters ? JSON.parse(savedFilters) : null;
+  } catch {
+    saved = null;
+  }
+  if (!saved || saved.v !== FILTERS_VERSION) return;
+  const setChecked = (root, values) => {
+    if (!root || !Array.isArray(values)) return;
+    const want = new Set(values);
+    root.querySelectorAll("input[type=checkbox]").forEach((i) => (i.checked = want.has(i.value)));
+  };
+  for (const [group, values] of Object.entries(saved.groups ?? {})) {
+    setChecked(document.querySelector(`#f-menu [data-group="${group}"]`), values);
+  }
+  setChecked($("#m-walls"), saved.walls);
+  setChecked($("#m-osm"), saved.osm);
+  if (typeof saved.search === "string") $("#f-search").value = saved.search;
+  if ([...$("#m-color").options].some((o) => o.value === saved.color)) $("#m-color").value = saved.color;
 }
 
 function renderProgress() {
@@ -167,6 +227,10 @@ async function select(key) {
   if (!key) return;
   const token = ++state.token;
   state.selected = key;
+  state.wall = null;
+  state.landuse = null;
+  map.stopEditing();
+  map.selectWall(null);
   $("#viewer-status").textContent = "a carregar…";
   viewer.clearAll();
   try {
@@ -231,7 +295,7 @@ function renderTopology(d, val, t) {
     .join("");
   const msgs = d.qa_flags.filter((f) => ["adjusts_osm", "topology_trimmed", "straddles_landuse", "overlaps_osm_building", "crosses_highway", "overlaps_new_building"].includes(f.code));
   return `<div class="full topology-box ${t("topology")}">
-      <b>Sobreposição com o OSM</b> <span class="est">padrão: ${topo.default === "osm" ? "contorno municipal manda" : "contorno do LiDAR é recortado"}</span>
+      <b>Sobreposição com o OSM</b> <span class="est">padrão: ${topo.default === "osm" ? "contorno municipal manda" : "este edifício é recortado"}</span>
       ${msgs.map((f) => `<div class="small">${esc(f.message)}</div>`).join("")}
       <select name="topology">${opts}</select>
       <div class="small muted">Ver as camadas OSM no mapa (landuse, muros, vias). Muda ao aceitar.</div>
@@ -301,11 +365,9 @@ function renderDetail() {
         ? `<a href="${d.osm_url}" target="_blank" rel="noopener">abrir no OSM ↗</a>
            <a href="#" id="josm-link" data-obj="${josmType}${d.osm_id}">carregar no JOSM</a>
            <span class="muted">v${d.osm_version} · ${esc(d.existing_tags.building ?? "")} · ${fmt(d.area, " m²")}</span>`
-        : `<span class="chip candidate" title="Pontos de edifício no LiDAR sem contorno no OSM">em falta no OSM</span>
-           ${d.candidate_source === "municipal" ? '<span class="chip municipal" title="Contorno da cartografia municipal, confirmado pelo LiDAR">cartografia municipal</span>' : ""}
-           <span class="muted">${d.candidate_source === "municipal"
-             ? `contorno municipal (gid ${fmt(d.diagnostics?.municipal_gid)}; LiDAR em ${Math.round((d.diagnostics?.municipal_lidar_cover ?? 0) * 100)}% da área)`
-             : d.diagnostics?.ortho_offset_dx !== undefined ? "contorno do ortofoto" : "contorno do LiDAR (inclui beirais)"} · ${fmt(d.area, " m²")} · ao aceitar, é exportado como edifício novo</span>`}
+        : `<span class="chip candidate" title="Edifício da cartografia municipal sem contorno no OSM">em falta no OSM</span>
+           <span class="chip municipal" title="Contorno da cartografia municipal, confirmado pelo LiDAR">cartografia municipal</span>
+           <span class="muted">contorno municipal (gid ${fmt(d.diagnostics?.municipal_gid)}; LiDAR em ${Math.round((d.diagnostics?.municipal_lidar_cover ?? 0) * 100)}% da área) · ${fmt(d.area, " m²")} · ao aceitar, é exportado como edifício novo</span>`}
     </div>
     ${renderOsmChange(d)}
     <div class="actions">
@@ -318,7 +380,7 @@ function renderDetail() {
     <form class="form" id="edit-form" autocomplete="off">
       ${renderTopology(d, val, t)}
       ${renderGround(d, val, t)}
-      ${d.candidate ? `<label class="full ${t("building")}">building (tipo do edifício novo) <span class="est">${d.candidate_source === "municipal" ? "da cartografia municipal" : "estimado"}: ${esc(d.estimated_building ?? "yes")}</span>
+      ${d.candidate ? `<label class="full ${t("building")}">building (tipo do edifício novo) <span class="est">da cartografia municipal: ${esc(d.estimated_building ?? "yes")}</span>
         <select name="building">${buildingTypeOptions(val("building", d.building_type ?? "yes"))}</select></label>` : ""}
       <label class="${t("roof_shape")}">forma do telhado <span class="est">estimado: ${fmt(est.roof_shape)} (${fmt(est.roof_shape_conf)})</span>
         <select name="roof_shape">${shapeOpts(val("roof_shape", eff.roof_shape))}</select></label>
@@ -411,7 +473,7 @@ async function afterReviewChange(detail, advance) {
   renderProgress();
   const current = state.selected;
   const idx = state.filtered.findIndex((r) => r.key === current);
-  map.setData(await api.geojson());
+  map.setData(municipalGeojson(await api.geojson()));
   applyFilters();
   // Atualiza os telhados 3D deste edifício no mapa (forma/cores podem ter mudado).
   if (map.roofs) map.updateBuilding(await api.sceneOne(current));
@@ -449,11 +511,21 @@ async function resetReview() {
 // ------------------------------------------------------------- arranque
 
 function wire() {
-  document.querySelectorAll(".msel:not(.mlayers) input").forEach((i) => i.addEventListener("input", applyFilters));
+  // Filtros guardados primeiro: o mapa cria as camadas já com eles.
+  restoreFilters();
+  map.mode = $("#m-color").value;
+  map.wallFilter = wallFilter();
+  map.osmKinds = new Set(checkedValues($("#m-osm")));
+  document.addEventListener("input", (e) => {
+    if (e.target.closest("#m-layers, #m-color")) scheduleSaveFilters();
+  });
+  document.querySelectorAll("#f-menu input").forEach((i) => i.addEventListener("input", applyFilters));
   document.querySelectorAll("#m-osm input").forEach((i) =>
     i.addEventListener("input", () => map.setOsmLayers(new Set([...document.querySelectorAll("#m-osm input:checked")].map((x) => x.value)))),
   );
   $("#m-osm-refresh").addEventListener("click", refreshOsmContext);
+  document.querySelectorAll("#m-walls input").forEach((i) => i.addEventListener("input", () => map.setWallFilter(wallFilter())));
+  $("#m-walls-fetch").addEventListener("click", fetchWalls);
   document.querySelectorAll(".msel").forEach((d) =>
     d.addEventListener("toggle", () => {
       // Só um menu aberto de cada vez.
@@ -464,7 +536,12 @@ function wire() {
     if (!e.target.closest(".msel")) document.querySelectorAll(".msel[open]").forEach((o) => (o.open = false));
   });
   $("#f-clear").addEventListener("click", () => {
-    document.querySelectorAll(".msel:not(.mlayers) input").forEach((i) => (i.checked = false));
+    document.querySelectorAll("#f-menu input").forEach((i) => (i.checked = false));
+    $("#f-search").value = "";
+    applyFilters();
+  });
+  $("#f-default").addEventListener("click", () => {
+    document.querySelectorAll("#f-menu input").forEach((i) => (i.checked = i.defaultChecked));
     $("#f-search").value = "";
     applyFilters();
   });
@@ -515,6 +592,16 @@ function wire() {
   document.addEventListener("keydown", (e) => {
     if (e.target.closest("input, select, textarea") || e.ctrlKey || e.metaKey || e.altKey) return;
     const k = e.key.toLowerCase();
+    if (state.landuse && !state.selected) return; // landuse: só as teclas do editor
+    if (state.wall && !state.selected) {
+      // Muro selecionado: as mesmas teclas revêem os muros.
+      if (k === "j" || e.key === "ArrowDown") { e.preventDefault(); moveWall(1); }
+      else if (k === "k" || e.key === "ArrowUp") { e.preventDefault(); moveWall(-1); }
+      else if (k === "a") reviewWall("accepted");
+      else if (k === "r") reviewWall("rejected");
+      else if (k === "u") reviewWall(null);
+      return;
+    }
     if (k === "j" || e.key === "ArrowDown") { e.preventDefault(); move(1); }
     else if (k === "k" || e.key === "ArrowUp") { e.preventDefault(); move(-1); }
     else if (k === "a") review("accepted");
@@ -820,11 +907,245 @@ async function loadOsmContext() {
     const date = ctx.date ? `dados OSM de ${ctx.date.slice(0, 10)}` : "sem contexto OSM";
     $("#m-osm-date").textContent = ctx.missing.length ? `${date} · em falta: ${ctx.missing.join(", ")}` : date;
     $("#m-osm").classList.toggle("warn", ctx.missing.length > 0);
+    layersWarn();
     if (ctx.missing.length) {
       toast(`Contexto OSM incompleto (obtido por uma versão anterior): faltam ${ctx.missing.join(", ")}. Usar "camadas OSM → atualizar do OSM".`, 9000);
     }
   } catch (e) {
     toast(`Camadas OSM: ${e.message}`);
+  }
+}
+
+// ------------------------------------------------------------------ muros
+
+const WALL_TYPES = { wall: "muro", fence: "vedação" };
+
+async function loadWalls() {
+  // Muros propostos e o estado das fontes; avisa se faltam dados do OSM ou do geoportal.
+  try {
+    const { info, geojson } = await api.walls();
+    state.walls = geojson.features.filter((f) => f.properties.kind === "wall").map((f) => f.properties);
+    await map.setWalls(geojson);
+    renderWallsInfo(info);
+    if (info.warnings.length && !loadWalls.warned) {
+      loadWalls.warned = true;
+      toast(`Muros: ${info.warnings.join(" ")}`, 9000);
+    }
+  } catch (e) {
+    toast(`Muros: ${e.message}`);
+  }
+}
+
+function renderWallsInfo(info) {
+  const c = info.counts ?? {};
+  const counts = `${c.pending ?? 0} por rever · ${c.accepted ?? 0} aceites · ${c.rejected ?? 0} rejeitados${c.archived ? ` · ${c.archived} arquivados` : ""}`;
+  const src = info.fetched ? `${esc(info.layers.join(" + "))} (${(info.fetched_at ?? "").slice(0, 10)})` : "por obter";
+  $("#m-walls-info").innerHTML = `${counts}<br>fonte: ${src}${info.warnings.map((w) => `<div class="warn-text">⚠ ${esc(w)}</div>`).join("")}`;
+  $("#m-walls").classList.toggle("warn", info.warnings.length > 0);
+  $("#m-walls-count").textContent = `· ${c.pending ?? 0} por rever`;
+  layersWarn();
+}
+
+function layersWarn() {
+  // Aviso no menu "Camadas" se faltam muros ou dados do OSM.
+  $("#m-layers").classList.toggle("warn", $("#m-walls").classList.contains("warn") || $("#m-osm").classList.contains("warn"));
+}
+
+function wallFilter() {
+  return new Set([...document.querySelectorAll("#m-walls input:checked")].map((x) => x.value));
+}
+
+async function selectWall(key) {
+  if (!key) return;
+  const token = ++state.token;
+  try {
+    const d = await api.wall(key);
+    if (token !== state.token) return;
+    state.wall = d;
+    state.landuse = null;
+    state.selected = null;
+    map.select(null);
+    map.selectWall(key, d.bbox);
+    if (Array.isArray(d.coords)) map.editWall(d);
+    else toast("Para editar a geometria, reiniciar o servidor (osm3d review): está a correr uma versão anterior.", 8000);
+    renderWallDetail();
+  } catch (e) {
+    toast(`Muro: ${e.message}`);
+  }
+}
+
+function renderWallDetail() {
+  const d = state.wall;
+  const statusChip = { pending: "", accepted: "ok", rejected: "bad" }[d.status];
+  const type = WALL_TYPES[d.tags.barrier] ?? d.tags.barrier;
+  $("#viewer-status").textContent = "muro: sem vista 3D";
+  viewer.clearAll();
+  $("#detail").innerHTML = `
+    <h2>${esc(type)} <span class="chip ${statusChip}">${{ pending: "por rever", accepted: "aceite", rejected: "rejeitado" }[d.status]}</span>
+      ${d.archived ? '<span class="chip">arquivado</span>' : ""}</h2>
+    <div class="links"><span class="chip candidate">proposta</span> <span class="muted">${esc(d.layer)} · ${d.length} m · ${d.sources.length} linha(s) municipais</span></div>
+    <div class="actions">
+      <button class="btn ok" id="w-accept" title="A">Aceitar</button>
+      <button class="btn bad" id="w-reject" title="R">Rejeitar</button>
+      <button class="btn" id="w-reset" title="U" ${d.status === "pending" ? "disabled" : ""}>Repor</button>
+    </div>
+    <h3>Tags</h3>
+    <table class="kv">${Object.entries(d.tags).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("")}</table>
+    <h3>Ligação ao landuse</h3>
+    ${d.runs.length
+      ? `<p class="small">Na exportação, estes limites passam para a posição do muro (tracejado laranja no mapa) e partilham os nós com ele:</p>
+         <table class="kv">${d.runs.map((r) => `<tr><th>${esc(r.label)}</th><td>${r.length} m, até ${r.max_offset} m do muro</td></tr>`).join("")}</table>`
+      : '<p class="small muted">Não corre ao longo de nenhum limite de landuse: vai como linha própria.</p>'}
+    <h3>Geometria ${d.edited ? '<span class="chip">editada à mão</span>' : ""}</h3>
+    ${EDIT_HINT}
+    <div class="actions"><button class="btn" id="w-geom-reset" ${d.edited ? "" : "disabled"}>Repor geometria municipal</button></div>
+    <label class="full small">nota<textarea id="w-note" rows="2">${esc(d.note ?? "")}</textarea></label>
+    <p class="small muted">Ver as camadas OSM (landuse, muros já mapeados) e o ortofoto para confirmar. J/K: muro seguinte/anterior.</p>`;
+  $("#w-accept").onclick = () => reviewWall("accepted");
+  $("#w-reject").onclick = () => reviewWall("rejected");
+  $("#w-reset").onclick = () => reviewWall(null);
+  $("#w-geom-reset").onclick = () => resetGeometry();
+}
+
+// ------------------------------------------------------- edição de geometria
+
+const EDIT_HINT = `<p class="small muted">No mapa: arrastar um vértice (encaixa em muros, landuse e edifícios;
+  largado noutro muro, liga-se a ele); um vértice com contorno laranja está ligado a outros elementos e move-os também.
+  Arrastar o ponto a meio de uma aresta ou duplo clique cria um vértice. Clique (ou botão direito) num vértice ou
+  numa aresta abre as opções: apagar (Delete), desligar (D), alinhar o muro (S). Ctrl+Z desfaz.</p>`;
+
+async function selectLanduse(key) {
+  // Limite de um landuse do OSM: edita-se como no iD (os nós partilhados movem-se em
+  // todas as ways que os usam).
+  const id = Number(key.replace("way/", ""));
+  const token = ++state.token;
+  try {
+    const d = await api.landuse(id);
+    if (token !== state.token) return;
+    state.landuse = d;
+    state.wall = null;
+    state.selected = null;
+    map.select(null);
+    map.selectWall(null);
+    map.editLanduse(d);
+    renderLanduseDetail();
+  } catch (e) {
+    toast(`Landuse: ${e.message}`);
+  }
+}
+
+function renderLanduseDetail() {
+  const d = state.landuse;
+  $("#viewer-status").textContent = "landuse: sem vista 3D";
+  viewer.clearAll();
+  const shared = Object.entries(d.shared ?? {});
+  const others = [...new Set(shared.flatMap(([, ways]) => ways))];
+  $("#detail").innerHTML = `
+    <h2>${esc(d.label)} ${d.edited ? '<span class="chip">editado à mão</span>' : ""}</h2>
+    <div class="links"><a href="${d.osm_url}" target="_blank" rel="noopener">abrir no OSM ↗</a>
+      <span class="muted">${d.nodes.length} nós${shared.length ? ` · ${shared.length} partilhados` : ""}</span></div>
+    <h3>Tags</h3>
+    <table class="kv">${Object.entries(d.tags).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("")}</table>
+    <h3>Geometria</h3>
+    ${EDIT_HINT}
+    ${others.length ? `<p class="small">Nós com contorno laranja são partilhados com: ${others.map(esc).join(", ")}. Movê-los move-os também nesses elementos.</p>` : ""}
+    <p class="small muted">A edição vai no .osm da exportação, aplicada aos dados atuais do OSM (se a way mudou no OSM entretanto, não se faz e fica no relatório).</p>
+    <div class="actions"><button class="btn" id="l-reset" ${d.edited ? "" : "disabled"}>Repor como no OSM</button></div>`;
+  $("#l-reset").onclick = () => resetGeometry();
+}
+
+// Gravações em fila: cada edição só sai depois da anterior (sem corridas no servidor).
+let editQueue = Promise.resolve();
+
+function commitEdit(target, coords, ids, others = {}) {
+  editQueue = editQueue.then(() => saveEdit(target, coords, ids, others));
+}
+
+async function saveEdit(target, coords, ids, others) {
+  try {
+    if (target.key.startsWith("wall/")) {
+      // O muro e os ligados a ele que mudaram (vértice partilhado, ligação, alinhamento).
+      const res = await api.saveWallsGeometry({ ...others, [target.key]: coords });
+      const d = res.details[target.key];
+      if (state.wall?.key === d.key) {
+        state.wall = d;
+        renderWallDetail();
+      }
+      await loadWalls();
+    } else {
+      const id = Number(target.key.replace("way/", ""));
+      const d = await api.saveLanduse(id, coords.map((c, i) => [ids[i], c[0], c[1]]));
+      if (state.landuse?.key === d.key) {
+        state.landuse = d;
+        renderLanduseDetail();
+        if (map.editor.editing(d.key)) map.editor.setGeometry(d.nodes.map((n) => [n[1], n[2]]), d.nodes.map((n) => n[0]));
+      }
+      // O landuse aparece com a edição; as ligações dos muros perto dele são refeitas.
+      await Promise.all([loadOsmContext(), loadWalls()]);
+    }
+  } catch (e) {
+    toast(`Edição não guardada: ${e.message}`, 6000);
+    // Volta à geometria guardada.
+    if (target.key.startsWith("wall/") && state.wall) map.editWall(state.wall);
+    else if (state.landuse) map.editLanduse(state.landuse);
+  }
+}
+
+async function resetGeometry() {
+  try {
+    if (state.wall) {
+      state.wall = await api.resetWallGeometry(state.wall.key);
+      map.editWall(state.wall);
+      renderWallDetail();
+      await loadWalls();
+    } else if (state.landuse) {
+      state.landuse = await api.resetLanduse(state.landuse.id);
+      map.editLanduse(state.landuse);
+      renderLanduseDetail();
+      await Promise.all([loadOsmContext(), loadWalls()]);
+    }
+  } catch (e) {
+    toast(`Erro ao repor: ${e.message}`);
+  }
+}
+
+async function reviewWall(status) {
+  const d = state.wall;
+  if (!d) return;
+  try {
+    const note = $("#w-note")?.value ?? null;
+    state.wall = status ? await api.saveWallReview(d.key, status, note) : await api.resetWallReview(d.key);
+    await loadWalls();
+    if (status) return moveWall(1);
+    renderWallDetail();
+  } catch (e) {
+    toast(`Erro ao guardar: ${e.message}`);
+  }
+}
+
+function moveWall(delta) {
+  // Muros visíveis pelo filtro, por rever primeiro.
+  const show = wallFilter();
+  const list = (state.walls ?? []).filter((w) => show.has(w.archived ? "archived" : w.status));
+  if (!list.length) return;
+  const i = list.findIndex((w) => w.key === state.wall?.key);
+  const next = list[(i + delta + list.length) % list.length];
+  selectWall(next.key);
+}
+
+async function fetchWalls(e) {
+  const btn = e.target;
+  btn.disabled = true;
+  btn.textContent = "a obter do geoportal…";
+  try {
+    const info = await api.fetchWalls();
+    toast(`Muros obtidos do geoportal (${info.counts.pending ?? 0} por rever)`, 4000);
+    await loadWalls();
+  } catch (err) {
+    toast(`Não foi possível obter os muros: ${err.message}`, 8000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "obter do geoportal";
   }
 }
 
@@ -847,10 +1168,10 @@ async function refreshOsmContext(e) {
 
 async function reload() {
   const [rows, geojson] = await Promise.all([api.buildings(), api.geojson()]);
-  state.rows = rows;
+  state.rows = municipalRows(rows);
   renderProgress();
   applyFilters();
-  await map.setData(geojson);
+  await map.setData(municipalGeojson(geojson));
   const current = state.filtered.find((r) => r.key === state.selected) ?? state.filtered[0];
   if (current) select(current.key);
 }
@@ -864,7 +1185,7 @@ async function init() {
     const a = await api.areas();
     state.reviewGeneration = a.review_generation;
     const active = a.areas.find((x) => x.active);
-    $("#area-name").textContent = active?.label ? `${active.label} · ${a.active}` : a.active;
+    $("#area-name").textContent = active?.label || a.active;
     $("#area-name").title = `Área ativa: ${a.active}, ${active?.tiles.length ?? "?"} quadrículas (mudar no separador Dados)`;
   } catch { /* sem áreas: o erro aparece abaixo */ }
   if (initial === "data" || initial === "results") showTab(initial);
@@ -873,11 +1194,12 @@ async function init() {
     state.summary = summary;
     $("#palette").innerHTML = (summary.palette ?? []).map((c) => `<option value="${c.hex}">${esc(c.label)}</option>`).join("");
     map.setPalette(summary.palette ?? [], summary.default_colours ?? { roof: "#c8c8c8" });
-    state.rows = rows;
+    state.rows = municipalRows(rows);
     renderProgress();
     applyFilters();
-    await map.setData(geojson);
+    await map.setData(municipalGeojson(geojson));
     loadOsmContext();
+    loadWalls();
     if (state.filtered.length) select(state.filtered[0].key);
   } catch (e) {
     if (e.status === 503) {

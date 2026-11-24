@@ -17,7 +17,7 @@ const REQUIRED = ["lidar", "dtm"];
 const COLORS = { complete: "#16a34a", partial: "#d97706", area: "#2563eb" };
 const STAGE_LABELS = {
   fetch: "edifícios OSM", prepare: "preparar", roofs: "telhados", colours: "cores", qa: "QA",
-  candidates: "candidatos",
+  candidates: "edifícios municipais em falta",
 };
 const STATE_LABELS = { done: "feita", missing: "em falta", stale: "desatualizada" };
 const TASK_LABELS = {
@@ -43,8 +43,8 @@ export class DataView {
     this.extras = new Set(); // produtos opcionais (MDS, ortofotos)
     this.includeCache = true;
     // redo_from: "" = só as fases em falta/desatualizadas; senão refaz a partir dessa.
-    // municipal: usar a cartografia municipal nos candidatos (null = a do config.yaml).
-    this.processOpts = { candidates: false, redo_from: "", municipal: null, refresh_municipal: false };
+    // candidates: incluir os edifícios da cartografia municipal em falta no OSM (null = o do config).
+    this.processOpts = { candidates: null, redo_from: "", refresh_municipal: false };
     this.jobs = new Map(); // quadrícula → estado da tarefa de download ativa
     this.downloads = null;
     this.processing = null;
@@ -132,7 +132,10 @@ export class DataView {
     await this.ensureKnown([...this.draft]);
     this.setDownloads(this.status.downloads);
     this.setProcessing(this.areas.processing);
-    if (this.processOpts.municipal === null && this.areas.municipal) this.processOpts.municipal = this.areas.municipal.enabled;
+    // Edifícios municipais em falta no OSM: por omissão, se a cartografia está ativa no config.
+    if (this.processOpts.candidates === null && this.areas.municipal) {
+      this.processOpts.candidates = !!(this.areas.municipal.configured && this.areas.municipal.enabled);
+    }
     // Download do concelho em curso (p.ex. iniciado antes de recarregar a página).
     if (this.areas.municipal?.download?.running && !this.muniDownload?.running) this.setMuniDownload(this.areas.municipal.download);
     this.renderOthers();
@@ -514,14 +517,7 @@ export class DataView {
   }
 
   candidatesNeedRun(s) {
-    // O estado do servidor usa a escolha do config.yaml; aqui conta a escolha do painel.
-    const m = this.areas?.municipal;
-    const want = !!this.processOpts.municipal;
-    if (s.state === "missing" || this.processOpts.refresh_municipal) return true;
-    if (m && m.used_in_candidates !== null && want !== m.used_in_candidates) return true;
-    if (m && m.used_in_candidates === null && want) return true;
-    const aboutMunicipal = (s.reason ?? "").startsWith("cartografia municipal");
-    if (aboutMunicipal) return want && s.reason.includes("por obter");
+    if (this.processOpts.refresh_municipal) return true;
     return s.state !== "done";
   }
 
@@ -539,10 +535,9 @@ export class DataView {
     try {
       const cand = this.processOpts.candidates;
       this.setProcessing(await api.startProcessing({
-        candidates: cand,
+        candidates: !!cand,
         redo_from: this.processOpts.redo_from || null,
-        municipal: cand ? !!this.processOpts.municipal : null,
-        refresh_municipal: cand && !!this.processOpts.municipal && this.processOpts.refresh_municipal,
+        refresh_municipal: !!cand && this.processOpts.refresh_municipal,
       }));
       this.processOpts.refresh_municipal = false;
       this.renderProcessing();
@@ -661,7 +656,9 @@ export class DataView {
 
       <h3>Processamento</h3>
       ${this.renderStageStates()}
-      <label class="check small"><input type="checkbox" id="p-candidates" ${this.processOpts.candidates ? "checked" : ""}> incluir edifícios em falta no OSM (candidatos)</label>
+      ${this.areas?.municipal?.configured
+        ? `<label class="check small" title="Polígonos da cartografia municipal sem contorno no OSM, confirmados pelo LiDAR (que dá a forma do telhado)"><input type="checkbox" id="p-candidates" ${this.processOpts.candidates ? "checked" : ""}> incluir edifícios da cartografia municipal em falta no OSM</label>`
+        : '<p class="small muted">Edifícios em falta no OSM: configurar o geoportal municipal (sources.municipal em config/local.yaml).</p>'}
       ${this.processOpts.candidates ? this.renderMunicipal() : ""}
       <label class="small redo">refazer:
         <select id="p-redo" title="Por omissão só correm as fases em falta ou desatualizadas">
@@ -704,14 +701,12 @@ export class DataView {
     $p("#d-delete").onclick = () => this.removeFiles(a.tiles, `"${a.label || a.name}"`);
     $p("#d-cache").oninput = (e) => (this.includeCache = e.target.checked);
     $p("#p-start").onclick = () => this.process();
-    $p("#p-candidates").oninput = (e) => {
+    $p("#p-candidates")?.addEventListener("input", (e) => {
       this.processOpts.candidates = e.target.checked;
-      if (!e.target.checked && this.processOpts.redo_from === "candidates") this.processOpts.redo_from = "";
-      this.renderPanel();
-    };
-    $p("#p-municipal")?.addEventListener("input", (e) => {
-      this.processOpts.municipal = e.target.checked;
-      if (!e.target.checked) this.processOpts.refresh_municipal = false;
+      if (!e.target.checked) {
+        this.processOpts.refresh_municipal = false;
+        if (this.processOpts.redo_from === "candidates") this.processOpts.redo_from = "";
+      }
       this.renderPanel();
     });
     $p("#p-muni-refresh")?.addEventListener("input", (e) => {
@@ -736,7 +731,6 @@ export class DataView {
     // Cartografia municipal de edifícios (fase candidatos): usar ou não, estado, refazer.
     const m = this.areas?.municipal;
     if (!m || !m.configured) return "";  // sem geoportal municipal configurado
-    const on = !!this.processOpts.municipal;
     const when = m.fetched_at ? new Date(m.fetched_at).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "short" }) : null;
     const full = m.full?.cached;
     const cache = m.cached
@@ -744,14 +738,12 @@ export class DataView {
       : full
         ? "recortada da cópia do concelho ao processar os candidatos (sem pedidos ao geoportal)"
         : "ainda não obtida (é pedida ao geoportal ao processar os candidatos)";
-    const used = m.used_in_candidates === null ? "" : m.used_in_candidates ? " · usada nos candidatos atuais" : " · os candidatos atuais não a usam";
     return `<div class="muni-box small">
-      <label class="check"><input type="checkbox" id="p-municipal" ${on ? "checked" : ""}>
-        usar a cartografia municipal (${esc(m.name)})</label>
-      <span class="muted">Contornos municipais confirmados pelo LiDAR passam a candidatos (casa, anexo, garagem, telheiro separados);
-        candidatos só do LiDAR que não constam dela ficam sinalizados. Área mínima ${m.min_area_m2} m².</span>
-      <span>${cache}${used} · <a href="${esc(m.viewer_url)}" target="_blank" rel="noopener">geoportal ↗</a></span>
-      <label class="check"><input type="checkbox" id="p-muni-refresh" ${on ? "" : "disabled"} ${this.processOpts.refresh_municipal ? "checked" : ""}>
+      <b>${esc(m.name)}</b>
+      <span class="muted">Contornos municipais sem contorno no OSM e confirmados pelo LiDAR (casa, anexo, garagem, telheiro separados);
+        o LiDAR dá a forma e a altura do telhado. Área mínima ${m.min_area_m2} m².</span>
+      <span>${cache} · <a href="${esc(m.viewer_url)}" target="_blank" rel="noopener">geoportal ↗</a></span>
+      <label class="check"><input type="checkbox" id="p-muni-refresh" ${this.processOpts.refresh_municipal ? "checked" : ""}>
         ${full ? "voltar a recortar da cópia do concelho (refaz os candidatos)" : "voltar a obter do geoportal (refaz os candidatos)"}</label>
       <div id="muni-dl"></div>
     </div>`;

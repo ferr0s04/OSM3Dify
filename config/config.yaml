@@ -52,11 +52,13 @@ sources:
   dtm_dir: data/raw/dtm            # MDT GeoTIFF do mesmo levantamento LiDAR
   dsm_dir: data/raw/dsm            # MDS GeoTIFF (opcional)
   orthophoto_dir: data/raw/orthophotos
-  # Cartografia municipal de edifícios (opcional) de um geoportal MapGuide, usada na
-  # fase candidates. Só com autorização do município. Polígonos confirmados pelo LiDAR
-  # passam a candidatos com o contorno municipal; candidatos só do LiDAR que não constam
-  # dela são sinalizados. O geoportal e a camada configuram-se no config/local.yaml
-  # (name, viewer_url, mapagent_url, feature_source, feature_class, filter).
+  # Cartografia municipal de edifícios (opcional) de um geoportal MapGuide: é a fonte da
+  # fase candidates (edifícios em falta no OSM). Só com autorização do município.
+  # Polígonos sem contorno no OSM e confirmados pelo LiDAR passam a candidatos com o
+  # contorno municipal; o LiDAR dá-lhes a forma e a altura do telhado. Não há deteção
+  # de edifícios só pelo LiDAR. enabled: incluir a fase por omissão na aplicação. O
+  # geoportal e a camada configuram-se no config/local.yaml (name, viewer_url,
+  # mapagent_url, feature_source, feature_class, filter).
   # Ver src/osm3d/acquisition/municipal.py.
   municipal:
     enabled: false

@@ -269,7 +269,6 @@ class AppContext:
         *,
         candidates: bool = False,
         redo_from: Stage | None = None,
-        municipal: bool | None = None,
         refresh_municipal: bool = False,
     ) -> dict[str, Any]:
         """Processa as fases em falta (e, se pedido, refaz a partir de ``redo_from``)."""
@@ -280,6 +279,5 @@ class AppContext:
                 self.cfg,
                 candidates=candidates,
                 redo_from=redo_from,
-                municipal=municipal,
                 refresh_municipal=refresh_municipal,
             )

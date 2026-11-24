@@ -1,6 +1,7 @@
 // Mapa (MapLibre): contornos coloridos por forma/estado/concordância; em modo 3D,
 // telhados com a forma e as cores inferidas (camada three.js dentro do MapLibre).
 import * as THREE from "three";
+import { GeometryEditor } from "./geom-editor.js";
 import {
   CHANGE_COLORS,
   CHANGE_LABELS,
@@ -14,8 +15,20 @@ import {
 
 // Contorno dos edifícios que já têm informação 3D no OSM (destacados em todos os modos).
 const OSM3D_LINE = "#7c3aed";
-// Contorno dos edifícios em falta no OSM (detetados no LiDAR).
+function legendOpen(value) {
+  // Legenda aberta ou fechada: lembrada neste browser (sem armazenamento, fica aberta).
+  try {
+    if (value !== undefined) localStorage.setItem("osm3d.legendOpen", value ? "1" : "0");
+    return localStorage.getItem("osm3d.legendOpen") !== "0";
+  } catch {
+    return value ?? true;
+  }
+}
+
+// Contorno dos edifícios da cartografia municipal em falta no OSM.
 const CANDIDATE_LINE = "#ea580c";
+// Camadas clicáveis dos muros propostos (muros e muros de suporte; vedações a tracejado).
+const WALL_LAYERS = ["walls-line", "walls-fence"];
 
 const EARTH_CIRCUMFERENCE = 2 * Math.PI * 6378137;
 
@@ -241,16 +254,21 @@ const COLOR_MODES = {
   },
   // Origem: OSM, ou candidato com contorno municipal / do LiDAR (ortofoto).
   origin: {
-    expr: matchExpr("candidate_source", { municipal: ORIGIN_COLORS.municipal, lidar: ORIGIN_COLORS.lidar }, ORIGIN_COLORS.osm),
+    expr: matchExpr("candidate_source", { municipal: ORIGIN_COLORS.municipal }, ORIGIN_COLORS.osm),
     legend: ORIGIN_COLORS,
     labels: ORIGIN_LABELS,
   },
 };
 
+const WALL_COLORS = { pending: "#db2777", accepted: "#16a34a", rejected: "#9ca3af" };
+
 export class BuildingMap {
-  constructor(container, legendEl, onSelect) {
+  constructor(container, legendEl, onSelect, onSelectWall) {
     this.legendEl = legendEl;
     this.onSelect = onSelect;
+    this.onSelectWall = onSelectWall;
+    this.wallFilter = new Set(["pending", "accepted"]);
+    this.selectedWall = null;
     this.selectedId = null;
     this.selectedKey = null;
     this.mode = "real";
@@ -259,11 +277,99 @@ export class BuildingMap {
     this.map = new maplibregl.Map({ container, style: BASEMAP, center: [-8.0, 39.6], zoom: 6, maxPitch: 70 }); // enquadrado nos edifícios ao carregar
     this.map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
     this.ready = new Promise((resolve) => this.map.on("load", resolve));
+    // Edição de geometria (muros e landuse), ao estilo do iD; o elemento em edição sai
+    // das camadas normais enquanto é editado.
+    this.onSelectLanduse = null;
+    this.onEditCommit = null;
+    this.editingWall = null;
+    this.editingCtx = null;
+    this.index = { walls: new Map(), ctx: new Map(), buildings: new Map() };
+    this.editor = new GeometryEditor(this.map, {
+      snapTargets: (point, px) => this.snapTargets(point, px),
+      wallsIndex: () => this.index.walls,
+      onCommit: (target, coords, ids, others) => {
+        this.applyWallFilter(); // muros que passaram a estar ligados também se editam
+        this.onEditCommit?.(target, coords, ids, others);
+      },
+    });
+    this.ready.then(() => this.editor.install());
+  }
+
+  // ------------------------------------------------------------- edição
+
+  editWall(d) {
+    this.editingCtx = null;
+    this.editingWall = d.key;
+    this.applyCtxFilters();
+    this.applyWallFilter();
+    this.editor.start({ key: d.key, closed: false, coords: d.coords, min: 2 });
+    this.applyWallFilter(); // os muros ligados também saem das camadas (desenha-os o editor)
+  }
+
+  editLanduse(d) {
+    this.editingWall = null;
+    this.editingCtx = d.key;
+    this.applyCtxFilters();
+    this.applyWallFilter();
+    this.editor.start({
+      key: d.key,
+      closed: true,
+      coords: d.nodes.map((n) => [n[1], n[2]]),
+      ids: d.nodes.map((n) => n[0]),
+      shared: new Set(Object.keys(d.shared ?? {}).map(Number)),
+      min: 3,
+    });
+  }
+
+  stopEditing() {
+    if (!this.editor.target && !this.editingWall && !this.editingCtx) return;
+    this.editor.stop();
+    this.editingWall = null;
+    this.editingCtx = null;
+    this.applyCtxFilters();
+    this.applyWallFilter();
+  }
+
+  snapTargets(point, px) {
+    // Geometrias originais (não as das tiles, cortadas) dos elementos à volta do cursor:
+    // [{ key, source, coords }] (um anel de polígono é uma linha).
+    const layers = ["walls-line", "walls-fence", "ctx-landuse-line", "ctx-building", "ctx-barrier", "ctx-fence", "b-line"]
+      .filter((id) => this.map.getLayer(id) && this.map.getLayoutProperty(id, "visibility") !== "none");
+    if (!layers.length) return [];
+    const box = [[point.x - px, point.y - px], [point.x + px, point.y + px]];
+    const out = [];
+    const seen = new Set();
+    for (const f of this.map.queryRenderedFeatures(box, { layers })) {
+      const p = f.properties;
+      const [kind, id] = f.source === "walls" ? ["walls", p.key] : f.source === "osm-ctx" ? ["ctx", p.id] : ["buildings", p.key];
+      if (!id || seen.has(`${kind}:${id}`) || (kind === "walls" && p.kind !== "wall")) continue;
+      seen.add(`${kind}:${id}`);
+      const g = this.index[kind].get(id);
+      if (!g) continue;
+      // Ways do OSM: o id do nó de cada vértice (anel exterior/linha, pela mesma ordem).
+      const nodes = kind === "ctx" ? this.index.ctxNodes?.get(id) : null;
+      const add = (coords, k = 0) => out.push({ key: id, source: kind, coords, nodes: k === 0 && nodes?.length === coords.length ? nodes : null });
+      if (g.type === "LineString") add(g.coordinates);
+      else if (g.type === "Polygon") g.coordinates.forEach(add);
+      else if (g.type === "MultiPolygon") for (const poly of g.coordinates) poly.forEach(add);
+    }
+    return out;
+  }
+
+  applyCtxFilters() {
+    // Landuse em edição: só a geometria do editor (a do contexto ainda é a antiga).
+    if (!this.map.getLayer("ctx-landuse-line")) return;
+    const notEditing = ["!=", ["get", "id"], this.editingCtx ?? ""];
+    const landuse = ["==", ["get", "kind"], "landuse"];
+    this.map.setFilter("ctx-landuse-fill", ["all", landuse, ["==", ["geometry-type"], "Polygon"], notEditing]);
+    this.map.setFilter("ctx-landuse-line", ["all", landuse, notEditing]);
   }
 
   async setOsmContext(geojson) {
     // Landuse, vias, muros/vedações e edifícios do OSM, por baixo dos edifícios em revisão.
     await this.ready;
+    this.index.ctx = new Map(geojson.features.map((f) => [f.properties.id, f.geometry]));
+    this.index.ctxNodes = new Map(geojson.features.filter((f) => f.properties.nodes).map((f) => [f.properties.id, f.properties.nodes]));
     const src = this.map.getSource("osm-ctx");
     if (src) return src.setData(geojson);
     this.map.addSource("osm-ctx", { type: "geojson", data: geojson });
@@ -289,6 +395,8 @@ export class BuildingMap {
     add({ id: "ctx-building", type: "line", source: "osm-ctx", filter: kind("building"),
       paint: { "line-color": OSM_CTX_COLORS.building, "line-width": 1.2, "line-dasharray": [3, 1.5] } });
     this.applyOsmLayers();
+    this.applyCtxFilters();
+    this.editor.raise();
     const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, className: "ctx-popup" });
     for (const id of ["ctx-landuse-line", "ctx-highway", "ctx-highway-other", "ctx-barrier", "ctx-fence", "ctx-building"]) {
       this.map.on("mousemove", id, (e) => {
@@ -299,6 +407,75 @@ export class BuildingMap {
       this.map.on("mouseleave", id, () => popup.remove());
     }
     this.renderLegend();
+  }
+
+  async setWalls(geojson) {
+    // Muros propostos (cor pelo estado) e, do selecionado, os limites de landuse que passam
+    // para ele (tracejado).
+    await this.ready;
+    this.index.walls = new Map(geojson.features.filter((f) => f.properties.kind === "wall").map((f) => [f.properties.key, f.geometry]));
+    const src = this.map.getSource("walls");
+    if (src) {
+      src.setData(geojson);
+      return this.applyWallFilter();
+    }
+    this.map.addSource("walls", { type: "geojson", data: geojson });
+    const color = ["match", ["get", "status"], "accepted", WALL_COLORS.accepted, "rejected", WALL_COLORS.rejected, WALL_COLORS.pending];
+    this.map.addLayer({ id: "walls-edge", type: "line", source: "walls", filter: ["==", ["get", "key"], ""],
+      paint: { "line-color": "#f97316", "line-width": 3, "line-dasharray": [1.5, 1.2] } });
+    this.map.addLayer({ id: "walls-sel", type: "line", source: "walls", filter: ["==", ["get", "key"], ""],
+      layout: { "line-cap": "round" }, paint: { "line-color": "#1d4ed8", "line-width": 8, "line-opacity": 0.45 } });
+    // Vedações a tracejado numa camada à parte: o MapLibre 4 não aceita line-dasharray
+    // por propriedade (a camada era rejeitada e nenhum muro aparecia).
+    const width = ["interpolate", ["linear"], ["zoom"], 15, 1.5, 19, 4.5];
+    this.map.addLayer({ id: "walls-line", type: "line", source: "walls", filter: ["==", ["get", "kind"], "wall"],
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": color, "line-width": width } });
+    this.map.addLayer({ id: "walls-fence", type: "line", source: "walls", filter: ["==", ["get", "kind"], "wall"],
+      layout: { "line-join": "round" },
+      paint: { "line-color": color, "line-width": width, "line-dasharray": [2, 1] } });
+    for (const id of WALL_LAYERS) {
+      this.map.on("mouseenter", id, () => (this.map.getCanvas().style.cursor = "pointer"));
+      this.map.on("mouseleave", id, () => (this.map.getCanvas().style.cursor = ""));
+    }
+    this.applyWallFilter();
+    this.editor.raise();
+    this.renderLegend();
+  }
+
+  setWallFilter(statuses) {
+    this.wallFilter = statuses;
+    this.applyWallFilter();
+  }
+
+  applyWallFilter() {
+    if (!this.map.getLayer("walls-line")) return;
+    const showArchived = this.wallFilter.has("archived");
+    const st = [...this.wallFilter].filter((s) => s !== "archived");
+    const shown = ["all", ["==", ["get", "kind"], "wall"],
+      ["in", ["get", "status"], ["literal", st]],
+      showArchived ? true : ["!", ["get", "archived"]],
+      // Em edição (o muro e os ligados a ele): desenha-os o editor.
+      ["!", ["in", ["get", "key"], ["literal", [this.editingWall ?? "", ...this.editor.linkedKeys()]]]]];
+    const fence = ["==", ["get", "barrier"], "fence"];
+    this.map.setFilter("walls-line", ["all", shown, ["!", fence]]);
+    this.map.setFilter("walls-fence", ["all", shown, fence]);
+    const key = this.selectedWall ?? "";
+    this.map.setFilter("walls-edge", ["all", ["==", ["get", "kind"], "edge"], ["==", ["get", "key"], key]]);
+    const halo = this.editingWall === key ? "" : key; // em edição: o editor já o destaca
+    this.map.setFilter("walls-sel", ["all", ["==", ["get", "kind"], "wall"], ["==", ["get", "key"], halo]]);
+  }
+
+  selectWall(key, bbox) {
+    this.selectedWall = key;
+    this.applyWallFilter();
+    if (key && bbox) {
+      const [w, s, e, n] = bbox;
+      const center = [(w + e) / 2, (s + n) / 2];
+      if (!this.map.getBounds().contains(center) || this.map.getZoom() < 17) {
+        this.map.easeTo({ center, zoom: Math.max(this.map.getZoom(), 18), duration: 500 });
+      }
+    }
   }
 
   setOsmLayers(kinds) {
@@ -317,6 +494,7 @@ export class BuildingMap {
   async setData(geojson) {
     await this.ready;
     this.keyToId = new Map(geojson.features.map((f) => [f.properties.key, f.id]));
+    this.index.buildings = new Map(geojson.features.map((f) => [f.properties.key, f.geometry]));
     const src = this.map.getSource("buildings");
     if (src) {
       src.setData(geojson);
@@ -338,7 +516,22 @@ export class BuildingMap {
       },
     });
     this.applyFilter();
-    this.map.on("click", "b-fill", (e) => e.features[0] && this.onSelect(e.features[0].properties.key));
+    this.map.on("click", (e) => {
+      // Muros por cima dos edifícios: um clique perto de um muro seleciona o muro.
+      const p = e.point;
+      if (this.editor.hitTest(p)) return; // vértice/aresta em edição
+      const box = [[p.x - 5, p.y - 5], [p.x + 5, p.y + 5]];
+      const wall = this.map.getLayer("walls-line") ? this.map.queryRenderedFeatures(box, { layers: WALL_LAYERS })[0] : null;
+      if (wall) return this.onSelectWall?.(wall.properties.key);
+      // Limite de um landuse (way do OSM): seleciona-o para editar os nós.
+      const near = [[p.x - 3, p.y - 3], [p.x + 3, p.y + 3]];
+      const landuse = this.map.getLayer("ctx-landuse-line") && this.map.getLayoutProperty("ctx-landuse-line", "visibility") !== "none"
+        ? this.map.queryRenderedFeatures(near, { layers: ["ctx-landuse-line"] }).find((f) => String(f.properties.id).startsWith("way/"))
+        : null;
+      if (landuse) return this.onSelectLanduse?.(landuse.properties.id);
+      const b = this.map.queryRenderedFeatures(p, { layers: ["b-fill"] })[0];
+      if (b) this.onSelect(b.properties.key);
+    });
     this.map.on("mouseenter", "b-fill", () => (this.map.getCanvas().style.cursor = "pointer"));
     this.map.on("mouseleave", "b-fill", () => (this.map.getCanvas().style.cursor = ""));
     const b = new maplibregl.LngLatBounds();
@@ -373,6 +566,7 @@ export class BuildingMap {
 
   setColorMode(mode) {
     this.mode = mode;
+    if (!this.map.getLayer("b-fill")) return; // criada depois, já com este modo
     this.map.setPaintProperty("b-fill", "fill-color", COLOR_MODES[mode].expr);
     this.renderLegend();
   }
@@ -435,20 +629,27 @@ export class BuildingMap {
 
   renderLegend() {
     const { legend, labels } = COLOR_MODES[this.mode];
-    this.legendEl.innerHTML = Object.entries(legend)
+    const body = Object.entries(legend)
       .map(([k, c]) => `<div><span class="sw" style="background:${c}"></span>${labels[k] ?? k}</div>`)
       .join("") +
-      `<div><span class="sw" style="background:none;border:2.5px solid ${OSM3D_LINE}"></span>já com 3D no OSM</div>` +
-      `<div><span class="sw" style="background:none;border:2.5px solid ${CANDIDATE_LINE}"></span>em falta no OSM (cartografia municipal ou LiDAR)</div>` +
+      `<div><span class="sw" style="background:none;border:2.5px solid ${CANDIDATE_LINE}"></span>em falta no OSM (cartografia municipal)</div>` +
       this.osmLegend();
+    const open = legendOpen();
+    this.legendEl.innerHTML = `<details class="legend-box" ${open ? "open" : ""}><summary>legenda</summary><div class="legend-body">${body}</div></details>`;
+    this.legendEl.querySelector("details").addEventListener("toggle", (e) => legendOpen(e.target.open));
   }
 
   osmLegend() {
-    if (!this.map.getSource("osm-ctx")) return "";
+    if (!this.map.getSource("osm-ctx") && !this.map.getSource("walls")) return "";
     const kinds = this.osmKinds ?? new Set(Object.keys(CTX_LAYERS));
     const line = (c, label, dash = false) => `<div><span class="sw line" style="border-bottom:3px ${dash ? "dashed" : "solid"} ${c}"></span>${label}</div>`;
     const c = OSM_CTX_COLORS;
-    return `<div class="legend-sep">OSM</div>` +
+    const walls = this.map.getSource("walls")
+      ? `<div class="legend-sep">muros propostos</div>` +
+        line(WALL_COLORS.pending, "por rever") + line(WALL_COLORS.accepted, "aceite") + line(WALL_COLORS.rejected, "rejeitado") +
+        line("#f97316", "limite de landuse que passa para o muro", true)
+      : "";
+    return walls + `<div class="legend-sep">OSM</div>` +
       (kinds.has("landuse") ? line(c.built, "landuse construído") + line(c.green, "landuse agrícola/verde") : "") +
       (kinds.has("highway") ? line("#334155", "via (não pode atravessar edifícios)") : "") +
       (kinds.has("barrier") ? line(c.wall, "muro") + line(c.fence, "vedação", true) : "") +

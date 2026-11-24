@@ -255,6 +255,13 @@ de Vila do Conde; ver `acquisition/municipal.py`):
   filtro e a cor do mapa "origem" (OSM / municipal / só LiDAR), o tipo `building`
   editável e a escolha (e nova obtenção) da cartografia no processamento.
 
+**v10 — sem deteção só pelo LiDAR** (2026-11-24): os contornos detetados só no
+LiDAR/ortofoto eram maus e a maioria das câmaras municipais tem um portal SIG com a
+cartografia. A fase `candidates` passa a usar só a cartografia municipal (regra da
+v9); o LiDAR confirma cada polígono e continua a dar a forma e a altura do telhado.
+O desvio cartografia → LiDAR é estimado por quadrícula (IoU, como no OSM). Candidatos
+só do LiDAR de artefactos antigos já não entram na revisão nem na exportação.
+
 **Telhados partilhados.** Para grupos de edifícios encostados cuja planta conjunta é
 retangular, ajusta-se também um telhado único ao grupo. Esse telhado é usado se
 explicar os pontos melhor do que os telhados individuais, pelo mesmo critério

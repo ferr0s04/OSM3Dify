@@ -43,8 +43,8 @@ export function renderResults(el, s) {
       <div class="box"><h3>Formas previstas</h3>${bars(s.shapes, SHAPE_COLORS, SHAPE_LABELS)}</div>
       <div class="box"><h3>Cor do telhado (roof:colour final)</h3>${bars(s.roof_colours ?? {}, Object.fromEntries(Object.keys(s.roof_colours ?? {}).map((k) => [k, k])), Object.fromEntries([...(s.palette ?? []).map((c) => [c.hex, c.label]), [s.default_colours?.roof, "sem roof:colour"]]))}
         <p class="small muted">Cor da ortofoto confirmada pelo LiDAR; abaixo de ${pct(s.min_colour_confidence)} de confiança não é exportada.</p></div>
-      <div class="box"><h3>Edifícios em falta no OSM (candidatos)</h3>${Object.keys(s.candidate_sources ?? {}).length ? bars(s.candidate_sources, ORIGIN_COLORS, ORIGIN_LABELS) : "<p class='muted'>Sem candidatos.</p>"}
-        <p class="small muted">Contorno da cartografia municipal (confirmado pelo LiDAR) ou só do LiDAR/ortofoto (não consta da cartografia: construção recente?).</p></div>
+      <div class="box"><h3>Edifícios da cartografia municipal em falta no OSM</h3>${Object.keys(s.candidate_sources ?? {}).length ? bars(s.candidate_sources, ORIGIN_COLORS, ORIGIN_LABELS) : "<p class='muted'>Sem candidatos.</p>"}
+        <p class="small muted">Contorno da cartografia municipal, confirmado pelo LiDAR (que dá a forma e a altura do telhado).</p></div>
       <div class="box"><h3>Sinalizações</h3>${bars(s.flags) || "<p class='muted'>Nenhuma.</p>"}</div>
       <div class="box"><h3>Exportação</h3>${bars(s.export.reasons)}
         <h3 style="margin-top:14px">Altura por piso implícita (vs building:levels)</h3>

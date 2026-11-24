@@ -49,10 +49,10 @@ import certifi
 import numpy as np
 import shapely
 from shapely import wkt
-from shapely.geometry import Polygon, mapping, shape
+from shapely.geometry import LineString, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
 
-from osm3d.config import MunicipalSourceConfig
+from osm3d.config import BarrierLayer, MunicipalSourceConfig
 
 log = logging.getLogger(__name__)
 
@@ -157,18 +157,24 @@ class MapGuideClient:
             time.sleep(2.0 * (attempt + 1))
         raise AssertionError("inalcançável")
 
-    def select(self, box: tuple[float, float, float, float]) -> bytes:
-        """XML dos polígonos de edifício que intersetam a caixa (EPSG:3763)."""
+    def select(
+        self,
+        box: tuple[float, float, float, float],
+        feature_class: str | None = None,
+        filter: str | None = None,
+    ) -> bytes:
+        """XML dos elementos da camada (por omissão, a dos edifícios) na caixa (EPSG:3763)."""
         x0, y0, x1, y1 = box
         ring = f"{x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}"
         flt = f"geom ENVELOPEINTERSECTS GeomFromText('POLYGON(({ring}))')"
-        if self.cfg.filter:
-            flt = f"{self.cfg.filter} AND {flt}"
+        extra = self.cfg.filter if feature_class is None else (filter or "")
+        if extra:
+            flt = f"{extra} AND {flt}"
         return self._request(
             {
                 "OPERATION": "SELECTFEATURES",
                 "RESOURCEID": self.cfg.feature_source,
-                "CLASSNAME": self.cfg.feature_class,
+                "CLASSNAME": feature_class or self.cfg.feature_class,
                 "FILTER": flt,
             }
         )
@@ -401,3 +407,105 @@ def load_municipal_buildings(path: Path) -> list[MunicipalBuilding]:
             p = f["properties"]
             out.append(MunicipalBuilding(int(p["gid"]), geom, str(p.get("descr") or "")))
     return out
+
+
+# ------------------------------------------------------------- muros e vedações
+
+
+@dataclass(frozen=True)
+class MunicipalBarrier:
+    """Muro/vedação de uma camada municipal (uma linha simples, EPSG:3763)."""
+
+    key: str  # "<n.º da camada>:<gid>:<parte>", estável entre descargas
+    layer: str  # etiqueta da camada
+    geometry: LineString
+    tags: dict[str, str]
+    priority: int = 0  # índice da camada em ``barriers`` (0 = a que manda)
+
+
+def parse_barriers(xml: bytes, layer: BarrierLayer, priority: int) -> list[MunicipalBarrier]:
+    """``FeatureSet`` de linhas → muros com as tags das regras (as outras linhas saem)."""
+    out: list[MunicipalBarrier] = []
+    for feat in ET.fromstring(xml).iter("Feature"):
+        props = {p.findtext("Name") or "": p.findtext("Value") for p in feat.iter("Property")}
+        tags = layer.tags_for(props)
+        if tags is None or not props.get("geom"):
+            continue
+        gid = props.get("gid") or props.get("id") or props.get("objectid") or "?"
+        geom = wkt.loads(str(props["geom"]))
+        lines = [g for g in getattr(geom, "geoms", [geom]) if isinstance(g, LineString)]
+        for i, line in enumerate(lines):
+            if line.length > 0.2:
+                key = f"{priority}:{gid}:{i}"
+                out.append(MunicipalBarrier(key, layer.label, line, tags, priority))
+    return out
+
+
+def fetch_municipal_barriers(
+    bbox: tuple[float, float, float, float],
+    cfg: MunicipalSourceConfig,
+    out: Path,
+    *,
+    force: bool = False,
+    progress: Callable[[str], None] | None = None,
+    client: MapGuideClient | None = None,
+) -> Path:
+    """Muros e vedações das camadas ``cfg.barriers`` na caixa (EPSG:3763), em GeoJSON."""
+    if out.exists() and not force:
+        return out
+    if not cfg.barriers:
+        raise MunicipalError("Sem camadas de muros configuradas (sources.municipal.barriers)")
+    client = client or MapGuideClient(cfg)
+    boxes = request_boxes(bbox, cfg.chunk_m * 2)
+    found: dict[str, MunicipalBarrier] = {}
+    for priority, layer in enumerate(cfg.barriers):
+        for i, box in enumerate(boxes):
+            if i or priority:
+                time.sleep(cfg.delay_s)
+            xml = client.select(box, layer.feature_class, layer.filter)
+            for b in parse_barriers(xml, layer, priority):
+                found[b.key] = b
+        if progress:
+            n = sum(b.priority == priority for b in found.values())
+            progress(f"  muros municipais ({layer.label or layer.feature_class}): {n} linhas")
+    features = [
+        {
+            "type": "Feature",
+            "geometry": mapping(b.geometry),
+            "properties": {"key": b.key, "layer": b.layer, "priority": b.priority, **b.tags},
+        }
+        for b in sorted(found.values(), key=lambda b: b.key)
+    ]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".part")
+    payload = {
+        "type": "FeatureCollection",
+        "features": features,
+        "osm3d": {
+            "source": cfg.name,
+            "layers": [layer.label or layer.feature_class for layer in cfg.barriers],
+            "bbox": list(bbox),
+            "fetched_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        },
+    }
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(out)
+    return out
+
+
+def load_municipal_barriers(path: Path) -> list[MunicipalBarrier]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    out = []
+    for f in data.get("features", []):
+        p = dict(f["properties"])
+        key, layer, priority = p.pop("key"), p.pop("layer", ""), int(p.pop("priority", 0))
+        out.append(MunicipalBarrier(key, layer, shape(f["geometry"]), p, priority))
+    return out
+
+
+def barriers_meta(path: Path) -> dict[str, object]:
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8")).get("osm3d", {})
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}

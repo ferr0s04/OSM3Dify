@@ -28,6 +28,25 @@ STATIC_DIR = Path(__file__).parent / "static"
 T = TypeVar("T")
 
 
+class WallReviewIn(BaseModel):
+    status: ReviewStatus
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class WallGeometryIn(BaseModel):
+    coords: list[tuple[float, float]] = Field(min_length=2, max_length=5000)  # (lon, lat)
+
+
+class WallsGeometryIn(BaseModel):
+    # Muros editados juntos (chave "wall/<id>" → linha (lon, lat)).
+    walls: dict[str, list[tuple[float, float]]] = Field(min_length=1, max_length=200)
+
+
+class LanduseGeometryIn(BaseModel):
+    # Anel do landuse: (id do nó do OSM ou None se novo, lon, lat), sem repetir o primeiro.
+    nodes: list[tuple[int | None, float, float]] = Field(min_length=3, max_length=20000)
+
+
 class ArchiveIn(BaseModel):
     status: Literal["accepted", "rejected"]
     archived: bool = True
@@ -77,12 +96,11 @@ class SettingsIn(BaseModel):
 
 
 class ProcessIn(BaseModel):
-    candidates: bool = False  # também a fase "candidates" (edifícios em falta no OSM)
+    # Também a fase "candidates": edifícios da cartografia municipal em falta no OSM.
+    candidates: bool = False
     # Por omissão só corre o que falta ou está desatualizado. Com uma fase, refaz essa e
     # as seguintes (fetch: volta a pedir os edifícios ao Overpass).
     redo_from: Stage | None = None
-    # Cartografia municipal nos candidatos: None = a do config.yaml.
-    municipal: bool | None = None
     refresh_municipal: bool = False  # voltar a obtê-la do geoportal (refaz os candidatos)
 
 
@@ -160,7 +178,7 @@ def create_app(
         try:
             return fn(*args)
         except NotFound as exc:
-            raise HTTPException(404, f"Edifício não encontrado: {exc}") from exc
+            raise HTTPException(404, f"Não encontrado: {exc}") from exc
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -248,6 +266,60 @@ def create_app(
     @app.post("/api/export")
     def export() -> dict[str, Any]:
         return rs().export()
+
+    @app.get("/api/walls")
+    def walls() -> dict[str, Any]:
+        """Propostas de muros (GeoJSON) e o estado das fontes (avisos de dados em falta)."""
+        svc = rs()
+        return {"info": svc.walls_info(), "geojson": svc.walls_geojson()}
+
+    @app.post("/api/walls/fetch")
+    def walls_fetch() -> dict[str, Any]:
+        """Obtém de novo os muros e vedações do geoportal municipal."""
+        try:
+            return rs().fetch_walls()
+        except (RuntimeError, OSError) as exc:  # geoportal sem resposta ou sem camadas
+            raise HTTPException(502, str(exc)) from exc
+
+    @app.get("/api/walls/{wall_id}")
+    def wall_detail(wall_id: str) -> dict[str, Any]:
+        return call(rs().wall_detail, f"wall/{wall_id}")
+
+    @app.put("/api/walls/{wall_id}/review")
+    def wall_review(wall_id: str, body: WallReviewIn) -> dict[str, Any]:
+        return call(rs().save_wall_review, f"wall/{wall_id}", body.status, body.note)
+
+    @app.delete("/api/walls/{wall_id}/review")
+    def wall_review_reset(wall_id: str) -> dict[str, Any]:
+        return call(rs().reset_wall_review, f"wall/{wall_id}")
+
+    @app.put("/api/walls/geometry")
+    def walls_geometry(body: WallsGeometryIn) -> dict[str, Any]:
+        """Vários muros editados no mapa de uma vez (vértices partilhados, ligações)."""
+        return call(rs().save_walls_geometry, body.walls)
+
+    @app.put("/api/walls/{wall_id}/geometry")
+    def wall_geometry(wall_id: str, body: WallGeometryIn) -> dict[str, Any]:
+        """Geometria do muro editada no mapa."""
+        return call(rs().save_wall_geometry, f"wall/{wall_id}", body.coords)
+
+    @app.delete("/api/walls/{wall_id}/geometry")
+    def wall_geometry_reset(wall_id: str) -> dict[str, Any]:
+        return call(rs().reset_wall_geometry, f"wall/{wall_id}")
+
+    @app.get("/api/landuse/{way_id}")
+    def landuse(way_id: int) -> dict[str, Any]:
+        """Landuse do OSM editável no mapa (anel com as edições e nós partilhados)."""
+        return call(rs().landuse_detail, way_id)
+
+    @app.put("/api/landuse/{way_id}/geometry")
+    def landuse_geometry(way_id: int, body: LanduseGeometryIn) -> dict[str, Any]:
+        """Landuse editado no mapa (nós movidos, acrescentados ou tirados)."""
+        return call(rs().save_landuse, way_id, body.nodes)
+
+    @app.delete("/api/landuse/{way_id}/geometry")
+    def landuse_geometry_reset(way_id: int) -> dict[str, Any]:
+        return call(rs().reset_landuse, way_id)
 
     @app.get("/api/osm-context")
     def osm_context() -> dict[str, Any]:
@@ -409,7 +481,6 @@ def create_app(
             ctx.process,
             candidates=body.candidates,
             redo_from=body.redo_from,
-            municipal=body.municipal,
             refresh_municipal=body.refresh_municipal,
         )
 
