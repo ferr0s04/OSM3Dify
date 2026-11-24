@@ -187,6 +187,11 @@ class MunicipalSourceConfig(BaseModel):
         slug = re.sub(r"[^a-z0-9]+", "-", ascii_name.lower())
         return self.cache_dir / f"{slug.strip('-') or 'municipal'}.geojson"
 
+    @property
+    def full_barriers_path(self) -> Path:
+        """Muros e vedações de todo o concelho (GeoJSON, EPSG:3763), ao lado dos edifícios."""
+        return self.full_path.with_name(self.full_path.stem + "-muros.geojson")
+
 
 class SourcesConfig(BaseModel):
     overpass_url: str = "https://overpass-api.de/api/interpreter"

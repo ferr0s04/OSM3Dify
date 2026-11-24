@@ -400,10 +400,18 @@ def barriers_path(config: Config) -> Path:
 def fetch_area_barriers(
     config: Config, *, force: bool = False, progress: Callable[[str], None] | None = None
 ) -> Path:
-    """Muros e vedações municipais das quadrículas da área (+30 m), em cache."""
+    """Muros e vedações municipais das quadrículas da área (+30 m), em cache.
+
+    Com a cópia de todo o concelho descarregada, recortam-se dela (sem pedidos ao
+    geoportal); senão, pedem-se ao geoportal só os da área.
+    """
     import shapely
 
-    from osm3d.acquisition.municipal import fetch_municipal_barriers
+    from osm3d.acquisition.municipal import (
+        crop_barriers,
+        fetch_municipal_barriers,
+        full_barriers_usable,
+    )
     from osm3d.geospatial.tiling import TileKey
 
     tiles = config.area.tiles
@@ -413,9 +421,14 @@ def fetch_area_barriers(
     bbox = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
     out = barriers_path(config)
     stale = force or not out.exists() or not cache_matches(out, tiles)
-    path = fetch_municipal_barriers(
-        bbox, config.sources.municipal, out, force=stale, progress=progress
-    )
+    mcfg = config.sources.municipal
+    if full_barriers_usable(mcfg):
+        full = mcfg.full_barriers_path
+        if stale or full.stat().st_mtime > out.stat().st_mtime:
+            crop_barriers(full, bbox, out, progress)
+        path = out
+    else:
+        path = fetch_municipal_barriers(bbox, mcfg, out, force=stale, progress=progress)
     mark_cache(path, tiles)
     return path
 
@@ -615,17 +628,42 @@ def municipal_status(config: Config) -> dict[str, Any]:
 
 
 def municipal_full_status(config: Config) -> dict[str, Any]:
-    """Cópia de todo o concelho (descarregada a pedido, partilhada por todas as áreas)."""
-    from osm3d.acquisition.municipal import read_fetch_meta
+    """Cópia de todo o concelho (descarregada a pedido, partilhada por todas as áreas):
+    edifícios, muros e um download interrompido que se pode retomar."""
+    from osm3d.acquisition.municipal import (
+        BoxLog,
+        barriers_meta,
+        full_barriers_usable,
+        progress_path,
+        read_fetch_meta,
+    )
 
-    full = config.sources.municipal.full_path
+    m = config.sources.municipal
+    full, walls = m.full_path, m.full_barriers_path
     meta = read_fetch_meta(full)
+    wmeta = barriers_meta(walls) if walls.exists() else {}
+    parts = [BoxLog.status(progress_path(p)) for p in (full, walls)]
+    partial = [s for s in parts if s]
     return {
         "cached": full.exists(),
-        "path": str(full),
+        "path": str(full.resolve()),
         "n": meta.get("n"),
         "fetched_at": meta.get("fetched_at"),
-        "bytes": full.stat().st_size if full.exists() else 0,
+        "bytes": (full.stat().st_size if full.exists() else 0)
+        + (walls.stat().st_size if walls.exists() else 0),
+        "barriers": {
+            "configured": bool(m.barriers),
+            "cached": full_barriers_usable(m),
+            "n": wmeta.get("n"),
+            "fetched_at": wmeta.get("fetched_at"),
+        },
+        # Download interrompido (servidor reiniciado, cancelado, erro): retoma-se.
+        "partial": {
+            "done": sum(s["done"] for s in partial),
+            "total": sum(s["total"] for s in partial),
+        }
+        if partial
+        else None,
     }
 
 

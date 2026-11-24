@@ -13,6 +13,9 @@ const GRID_MIN_ZOOM = 9;
 // Tamanhos típicos por quadrícula (levantamento DGT 2024–2025), só para estimar o download.
 const TYPICAL_MB = { lidar: 155, dtm: 13, dsm: 13 };
 const SHORT = { lidar: "LAZ", dtm: "MDT", dsm: "MDS", orthophoto: "Orto" };
+// "Eliminar ficheiros da área" não apaga as ortofotos (folhas grandes, partilhadas por
+// ~40 quadrículas, também de outras áreas): só o ✕ de cada quadrícula as apaga.
+const AREA_DELETE = ["lidar", "dtm", "dsm"];
 const REQUIRED = ["lidar", "dtm"];
 const COLORS = { complete: "#16a34a", partial: "#d97706", area: "#2563eb" };
 const STAGE_LABELS = {
@@ -460,23 +463,26 @@ export class DataView {
     this.renderDownloads();
   }
 
-  bytesOf(tiles) {
-    // Bytes em disco das quadrículas: uma folha partilhada (ortofoto) conta uma vez.
+  bytesOf(tiles, products = null) {
+    // Bytes em disco das quadrículas (só de `products`, se dados): uma folha partilhada
+    // (ortofoto) conta uma vez.
     const files = new Map();
     for (const n of tiles) {
-      for (const v of Object.values(this.known.get(n)?.properties.local ?? {})) {
+      for (const [p, v] of Object.entries(this.known.get(n)?.properties.local ?? {})) {
+        if (products && !products.includes(p)) continue;
         for (const f of v.files) files.set(f, v.size / v.files.length);
       }
     }
     return [...files.values()].reduce((s, b) => s + b, 0);
   }
 
-  async removeFiles(tiles, label) {
-    const products = Object.keys(SHORT);
-    const withFiles = tiles.filter((n) => this.known.get(n)?.properties.size > 0);
+  async removeFiles(tiles, label, products = Object.keys(SHORT)) {
+    const withFiles = tiles.filter((n) => this.bytesOf([n], products) > 0);
     if (!withFiles.length) return this.toast("Não há ficheiros locais para apagar.");
-    const bytes = this.bytesOf(withFiles);
-    const sheets = withFiles.some((n) => (this.known.get(n).properties.local.orthophoto?.shared ?? 1) > 1);
+    const bytes = this.bytesOf(withFiles, products);
+    const sheets = products.includes("orthophoto") &&
+      withFiles.some((n) => (this.known.get(n).properties.local.orthophoto?.shared ?? 1) > 1);
+    const kept = products.includes("orthophoto") ? "" : "As ortofotos ficam (apagam-se no ✕ de cada quadrícula).\n";
     const shared = this.areas.areas
       .filter((a) => !a.active)
       .map((a) => [a.name, a.tiles.filter((t) => withFiles.includes(t))])
@@ -485,6 +491,7 @@ export class DataView {
       `${withFiles.slice(0, 12).join(", ")}${withFiles.length > 12 ? "…" : ""}\n\n` +
       (shared.length ? `Também usadas por: ${shared.map(([n, t]) => `${n} (${t.length})`).join(", ")}.\n` : "") +
       (sheets ? "As folhas de ortofoto cobrem também quadrículas vizinhas: deixam de existir para elas.\n" : "") +
+      kept +
       (this.includeCache ? "As caches de pontos da revisão destes LAZ também são apagadas.\n" : "") +
       "Não pode ser desfeito: será preciso voltar a descarregá-los.";
     if (!confirm(msg)) return;
@@ -606,7 +613,7 @@ export class DataView {
     const removed = a.tiles.filter((t) => !this.draft.has(t)).length;
     const missing = this.missingTiles();
     const est = this.estimate(missing, this.products());
-    const areaBytes = this.bytesOf(a.tiles);
+    const areaBytes = this.bytesOf(a.tiles, AREA_DELETE);
     const running = this.processing?.running;
     const plan = this.stagePlan();
     const warnings = [
@@ -659,7 +666,7 @@ export class DataView {
       ${this.areas?.municipal?.configured
         ? `<label class="check small" title="Polígonos da cartografia municipal sem contorno no OSM, confirmados pelo LiDAR (que dá a forma do telhado)"><input type="checkbox" id="p-candidates" ${this.processOpts.candidates ? "checked" : ""}> incluir edifícios da cartografia municipal em falta no OSM</label>`
         : '<p class="small muted">Edifícios em falta no OSM: configurar o geoportal municipal (sources.municipal em config/local.yaml).</p>'}
-      ${this.processOpts.candidates ? this.renderMunicipal() : ""}
+      ${this.renderMunicipal()}
       <label class="small redo">refazer:
         <select id="p-redo" title="Por omissão só correm as fases em falta ou desatualizadas">
           <option value="">nada (só as fases em falta)</option>
@@ -698,7 +705,7 @@ export class DataView {
       this.renderPanel();
     }));
     $p("#d-download").onclick = () => this.download();
-    $p("#d-delete").onclick = () => this.removeFiles(a.tiles, `"${a.label || a.name}"`);
+    $p("#d-delete").onclick = () => this.removeFiles(a.tiles, `"${a.label || a.name}"`, AREA_DELETE);
     $p("#d-cache").oninput = (e) => (this.includeCache = e.target.checked);
     $p("#p-start").onclick = () => this.process();
     $p("#p-candidates")?.addEventListener("input", (e) => {
@@ -743,8 +750,8 @@ export class DataView {
       <span class="muted">Contornos municipais sem contorno no OSM e confirmados pelo LiDAR (casa, anexo, garagem, telheiro separados);
         o LiDAR dá a forma e a altura do telhado. Área mínima ${m.min_area_m2} m².</span>
       <span>${cache} · <a href="${esc(m.viewer_url)}" target="_blank" rel="noopener">geoportal ↗</a></span>
-      <label class="check"><input type="checkbox" id="p-muni-refresh" ${this.processOpts.refresh_municipal ? "checked" : ""}>
-        ${full ? "voltar a recortar da cópia do concelho (refaz os candidatos)" : "voltar a obter do geoportal (refaz os candidatos)"}</label>
+      ${this.processOpts.candidates ? `<label class="check"><input type="checkbox" id="p-muni-refresh" ${this.processOpts.refresh_municipal ? "checked" : ""}>
+        ${full ? "voltar a recortar da cópia do concelho (refaz os candidatos)" : "voltar a obter do geoportal (refaz os candidatos)"}</label>` : ""}
       <div id="muni-dl"></div>
     </div>`;
   }
@@ -757,24 +764,34 @@ export class DataView {
     const d = this.muniDownload ?? m.download ?? {};
     const f = m.full ?? {};
     const when = f.fetched_at ? new Date(f.fetched_at).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "short" }) : null;
+    const walls = f.barriers ?? {};
+    const part = f.partial;
+    const resume = part && !d.running
+      ? `<span class="warn-text">Download do concelho interrompido: ${part.done} de ${part.total} pedidos feitos. Os feitos não se repetem.</span>
+         <button class="btn mini-light" id="muni-dl-start" title="Retoma onde parou">Continuar download</button>` : "";
     let body;
     if (d.running) {
       const pct = d.total ? Math.min(100, (100 * d.done) / d.total) : 0;
       body = `<b>A descarregar o concelho…</b>
         <span class="t-bar"><span style="width:${pct.toFixed(1)}%"></span></span>
         <span class="muted">${esc(d.message ?? "")}</span>
+        <span class="muted">Cada pedido fica guardado: se o servidor for reiniciado, o download retoma.</span>
         <button class="btn mini-light" id="muni-dl-cancel">Cancelar</button>`;
     } else {
       const last = d.finished_at && d.ok === false
         ? `<span class="${d.error ? "warn-text" : "muted"}">Último download: ${esc(d.message ?? "")}${d.error ? ` — ${esc(d.error)}` : ""}</span>` : "";
+      const wallsInfo = walls.configured
+        ? walls.cached ? ` e <b>${(walls.n ?? 0).toLocaleString("pt-PT")}</b> linhas de muros` : " (muros ainda não: descarregar de novo para os incluir)"
+        : "";
       body = f.cached
-        ? `<span>Cópia do concelho: <b>${(f.n ?? 0).toLocaleString("pt-PT")}</b> polígonos${when ? `, de ${when}` : ""} (${mb(f.bytes ?? 0)}).
-             Todas as áreas a recortam localmente, sem pedidos ao geoportal.</span>
-           ${last}
-           <button class="btn mini-light" id="muni-dl-start" title="Voltar a descarregar todo o concelho (a cópia atual só é substituída no fim)">Descarregar de novo</button>`
+        ? `<span>Cópia do concelho: <b>${(f.n ?? 0).toLocaleString("pt-PT")}</b> polígonos${wallsInfo}${when ? `, de ${when}` : ""} (${mb(f.bytes ?? 0)}).
+             Usada automaticamente: todas as áreas a recortam localmente, sem pedidos ao geoportal.
+             Não é apagada com os ficheiros das áreas.</span>
+           ${last}${resume}
+           ${resume ? "" : `<button class="btn mini-light" id="muni-dl-start" title="Voltar a descarregar todo o concelho (a cópia atual só é substituída no fim)">Descarregar de novo</button>`}`
         : `<span class="muted">Sem cópia do concelho: cada área pede ao geoportal só a sua zona.</span>
-           ${last}
-           <button class="btn mini-light" id="muni-dl-start" title="~110 mil polígonos, ~260 pedidos espaçados, ~5 min. Fica guardado em data/raw/municipal e serve todas as áreas.">Descarregar todo o concelho</button>`;
+           ${last}${resume}
+           ${resume ? "" : `<button class="btn mini-light" id="muni-dl-start" title="Edifícios e muros de todo o concelho, pedidos espaçados ao geoportal (~15 min). Fica guardado e serve todas as áreas.">Descarregar todo o concelho</button>`}`;
     }
     el.innerHTML = `<div class="muni-full">${body}</div>`;
     el.querySelector("#muni-dl-start")?.addEventListener("click", () => this.startMuniDownload());
@@ -785,10 +802,12 @@ export class DataView {
 
   async startMuniDownload() {
     const f = this.areas?.municipal?.full;
-    const msg = f?.cached
-      ? "Voltar a descarregar toda a cartografia municipal do concelho?\n\nA cópia atual mantém-se até o novo download terminar."
-      : "Descarregar toda a cartografia municipal do concelho?\n\n~110 mil polígonos, ~260 pedidos espaçados ao geoportal (~5 min). Fica guardada e serve todas as áreas: deixam de ser feitos pedidos por área.";
-    if (!confirm(msg)) return;
+    const msg = f?.partial
+      ? null // retomar: sem perguntas
+      : f?.cached
+        ? "Voltar a descarregar toda a cartografia municipal do concelho (edifícios e muros)?\n\nA cópia atual mantém-se até o novo download terminar."
+        : "Descarregar toda a cartografia municipal do concelho (edifícios e muros)?\n\nPedidos espaçados ao geoportal (~15 min). Cada pedido fica guardado: se o servidor for reiniciado, o download retoma. A cópia serve todas as áreas (deixam de ser feitos pedidos por área) e não é apagada com os ficheiros das áreas.";
+    if (msg && !confirm(msg)) return;
     try {
       this.setMuniDownload(await api.startMunicipalDownload());
     } catch (e) {

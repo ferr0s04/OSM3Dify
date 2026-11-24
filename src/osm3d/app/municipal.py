@@ -95,7 +95,7 @@ class MunicipalDownload:
                 done=done,
                 total=total,
                 found=found,
-                message=f"{done} de {total} pedidos · {found:,} polígonos".replace(",", " "),
+                message=f"{done} de {total} pedidos · {found:,} elementos".replace(",", " "),
             )
 
     def _progress(self, line: str) -> None:
@@ -111,18 +111,22 @@ class MunicipalDownload:
             ok = True
             with self._lock:
                 self._state["message"] = (
-                    f"{self._state.get('found', 0):,} polígonos guardados em {path}".replace(
+                    f"{self._state.get('found', 0):,} elementos guardados em {path}".replace(
                         ",", " "
                     )
                 )
         except MunicipalCancelled:
             with self._lock:
-                self._state["message"] = "cancelado (a cópia anterior, se havia, mantém-se)"
+                self._state["message"] = (
+                    "cancelado: os pedidos feitos ficam guardados (o download seguinte retoma)"
+                )
         except (MunicipalError, urllib.error.URLError, OSError, ValueError) as exc:
             log.warning("Download da cartografia municipal falhou: %s", exc)
             with self._lock:
                 self._state["error"] = f"{type(exc).__name__}: {exc}"
-                self._state["message"] = "falhou (a cópia anterior, se havia, mantém-se)"
+                self._state["message"] = (
+                    "falhou: os pedidos feitos ficam guardados (o download seguinte retoma)"
+                )
         finally:
             with self._lock:
                 self._state["ok"] = ok

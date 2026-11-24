@@ -183,3 +183,94 @@ def test_enabled_needs_a_geoportal() -> None:
     with pytest.raises(ValueError):
         MunicipalSourceConfig(enabled=True)
     assert not MunicipalSourceConfig().configured and _source().configured
+
+
+WALL_SET = b"""<FeatureSet>
+  <Feature><Property><Name>gid</Name><Value>7</Value></Property>
+    <Property><Name>valor_cons</Name><Value>12</Value></Property>
+    <Property><Name>geom</Name><Value>LINESTRING (0 0, 20 0)</Value></Property></Feature>
+  <Feature><Property><Name>gid</Name><Value>8</Value></Property>
+    <Property><Name>valor_cons</Name><Value>12</Value></Property>
+    <Property><Name>geom</Name><Value>LINESTRING (1200 800, 1250 800)</Value></Property></Feature>
+</FeatureSet>"""
+
+
+class _FullWithWalls(_FakeFullClient):
+    """Concelho de 1500 × 900 m: 2 caixas de 1 km, edifícios e uma camada de muros."""
+
+    def __init__(self, fail_after: int | None = None) -> None:
+        super().__init__()
+        self.fail_after = fail_after
+
+    def select(self, b, feature_class=None, filter=None):  # type: ignore[no-untyped-def]
+        if self.fail_after is not None and len(self.boxes) >= self.fail_after:
+            raise OSError("ligação perdida")  # p.ex. o servidor reiniciado a meio
+        self.boxes.append(b)
+        return WALL_SET if feature_class else FEATURE_SET
+
+
+def _walls_source(tmp_path: Path) -> MunicipalSourceConfig:
+    from osm3d.config import BarrierLayer, BarrierRule
+
+    layer = BarrierLayer(
+        label="2024",
+        feature_class="carto:muros",
+        rules=[BarrierRule(match={"valor_cons": "12"}, tags={"barrier": "wall"})],
+    )
+    return _source(enabled=True, delay_s=0.2, cache_dir=tmp_path / "raw", barriers=[layer])
+
+
+def test_full_download_resumes_after_interruption(tmp_path: Path) -> None:
+    from osm3d.acquisition.municipal import (
+        BoxLog,
+        fetch_full_municipality,
+        full_barriers_usable,
+        progress_path,
+    )
+
+    cfg = _walls_source(tmp_path)
+    # 1.º download: cai depois de 3 dos 4 pedidos (2 de edifícios + 1 de muros).
+    first = _FullWithWalls(fail_after=3)
+    with pytest.raises(OSError):
+        fetch_full_municipality(cfg, first)  # type: ignore[arg-type]
+    assert not cfg.full_barriers_path.exists()
+    assert BoxLog.status(progress_path(cfg.full_barriers_path)) == {"done": 1, "total": 2}
+    # 2.º: só faz o pedido que faltava e deixa as duas cópias completas.
+    second = _FullWithWalls()
+    seen: list[tuple[int, int, int]] = []
+    fetch_full_municipality(cfg, second, on_box=lambda d, t, n: seen.append((d, t, n)))  # type: ignore[arg-type]
+    assert len(second.boxes) == 1 and seen[-1][:2] == (4, 4)
+    assert cfg.full_path.exists() and full_barriers_usable(cfg)
+    assert not progress_path(cfg.full_path).exists()
+    assert not progress_path(cfg.full_barriers_path).exists()
+
+
+def test_area_walls_are_cropped_from_the_full_copy(tmp_path: Path) -> None:
+    from osm3d.acquisition.municipal import (
+        crop_barriers,
+        fetch_full_municipality,
+        load_municipal_barriers,
+    )
+
+    cfg = _walls_source(tmp_path)
+    fetch_full_municipality(cfg, _FullWithWalls())  # type: ignore[arg-type]
+    out = crop_barriers(cfg.full_barriers_path, (-10, -10, 100, 100), tmp_path / "area.geojson")
+    (wall,) = load_municipal_barriers(out)
+    assert wall.key == "0:7:0" and wall.tags == {"barrier": "wall"}
+
+
+def test_deleting_area_files_keeps_the_municipality_copy(tmp_path: Path) -> None:
+    from osm3d.acquisition.inventory import PRODUCTS, delete_local
+    from tests.test_data import make_cfg, touch
+
+    cfg = make_cfg(tmp_path)
+    m = _walls_source(tmp_path).model_copy(
+        update={"cache_dir": cfg.sources.lidar_dir.parent / "municipal"}
+    )
+    m.full_path.parent.mkdir(parents=True)
+    m.full_path.write_text("{}", encoding="utf-8")
+    m.full_barriers_path.write_text("{}", encoding="utf-8")
+    laz = touch(cfg.sources.lidar_dir / "LO-155480-07-2025_v05.laz", 100)
+    removed = delete_local(cfg.sources, cfg.paths.processed, ["155480"], PRODUCTS)
+    assert [f.path for f in removed] == [laz]
+    assert m.full_path.exists() and m.full_barriers_path.exists()

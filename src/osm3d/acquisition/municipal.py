@@ -44,6 +44,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import certifi
 import numpy as np
@@ -253,6 +254,7 @@ def fetch_municipal_buildings(
     on_box: BoxProgress | None = None,
     cancel: threading.Event | None = None,
     full: bool = False,
+    log: BoxLog | None = None,
 ) -> Path:
     """Descarrega os edifícios municipais da caixa (EPSG:3763) para GeoJSON (cache).
 
@@ -263,12 +265,23 @@ def fetch_municipal_buildings(
     client = client or MapGuideClient(cfg)
     boxes = request_boxes(bbox, chunk_m or cfg.chunk_m)
     found: dict[int, MunicipalBuilding] = {}
+    asked = False
     for i, box in enumerate(boxes):
         if cancel is not None and cancel.is_set():
             raise MunicipalCancelled("Download da cartografia municipal cancelado")
-        if i:
-            time.sleep(cfg.delay_s)
-        for b in parse_features(client.select(box)):
+        if log is not None and i in log.done:  # já feito num download interrompido
+            items = [
+                MunicipalBuilding(int(d["gid"]), shape(d["geom"]), str(d["descr"]))
+                for d in log.done[i]
+            ]
+        else:
+            if asked:
+                time.sleep(cfg.delay_s)
+            asked = True
+            items = parse_features(client.select(box))
+            if log is not None:
+                log.add(i, [_building_item(b) for b in items])
+        for b in items:
             found[b.gid] = b
         if on_box:
             on_box(i + 1, len(boxes), len(found))
@@ -278,6 +291,64 @@ def fetch_municipal_buildings(
         )
     _write(out, sorted(found.values(), key=lambda b: b.gid), cfg, bbox, full=full)
     return out
+
+
+class BoxLog:
+    """Pedidos já feitos de um download longo, guardados em disco à medida que chegam.
+
+    Se o download for interrompido (servidor reiniciado, cancelado, erro de rede), o
+    seguinte com os mesmos parâmetros (``header``) retoma: os pedidos feitos não se
+    repetem. Uma linha por pedido; a última pode ter ficado a meio e é ignorada.
+    """
+
+    def __init__(self, path: Path, header: dict[str, Any]) -> None:
+        self.path = path
+        self.done: dict[int, list[dict[str, Any]]] = {}
+        header = json.loads(json.dumps(header))  # como fica no ficheiro (listas, não tuplos)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+            if lines and json.loads(lines[0]) == header:
+                for line in lines[1:]:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        break
+                    self.done[int(rec["i"])] = rec["items"]
+        except (OSError, ValueError, KeyError):
+            self.done = {}
+        if not self.done:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(header) + "\n", encoding="utf-8")
+
+    def add(self, i: int, items: list[dict[str, Any]]) -> None:
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"i": i, "items": items}) + "\n")
+
+    def finish(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+    @staticmethod
+    def status(path: Path) -> dict[str, int] | None:
+        """Pedidos feitos e total de um download interrompido (``None``: não há)."""
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            total = int(json.loads(lines[0]).get("total", 0))
+        except (OSError, ValueError, IndexError, AttributeError):
+            return None
+        return {"done": max(0, len(lines) - 1), "total": total}
+
+
+def _building_item(b: MunicipalBuilding) -> dict[str, Any]:
+    return {"gid": b.gid, "descr": b.descr, "geom": mapping(b.geometry)}
+
+
+def _barrier_item(b: MunicipalBarrier) -> dict[str, Any]:
+    return {"key": b.key, "layer": b.layer, "tags": b.tags, "geom": mapping(b.geometry)}
+
+
+def progress_path(out: Path) -> Path:
+    """Ficheiro de progresso (para retomar) de um download do concelho."""
+    return out.with_name(out.name + ".progress.jsonl")
 
 
 def fetch_meta(path: Path) -> Path:
@@ -341,32 +412,79 @@ def fetch_full_municipality(
     cancel: threading.Event | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> Path:
-    """Descarrega todos os edifícios do concelho para ``cfg.full_path``.
+    """Descarrega todo o concelho: edifícios (``cfg.full_path``) e, com camadas de muros
+    configuradas, muros e vedações (``cfg.full_barriers_path``).
 
     A extensão vem do próprio geoportal. Pedidos de ``full_chunk_m`` (1 km), espaçados
-    como os outros; a cópia anterior só é substituída no fim.
+    como os outros; as cópias anteriores só são substituídas no fim. Cada pedido feito
+    fica em disco: um download interrompido retoma onde parou.
     """
     client = client or MapGuideClient(cfg)
     extent = client.extent()
+    step = cfg.full_chunk_m
+    n_boxes = len(request_boxes(extent, step))
+    n_layers = len(cfg.barriers)
+    total = n_boxes * (1 + n_layers)
     if progress:
         x0, y0, x1, y1 = extent
-        n = len(request_boxes(extent, cfg.full_chunk_m))
         progress(
             f"cartografia municipal: concelho com {(x1 - x0) / 1000:.1f} × "
-            f"{(y1 - y0) / 1000:.1f} km, {n} pedidos"
+            f"{(y1 - y0) / 1000:.1f} km, {total} pedidos"
         )
-    return fetch_municipal_buildings(
+    header = {"bbox": list(extent), "step": step, "total": n_boxes, "source": cfg.feature_source}
+    blog = BoxLog(
+        progress_path(cfg.full_path),
+        header | {"layer": cfg.feature_class, "filter": cfg.filter},
+    )
+    found = {"buildings": 0}
+
+    def buildings_box(done: int, _total: int, n: int) -> None:
+        found["buildings"] = n
+        if on_box:
+            on_box(done, total, n)
+
+    path = fetch_municipal_buildings(
         extent,
         cfg,
         cfg.full_path,
         force=True,
         progress=progress,
         client=client,
-        chunk_m=cfg.full_chunk_m,
-        on_box=on_box,
+        chunk_m=step,
+        on_box=buildings_box,
         cancel=cancel,
         full=True,
+        log=blog,
     )
+    logs = [blog]
+    if cfg.barriers:
+        layers = [[layer.feature_class, layer.filter] for layer in cfg.barriers]
+        wlog = BoxLog(
+            progress_path(cfg.full_barriers_path),
+            header | {"total": n_boxes * n_layers, "layers": layers},
+        )
+        logs.append(wlog)
+
+        def barriers_box(done: int, _total: int, n: int) -> None:
+            if on_box:
+                on_box(n_boxes + done, total, found["buildings"] + n)
+
+        fetch_municipal_barriers(
+            extent,
+            cfg,
+            cfg.full_barriers_path,
+            force=True,
+            progress=progress,
+            client=client,
+            chunk_m=step,
+            on_box=barriers_box,
+            cancel=cancel,
+            full=True,
+            log=wlog,
+        )
+    for done_log in logs:  # só no fim de tudo: uma interrupção nos muros não refaz os edifícios
+        done_log.finish()
+    return path
 
 
 def crop_municipal(
@@ -449,22 +567,46 @@ def fetch_municipal_barriers(
     force: bool = False,
     progress: Callable[[str], None] | None = None,
     client: MapGuideClient | None = None,
+    chunk_m: float | None = None,
+    on_box: BoxProgress | None = None,
+    cancel: threading.Event | None = None,
+    full: bool = False,
+    log: BoxLog | None = None,
 ) -> Path:
-    """Muros e vedações das camadas ``cfg.barriers`` na caixa (EPSG:3763), em GeoJSON."""
+    """Muros e vedações das camadas ``cfg.barriers`` na caixa (EPSG:3763), em GeoJSON.
+
+    ``log``: pedidos já feitos (download do concelho retomável, ver :class:`BoxLog`).
+    """
     if out.exists() and not force:
         return out
     if not cfg.barriers:
         raise MunicipalError("Sem camadas de muros configuradas (sources.municipal.barriers)")
     client = client or MapGuideClient(cfg)
-    boxes = request_boxes(bbox, cfg.chunk_m * 2)
+    boxes = request_boxes(bbox, chunk_m or cfg.chunk_m * 2)
     found: dict[str, MunicipalBarrier] = {}
+    asked = False
     for priority, layer in enumerate(cfg.barriers):
         for i, box in enumerate(boxes):
-            if i or priority:
-                time.sleep(cfg.delay_s)
-            xml = client.select(box, layer.feature_class, layer.filter)
-            for b in parse_barriers(xml, layer, priority):
+            if cancel is not None and cancel.is_set():
+                raise MunicipalCancelled("Download da cartografia municipal cancelado")
+            k = priority * len(boxes) + i
+            if log is not None and k in log.done:
+                items = [
+                    MunicipalBarrier(d["key"], d["layer"], shape(d["geom"]), d["tags"], priority)
+                    for d in log.done[k]
+                ]
+            else:
+                if asked:
+                    time.sleep(cfg.delay_s)
+                asked = True
+                xml = client.select(box, layer.feature_class, layer.filter)
+                items = parse_barriers(xml, layer, priority)
+                if log is not None:
+                    log.add(k, [_barrier_item(b) for b in items])
+            for b in items:
                 found[b.key] = b
+            if on_box:
+                on_box(k + 1, len(boxes) * len(cfg.barriers), len(found))
         if progress:
             n = sum(b.priority == priority for b in found.values())
             progress(f"  muros municipais ({layer.label or layer.feature_class}): {n} linhas")
@@ -483,13 +625,56 @@ def fetch_municipal_barriers(
         "features": features,
         "osm3d": {
             "source": cfg.name,
-            "layers": [layer.label or layer.feature_class for layer in cfg.barriers],
+            "layers": barrier_layers(cfg),
             "bbox": list(bbox),
             "fetched_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "full": full,  # cópia de todo o concelho
+            "from_full": False,
+            "n": len(features),
         },
     }
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     tmp.replace(out)
+    return out
+
+
+def barrier_layers(cfg: MunicipalSourceConfig) -> list[str]:
+    return [layer.label or layer.feature_class for layer in cfg.barriers]
+
+
+def full_barriers_usable(cfg: MunicipalSourceConfig) -> bool:
+    """Há uma cópia dos muros do concelho feita com as camadas configuradas agora?"""
+    path = cfg.full_barriers_path
+    if not cfg.barriers or not path.exists():
+        return False
+    meta = barriers_meta(path)
+    return bool(meta.get("full")) and meta.get("layers") == barrier_layers(cfg)
+
+
+def crop_barriers(
+    full: Path,
+    bbox: tuple[float, float, float, float],
+    out: Path,
+    progress: Callable[[str], None] | None = None,
+) -> Path:
+    """Muros da caixa, recortados da cópia do concelho (sem pedidos ao geoportal)."""
+    data = json.loads(full.read_text(encoding="utf-8"))
+    area = shapely.box(*bbox)
+    features = [f for f in data.get("features", []) if shape(f["geometry"]).intersects(area)]
+    meta = dict(data.get("osm3d", {}))
+    meta.update(bbox=list(bbox), full=False, from_full=True, n=len(features))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".part")
+    tmp.write_text(
+        json.dumps({"type": "FeatureCollection", "features": features, "osm3d": meta}),
+        encoding="utf-8",
+    )
+    tmp.replace(out)
+    if progress:
+        progress(
+            f"  muros municipais: {len(features)} linhas (recortadas da cópia do concelho, "
+            "sem pedidos ao geoportal)"
+        )
     return out
 
 
