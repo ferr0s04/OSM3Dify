@@ -735,81 +735,89 @@ export class DataView {
   }
 
   renderMunicipal() {
-    // Cartografia municipal de edifícios (fase candidatos): usar ou não, estado, refazer.
+    // Cartografia municipal (fase candidatos): as câmaras configuradas, as que cobrem a
+    // área ativa, o recorte da área e a cópia de cada concelho.
     const m = this.areas?.municipal;
-    if (!m || !m.configured) return "";  // sem geoportal municipal configurado
+    if (!m || !m.configured) return "";  // sem câmaras configuradas
     const when = m.fetched_at ? new Date(m.fetched_at).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "short" }) : null;
-    const full = m.full?.cached;
+    const sources = m.sources ?? [];
+    const here = sources.filter((s) => s.covers_area);
     const cache = m.cached
-      ? `${m.n ?? "?"} polígonos de edifício nesta área${m.from_full ? " (recortados da cópia do concelho)" : ""}${when ? `, dados de ${when}` : ""}`
-      : full
-        ? "recortada da cópia do concelho ao processar os candidatos (sem pedidos ao geoportal)"
-        : "ainda não obtida (é pedida ao geoportal ao processar os candidatos)";
+      ? `${m.n ?? "?"} polígonos de edifício nesta área${m.from_full ? " (recortados das cópias dos concelhos)" : ""}${when ? `, dados de ${when}` : ""}`
+      : "obtida ao processar os candidatos (da cópia do concelho, se existe; senão, só a área)";
     return `<div class="muni-box small">
-      <b>${esc(m.name)}</b>
-      <span class="muted">Contornos municipais sem contorno no OSM e confirmados pelo LiDAR (casa, anexo, garagem, telheiro separados);
-        o LiDAR dá a forma e a altura do telhado. Área mínima ${m.min_area_m2} m².</span>
-      <span>${cache} · <a href="${esc(m.viewer_url)}" target="_blank" rel="noopener">geoportal ↗</a></span>
+      <b>Cartografia municipal${here.length ? `: ${here.map((s) => esc(s.name)).join(" + ")}` : ""}</b>
+      <span class="muted">Contornos municipais sem contorno no OSM e confirmados pelo LiDAR; o LiDAR dá a forma e a altura do telhado.
+        Área mínima ${m.min_area_m2} m².${here.length > 1 ? " Na fronteira, um edifício que as duas cartografias têm fica só uma vez." : ""}</span>
+      <span>${cache}</span>
       ${this.processOpts.candidates ? `<label class="check"><input type="checkbox" id="p-muni-refresh" ${this.processOpts.refresh_municipal ? "checked" : ""}>
-        ${full ? "voltar a recortar da cópia do concelho (refaz os candidatos)" : "voltar a obter do geoportal (refaz os candidatos)"}</label>` : ""}
+        voltar a obter a cartografia da área (refaz os candidatos)</label>` : ""}
       <div id="muni-dl"></div>
     </div>`;
   }
 
   renderMuniDownload() {
-    // Cópia de todo o concelho: descarregada uma vez, as áreas recortam-na localmente.
+    // Cópia de todo o concelho de cada câmara: descarregada uma vez, as áreas recortam-na
+    // localmente. As que cobrem a área ativa primeiro.
     const el = this.panelEl.querySelector("#muni-dl");
     const m = this.areas?.municipal;
     if (!el || !m) return;
     const d = this.muniDownload ?? m.download ?? {};
-    const f = m.full ?? {};
-    const when = f.fetched_at ? new Date(f.fetched_at).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "short" }) : null;
-    const walls = f.barriers ?? {};
-    const part = f.partial;
-    const resume = part && !d.running
-      ? `<span class="warn-text">Download do concelho interrompido: ${part.done} de ${part.total} pedidos feitos. Os feitos não se repetem.</span>
-         <button class="btn mini-light" id="muni-dl-start" title="Retoma onde parou">Continuar download</button>` : "";
-    let body;
-    if (d.running) {
-      const pct = d.total ? Math.min(100, (100 * d.done) / d.total) : 0;
-      body = `<b>A descarregar o concelho…</b>
-        <span class="t-bar"><span style="width:${pct.toFixed(1)}%"></span></span>
-        <span class="muted">${esc(d.message ?? "")}</span>
-        <span class="muted">Cada pedido fica guardado: se o servidor for reiniciado, o download retoma.</span>
-        <button class="btn mini-light" id="muni-dl-cancel">Cancelar</button>`;
-    } else {
-      const last = d.finished_at && d.ok === false
-        ? `<span class="${d.error ? "warn-text" : "muted"}">Último download: ${esc(d.message ?? "")}${d.error ? ` — ${esc(d.error)}` : ""}</span>` : "";
+    const kinds = { mapguide: "geoportal MapGuide", arcgis: "serviço ArcGIS", file: "ficheiro de dados abertos" };
+    const sources = [...(m.sources ?? [])].sort((a, b) => b.covers_area - a.covers_area);
+    const rows = sources.map((s) => {
+      const f = s.full ?? {};
+      const running = d.running && d.source === s.key;
+      const when = f.fetched_at ? new Date(f.fetched_at).toLocaleString("pt-PT", { dateStyle: "short" }) : null;
+      const walls = f.barriers ?? {};
       const wallsInfo = walls.configured
-        ? walls.cached ? ` e <b>${(walls.n ?? 0).toLocaleString("pt-PT")}</b> linhas de muros` : " (muros ainda não: descarregar de novo para os incluir)"
+        ? walls.cached ? ` e ${(walls.n ?? 0).toLocaleString("pt-PT")} muros` : " (muros por obter: descarregar de novo)"
         : "";
-      body = f.cached
-        ? `<span>Cópia do concelho: <b>${(f.n ?? 0).toLocaleString("pt-PT")}</b> polígonos${wallsInfo}${when ? `, de ${when}` : ""} (${mb(f.bytes ?? 0)}).
-             Usada automaticamente: todas as áreas a recortam localmente, sem pedidos ao geoportal.
-             Não é apagada com os ficheiros das áreas.</span>
-           ${last}${resume}
-           ${resume ? "" : `<button class="btn mini-light" id="muni-dl-start" title="Voltar a descarregar todo o concelho (a cópia atual só é substituída no fim)">Descarregar de novo</button>`}`
-        : `<span class="muted">Sem cópia do concelho: cada área pede ao geoportal só a sua zona.</span>
-           ${last}${resume}
-           ${resume ? "" : `<button class="btn mini-light" id="muni-dl-start" title="Edifícios e muros de todo o concelho, pedidos espaçados ao geoportal (~15 min). Fica guardado e serve todas as áreas.">Descarregar todo o concelho</button>`}`;
-    }
-    el.innerHTML = `<div class="muni-full">${body}</div>`;
-    el.querySelector("#muni-dl-start")?.addEventListener("click", () => this.startMuniDownload());
-    el.querySelector("#muni-dl-cancel")?.addEventListener("click", async () => {
+      const part = f.partial;
+      const partText = part?.total ? `${part.done} de ${part.total} pedidos feitos` : part?.bytes ? `${mb(part.bytes)} descarregados` : "";
+      let state;
+      if (running) {
+        const pct = d.total ? Math.min(100, (100 * d.done) / d.total) : 0;
+        state = `<span class="t-bar"><span style="width:${pct.toFixed(1)}%"></span></span>
+          <span class="muted">${esc(d.message ?? "")} · se o servidor reiniciar, retoma</span>
+          <button class="btn mini-light" data-muni-cancel>Cancelar</button>`;
+      } else {
+        const last = d.source === s.key && d.finished_at && d.ok === false
+          ? `<span class="warn-text">Último download: ${esc(d.message ?? "")}${d.error ? ` — ${esc(d.error)}` : ""}</span>` : "";
+        const info = f.cached
+          ? `cópia do concelho: <b>${(f.n ?? 0).toLocaleString("pt-PT")}</b> edifícios${wallsInfo}${when ? `, de ${when}` : ""} (${mb(f.bytes ?? 0)})`
+          : `<span class="muted">sem cópia do concelho${s.kind === "file" ? " (o ficheiro é descarregado ao processar a primeira área)" : ": cada área pede só a sua zona"}</span>`;
+        const btn = d.running ? "" : partText
+          ? `<span class="warn-text">download interrompido: ${partText}</span> <button class="btn mini-light" data-muni-start="${esc(s.key)}" title="Retoma onde parou">Continuar</button>`
+          : `<button class="btn mini-light" data-muni-start="${esc(s.key)}">${f.cached ? "Descarregar de novo" : "Descarregar o concelho"}</button>`;
+        state = `<span>${info}</span>${last}${btn}`;
+      }
+      return `<div class="muni-src${s.covers_area ? "" : " muted"}">
+        <b>${esc(s.name)}</b> <span class="chip">${kinds[s.kind] ?? s.kind}</span>
+        ${s.covers_area ? '<span class="chip ok">cobre esta área</span>' : ""}
+        ${s.viewer_url ? `<a href="${esc(s.viewer_url)}" target="_blank" rel="noopener">fonte ↗</a>` : ""}
+        <div>${state}</div>
+      </div>`;
+    });
+    el.innerHTML = `<div class="muni-full">${rows.join("")}
+      <span class="muted">As cópias dos concelhos ficam em data/raw/municipal, servem todas as áreas e não são apagadas com os ficheiros das áreas.</span></div>`;
+    el.querySelectorAll("[data-muni-start]").forEach((b) => b.addEventListener("click", () => this.startMuniDownload(b.dataset.muniStart)));
+    el.querySelector("[data-muni-cancel]")?.addEventListener("click", async () => {
       this.setMuniDownload(await api.cancelMunicipalDownload());
     });
   }
 
-  async startMuniDownload() {
-    const f = this.areas?.municipal?.full;
-    const msg = f?.partial
+  async startMuniDownload(key) {
+    const s = (this.areas?.municipal?.sources ?? []).find((x) => x.key === key);
+    const f = s?.full ?? {};
+    const msg = f.partial
       ? null // retomar: sem perguntas
-      : f?.cached
-        ? "Voltar a descarregar toda a cartografia municipal do concelho (edifícios e muros)?\n\nA cópia atual mantém-se até o novo download terminar."
-        : "Descarregar toda a cartografia municipal do concelho (edifícios e muros)?\n\nPedidos espaçados ao geoportal (~15 min). Cada pedido fica guardado: se o servidor for reiniciado, o download retoma. A cópia serve todas as áreas (deixam de ser feitos pedidos por área) e não é apagada com os ficheiros das áreas.";
+      : f.cached
+        ? `Voltar a descarregar a cartografia de todo o concelho (${s?.name})?\n\nA cópia atual mantém-se até o novo download terminar.`
+        : `Descarregar a cartografia de todo o concelho (${s?.name}): edifícios${s?.barriers ? " e muros" : ""}?\n\nCada pedido fica guardado: se o servidor for reiniciado, o download retoma. A cópia serve todas as áreas (deixam de ser feitos pedidos por área) e não é apagada com os ficheiros das áreas.`;
     if (msg && !confirm(msg)) return;
     try {
-      this.setMuniDownload(await api.startMunicipalDownload());
+      this.setMuniDownload(await api.startMunicipalDownload(key));
     } catch (e) {
       this.toast(`Cartografia municipal: ${e.message}`, 6000);
     }
@@ -822,7 +830,7 @@ export class DataView {
     if (state.running) this.muniTimer = setTimeout(() => this.pollMuniDownload(), 1500);
     this.renderMuniDownload();
     if (wasRunning && !state.running) {
-      this.toast(state.ok ? "Cartografia municipal do concelho descarregada." : `Cartografia municipal: ${state.message}`, 8000);
+      this.toast(state.ok ? `Cartografia do concelho descarregada (${state.source_name ?? ""}).` : `Cartografia municipal: ${state.message}`, 8000);
       this.refresh();
     }
   }

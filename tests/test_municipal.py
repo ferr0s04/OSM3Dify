@@ -9,6 +9,7 @@ from shapely.geometry import box
 
 import osm3d.reconstruction.candidates as cand_mod
 from osm3d.acquisition.municipal import (
+    MapGuideParsing,
     MunicipalBuilding,
     fetch_municipal_buildings,
     load_municipal_buildings,
@@ -53,7 +54,7 @@ def test_parse_mapguide_feature_set() -> None:
     assert MunicipalBuilding(1, box(0, 0, 1, 1), "Piscinas").building_tag is None
 
 
-class _FakeClient:
+class _FakeClient(MapGuideParsing):
     def __init__(self) -> None:
         self.boxes: list[tuple[float, float, float, float]] = []
 

@@ -270,3 +270,8 @@ label.redo select { font: inherit; padding: 2px 4px; border: 1px solid var(--bor
 .edit-menu button:hover:not(:disabled) { background: var(--sel); }
 .edit-menu button:disabled { color: var(--muted); cursor: default; opacity: .6; }
 .edit-menu kbd { font-size: 11px; color: var(--muted); }
+
+/* Câmaras da cartografia municipal (painel de processamento). */
+.muni-src { padding: 6px 0; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 3px; }
+.muni-src:first-child { border-top: 0; }
+.muni-src > div { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }

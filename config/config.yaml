@@ -52,14 +52,24 @@ sources:
   dtm_dir: data/raw/dtm            # MDT GeoTIFF do mesmo levantamento LiDAR
   dsm_dir: data/raw/dsm            # MDS GeoTIFF (opcional)
   orthophoto_dir: data/raw/orthophotos
-  # Cartografia municipal de edifícios (opcional) de um geoportal MapGuide: é a fonte da
-  # fase candidates (edifícios em falta no OSM). Só com autorização do município.
-  # Polígonos sem contorno no OSM e confirmados pelo LiDAR passam a candidatos com o
-  # contorno municipal; o LiDAR dá-lhes a forma e a altura do telhado. Não há deteção
-  # de edifícios só pelo LiDAR. enabled: incluir a fase por omissão na aplicação. O
-  # geoportal e a camada configuram-se no config/local.yaml (name, viewer_url,
-  # mapagent_url, feature_source, feature_class, filter).
-  # Ver src/osm3d/acquisition/municipal.py.
+  # Cartografia municipal de edifícios (opcional): a fonte da fase candidates (edifícios
+  # em falta no OSM). Só com autorização do município. Polígonos sem contorno no OSM e
+  # confirmados pelo LiDAR passam a candidatos com o contorno municipal; o LiDAR dá-lhes
+  # a forma e a altura do telhado. Não há deteção de edifícios só pelo LiDAR.
+  #
+  # Uma câmara em `municipal` (forma antiga) e/ou várias em `municipalities` (lista com
+  # os mesmos campos). Cada área usa as câmaras cuja extensão (`bbox`, EPSG:3763; sem
+  # ela, a da cópia do concelho ou a pedida uma vez à fonte) a cobre; na fronteira entre
+  # concelhos, todas, sem repetir edifícios. Tipos de fonte (`kind`):
+  #   mapguide: geoportal Autodesk MapGuide (viewer_url, mapagent_url, feature_source,
+  #             feature_class, filter);
+  #   arcgis:   serviço ArcGIS REST (layer_url = …/MapServer/<n>, type_field);
+  #   file:     ficheiro de dados abertos, p.ex. GeoPackage do dados.gov.pt (file_url,
+  #             layer), descarregado uma vez para cache_dir.
+  # Classificação dos tipos (`types`): catalogo ("Vivenda Casa", "06020103-PRÉDIO"…) ou
+  # carttop (modelo CartTop da DGT). Muros: `barriers` (camadas e regras de tags).
+  # Exemplos no config/local.yaml (que configura as câmaras desta instalação).
+  # Ver src/osm3d/acquisition/municipal*.py e src/osm3d/municipal_area.py.
   municipal:
     enabled: false
     chunk_m: 250       # caixa de cada pedido (por área)

@@ -127,7 +127,11 @@ class BarrierRule(BaseModel):
 
 
 class BarrierLayer(BaseModel):
-    """Camada de muros/vedações do geoportal (linhas). A primeira regra que bate manda."""
+    """Camada de muros/vedações do geoportal (linhas). A primeira regra que bate manda.
+
+    ``feature_class``: no MapGuide, a classe (esquema:classe); no ArcGIS, o endereço da
+    camada (…/MapServer/<n>); num ficheiro, o nome da camada.
+    """
 
     label: str = ""  # p.ex. "cartografia 2024" (mostrado na aplicação)
     feature_class: str
@@ -141,20 +145,42 @@ class BarrierLayer(BaseModel):
         return None
 
 
-class MunicipalSourceConfig(BaseModel):
-    """Cartografia municipal de edifícios (geoportal MapGuide), para os candidatos.
+MunicipalKind = Literal["mapguide", "arcgis", "file"]
+# Classificação dos tipos de edifício: "catalogo" (descrições do catálogo de objetos da
+# cartografia 1:1000–1:10000 anterior ao CartTop, p.ex. "Vivenda Casa", "06020103-PRÉDIO")
+# ou "carttop" (modelo CartTop da DGT: utilização, forma e condição do edifício).
+TypeSchema = Literal["catalogo", "carttop"]
 
-    Ver ``acquisition/municipal.py``. Só com autorização do município. Cada município
-    tem o seu geoportal: os endereços e a camada vêm do ``config.yaml`` (sem omissão).
+
+class MunicipalSourceConfig(BaseModel):
+    """Cartografia municipal de edifícios (e muros) de um concelho, para os candidatos.
+
+    Ver ``acquisition/municipal.py`` e ``acquisition/municipal_providers.py``. Só com
+    autorização do município. Três tipos de fonte (``kind``):
+
+    - ``mapguide``: geoportal Autodesk MapGuide (``viewer_url``, ``mapagent_url``,
+      ``feature_source``, ``feature_class``, ``filter``);
+    - ``arcgis``: serviço ArcGIS REST (``layer_url`` = …/MapServer/<n>; ``type_field``);
+    - ``file``: ficheiro (GeoPackage) de dados abertos (``file_url``, ``layer``).
     """
 
+    kind: MunicipalKind = "mapguide"
+    id: str = ""  # identificador curto (omissão: do nome)
     enabled: bool = False
     name: str = ""  # p.ex. "Câmara Municipal de …" (mostrado na aplicação)
-    viewer_url: str = ""  # página do visualizador (dá a sessão anónima)
+    viewer_url: str = ""  # página do visualizador / do geoportal (ligação na aplicação)
     mapagent_url: str = ""  # …/mapguide/mapagent/mapagent.fcgi
     feature_source: str = ""  # Library://…/….FeatureSource
     feature_class: str = ""  # esquema:classe da camada de edifícios
-    filter: str = ""  # filtro MapGuide dos polígonos de edifício (vazio: todos)
+    filter: str = ""  # filtro dos polígonos de edifício (MapGuide/ArcGIS; vazio: todos)
+    layer_url: str = ""  # ArcGIS: …/MapServer/<n> ou …/FeatureServer/<n>
+    file_url: str = ""  # ficheiro: endereço (http/https) ou caminho local
+    layer: str = ""  # ficheiro: camada dos edifícios
+    type_field: str = ""  # campo do tipo (omissão: descr / layer / campos CartTop)
+    types: TypeSchema = "catalogo"  # classificação dos tipos de edifício (ver TypeSchema)
+    # Extensão do concelho (EPSG:3763): escolhe as câmaras de cada área sem pedidos.
+    # Omissão: a da cópia do concelho ou a pedida uma vez à fonte (em cache).
+    bbox: tuple[float, float, float, float] | None = None
     chunk_m: float = Field(default=250.0, gt=10, le=1000)
     delay_s: float = Field(default=0.5, ge=0.2, description="Pausa entre pedidos.")
     min_area_m2: float = Field(default=8.0, ge=0)
@@ -168,24 +194,38 @@ class MunicipalSourceConfig(BaseModel):
 
     @property
     def configured(self) -> bool:
-        """Há um geoportal configurado (endereços e camada)?"""
+        """Há uma fonte configurada (endereços e camada)?"""
+        if self.kind == "arcgis":
+            return bool(self.layer_url)
+        if self.kind == "file":
+            return bool(self.file_url and self.layer)
         return all((self.viewer_url, self.mapagent_url, self.feature_source, self.feature_class))
 
     @model_validator(mode="after")
     def _needs_source(self) -> MunicipalSourceConfig:
         if self.enabled and not self.configured:
-            raise ValueError(
-                "sources.municipal.enabled exige viewer_url, mapagent_url, feature_source e "
-                "feature_class (ver config.yaml)"
-            )
+            needs = {
+                "mapguide": "viewer_url, mapagent_url, feature_source e feature_class",
+                "arcgis": "layer_url",
+                "file": "file_url e layer",
+            }[self.kind]
+            raise ValueError(f"sources.municipal ({self.name or self.kind}): enabled exige {needs}")
         return self
+
+    @property
+    def key(self) -> str:
+        """Identificador curto e estável (nomes de ficheiros, aplicação)."""
+        text = self.id or self.name
+        ascii_name = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+        slug = re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-")
+        return slug or "municipal"
 
     @property
     def full_path(self) -> Path:
         """Cópia de todo o concelho (GeoJSON, EPSG:3763)."""
         ascii_name = unicodedata.normalize("NFKD", self.name).encode("ascii", "ignore").decode()
         slug = re.sub(r"[^a-z0-9]+", "-", ascii_name.lower())
-        return self.cache_dir / f"{slug.strip('-') or 'municipal'}.geojson"
+        return self.cache_dir / f"{slug.strip('-') or self.key}.geojson"
 
     @property
     def full_barriers_path(self) -> Path:
@@ -211,7 +251,25 @@ class SourcesConfig(BaseModel):
     dtm_dir: Path = Path("data/raw/dtm")
     dsm_dir: Path = Path("data/raw/dsm")
     orthophoto_dir: Path = Path("data/raw/orthophotos")
+    # Cartografia municipal: uma câmara (``municipal``, a forma antiga) e/ou várias
+    # (``municipalities``). Cada área usa as câmaras cuja extensão a cobre.
     municipal: MunicipalSourceConfig = MunicipalSourceConfig()
+    municipalities: list[MunicipalSourceConfig] = Field(default_factory=list)
+
+    @property
+    def municipal_sources(self) -> list[MunicipalSourceConfig]:
+        """Câmaras configuradas (a de ``municipal`` primeiro), sem repetidas."""
+        out = [self.municipal] if self.municipal.configured else []
+        for m in self.municipalities:
+            if m.configured and all(o.key != m.key for o in out):
+                out.append(m)
+        return out
+
+    def municipal_source(self, key: str) -> MunicipalSourceConfig:
+        for m in self.municipal_sources:
+            if m.key == key:
+                return m
+        raise KeyError(f"Câmara não configurada: {key}")
 
     def product_dir(self, product: str) -> Path:
         dirs = {

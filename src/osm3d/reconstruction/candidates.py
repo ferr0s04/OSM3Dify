@@ -317,7 +317,8 @@ def municipal_candidate(
     flags = [
         QAFlag(
             code="missing_in_osm",
-            message=f"Edifício da cartografia municipal sem contorno no OSM: {m.descr} "
+            message=f"Edifício da cartografia municipal{f' ({m.source})' if m.source else ''} "
+            f"sem contorno no OSM: {m.descr} "
             f"({footprint.area:.0f} m², ~{height:.1f} m de altura). Contorno municipal "
             f"(gid {m.gid}), confirmado pelo LiDAR em {cover:.0%} da área.",
             severity="info",

@@ -138,9 +138,12 @@ def stage_state(config: Config, stage: Stage) -> tuple[StageState, str]:
         mpath = municipal_path(config)
         if not mpath.exists() or mpath.stat().st_mtime > made:
             return "stale", "cartografia municipal por obter ou mais recente"
-        full = config.sources.municipal.full_path
-        if full.exists() and full.stat().st_mtime > made:
-            return "stale", "cartografia municipal do concelho descarregada de novo"
+        from osm3d.municipal_area import sources_for_area
+
+        for src in sources_for_area(config, network=False):
+            full = src.full_path
+            if full.exists() and full.stat().st_mtime > made:
+                return "stale", f"cartografia municipal descarregada de novo ({src.name})"
     else:
         prev = _previous(config, stage)
         before = artefact_path(config, prev)
@@ -402,35 +405,12 @@ def fetch_area_barriers(
 ) -> Path:
     """Muros e vedações municipais das quadrículas da área (+30 m), em cache.
 
-    Com a cópia de todo o concelho descarregada, recortam-se dela (sem pedidos ao
-    geoportal); senão, pedem-se ao geoportal só os da área.
+    De todas as câmaras que cobrem a área: recortados da cópia do concelho quando existe
+    (sem pedidos), senão pedidos à fonte só os da área. Ver :mod:`osm3d.municipal_area`.
     """
-    import shapely
+    from osm3d.municipal_area import area_barriers
 
-    from osm3d.acquisition.municipal import (
-        crop_barriers,
-        fetch_municipal_barriers,
-        full_barriers_usable,
-    )
-    from osm3d.geospatial.tiling import TileKey
-
-    tiles = config.area.tiles
-    if not tiles:
-        raise FileNotFoundError("A área não tem quadrículas")
-    extent = shapely.union_all([shapely.box(*TileKey.from_dgt_name(t).bounds) for t in tiles])
-    bbox = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
-    out = barriers_path(config)
-    stale = force or not out.exists() or not cache_matches(out, tiles)
-    mcfg = config.sources.municipal
-    if full_barriers_usable(mcfg):
-        full = mcfg.full_barriers_path
-        if stale or full.stat().st_mtime > out.stat().st_mtime:
-            crop_barriers(full, bbox, out, progress)
-        path = out
-    else:
-        path = fetch_municipal_barriers(bbox, mcfg, out, force=stale, progress=progress)
-    mark_cache(path, tiles)
-    return path
+    return area_barriers(config, force=force, progress=progress)
 
 
 def municipal_path(config: Config) -> Path:
@@ -489,25 +469,19 @@ def _run_candidates(
 ) -> Path:
     """Edifícios da cartografia municipal em falta no OSM e confirmados pelo LiDAR, com o
     telhado (LiDAR) e a cor ajustados como aos restantes."""
-    import shapely
 
-    from osm3d.acquisition.municipal import (
-        crop_municipal,
-        fetch_municipal_buildings,
-        load_municipal_buildings,
-    )
     from osm3d.acquisition.osm import context_timestamp
+    from osm3d.config import MunicipalSourceConfig
     from osm3d.export.geopackage import write_buildings
-    from osm3d.geospatial.tiling import TileKey
+    from osm3d.municipal_area import area_buildings
     from osm3d.reconstruction.building import reconstruct_area
     from osm3d.reconstruction.candidates import detect_candidates, load_context
     from osm3d.validation.quality import check_building
 
-    mcfg = config.sources.municipal
-    if not mcfg.configured:
+    if not config.sources.municipal_sources:
         raise ValueError(
-            "Os edifícios em falta no OSM vêm da cartografia municipal: configurar o geoportal "
-            "em sources.municipal (config/local.yaml)"
+            "Os edifícios em falta no OSM vêm da cartografia municipal: configurar as câmaras "
+            "em sources.municipalities (config/local.yaml)"
         )
     lidar = area_tiles(config, config.sources.lidar_dir, (".laz", ".las"))
     dtm = area_tiles(config, config.sources.dtm_dir, (".tif", ".tiff"))
@@ -516,7 +490,6 @@ def _run_candidates(
         raise FileNotFoundError("Nenhuma quadrícula da área tem LAZ e MDT (descarregar primeiro)")
     # Edifícios OSM das quadrículas (+30 m): um edifício já mapeado logo do outro lado do
     # limite da área não é "em falta".
-    extent = shapely.union_all([shapely.box(*TileKey.from_dgt_name(t).bounds) for t in tiles])
     ctx = refresh_context(config, tiles, force=force, progress=progress)
     osm, _ = load_context(ctx, config.processing_crs, None)
     # Os edifícios da fase fetch também contam: um servidor Overpass alternativo pode
@@ -531,20 +504,10 @@ def _run_candidates(
             f"  contexto OSM ({context_timestamp(ctx)}): {len(osm)} edifícios em "
             f"{len(tiles)} quadrículas"
         )
-    mpath = municipal_path(config)
-    mx0, my0, mx1, my1 = extent.buffer(TILE_CONTEXT_MARGIN_M).bounds
-    stale = force or not mpath.exists() or not cache_matches(mpath, tiles)
-    if mcfg.full_path.exists():
-        # Cópia de todo o concelho: recorta-se a área localmente, sem pedidos.
-        if stale or mcfg.full_path.stat().st_mtime > mpath.stat().st_mtime:
-            crop_municipal(mcfg.full_path, (mx0, my0, mx1, my1), mpath, mcfg, progress)
-        elif progress:
-            progress("  cartografia municipal: recorte da cópia do concelho em cache")
-    else:
-        fetch_municipal_buildings((mx0, my0, mx1, my1), mcfg, mpath, force=stale, progress=progress)
-    mark_cache(mpath, tiles)
-    municipal = load_municipal_buildings(mpath)
-    if mcfg.barriers:
+    # Todas as câmaras que cobrem a área (recortes em cache, juntos sem repetidos).
+    municipal, sources = area_buildings(config, tiles, force=force, progress=progress)
+    mcfg = MunicipalSourceConfig(min_area_m2=min(s.min_area_m2 for s in sources))
+    if any(s.barriers for s in sources):
         # Muros e vedações para as propostas de muros (falhar aqui não trava os edifícios).
         try:
             fetch_area_barriers(config, force=force, progress=progress)
@@ -577,7 +540,14 @@ def _run_candidates(
         checked.append(b.model_copy(update={"qa_flags": [*b.qa_flags, *extra]}))
     path = write_buildings(checked, out, config.processing_crs)
     _sources_meta(out).write_text(
-        json.dumps({"municipal": True, "version": CANDIDATES_VERSION}), encoding="utf-8"
+        json.dumps(
+            {
+                "municipal": True,
+                "version": CANDIDATES_VERSION,
+                "sources": [s.key for s in sources],
+            }
+        ),
+        encoding="utf-8",
     )
     return path
 
@@ -600,10 +570,14 @@ def candidates_sources(config: Config) -> dict[str, Any] | None:
 
 
 def municipal_status(config: Config) -> dict[str, Any]:
-    """Cartografia municipal da área ativa, para a aplicação."""
+    """Cartografia municipal da área ativa, para a aplicação (todas as câmaras)."""
     from osm3d.acquisition.municipal import read_fetch_meta
+    from osm3d.municipal_area import sources_status
 
-    m = config.sources.municipal
+    sources = config.sources.municipal_sources
+    status = sources_status(config)
+    here = [s for s in status if s["covers_area"]]
+    first: dict[str, Any] | None = (here or status or [None])[0]  # type: ignore[list-item]
     path = municipal_path(config)
     meta: dict[str, Any] = dict(read_fetch_meta(path))
     if path.exists() and meta.get("n") is None:  # caches antigas: contar no ficheiro
@@ -611,67 +585,42 @@ def municipal_status(config: Config) -> dict[str, Any]:
             meta["n"] = len(json.loads(path.read_text(encoding="utf-8"))["features"])
     used = candidates_sources(config)
     return {
-        "name": m.name,
-        # Há um geoportal configurado (config/local.yaml)? Sem ele, a opção não aparece.
-        "configured": m.configured,
-        "enabled": m.enabled,
-        "viewer_url": m.viewer_url,
-        "min_area_m2": m.min_area_m2,
+        "name": ", ".join(s["name"] for s in here) or (first["name"] if first else ""),
+        # Há câmaras configuradas (config/local.yaml)? Sem elas, a opção não aparece.
+        "configured": bool(sources),
+        "enabled": any(s.enabled for s in sources),
+        "viewer_url": first["viewer_url"] if first else "",
+        "min_area_m2": min((s.min_area_m2 for s in sources), default=8.0),
+        "sources": status,
         "cached": path.exists(),
         "n": meta.get("n"),
         "fetched_at": meta.get("fetched_at"),
         "used_in_candidates": None if used is None else used.get("version") == CANDIDATES_VERSION,
         # O recorte da área veio da cópia do concelho (sem pedidos ao geoportal)?
         "from_full": bool(meta.get("from_full")),
-        "full": municipal_full_status(config),
+        "full": first["full"] if first else None,
     }
 
 
-def municipal_full_status(config: Config) -> dict[str, Any]:
-    """Cópia de todo o concelho (descarregada a pedido, partilhada por todas as áreas):
-    edifícios, muros e um download interrompido que se pode retomar."""
-    from osm3d.acquisition.municipal import (
-        BoxLog,
-        barriers_meta,
-        full_barriers_usable,
-        progress_path,
-        read_fetch_meta,
-    )
+def municipal_full_status(config: Config, key: str | None = None) -> dict[str, Any]:
+    """Cópia de todo o concelho de uma câmara (a primeira, sem ``key``)."""
+    from osm3d.municipal_area import full_status
 
-    m = config.sources.municipal
-    full, walls = m.full_path, m.full_barriers_path
-    meta = read_fetch_meta(full)
-    wmeta = barriers_meta(walls) if walls.exists() else {}
-    parts = [BoxLog.status(progress_path(p)) for p in (full, walls)]
-    partial = [s for s in parts if s]
-    return {
-        "cached": full.exists(),
-        "path": str(full.resolve()),
-        "n": meta.get("n"),
-        "fetched_at": meta.get("fetched_at"),
-        "bytes": (full.stat().st_size if full.exists() else 0)
-        + (walls.stat().st_size if walls.exists() else 0),
-        "barriers": {
-            "configured": bool(m.barriers),
-            "cached": full_barriers_usable(m),
-            "n": wmeta.get("n"),
-            "fetched_at": wmeta.get("fetched_at"),
-        },
-        # Download interrompido (servidor reiniciado, cancelado, erro): retoma-se.
-        "partial": {
-            "done": sum(s["done"] for s in partial),
-            "total": sum(s["total"] for s in partial),
-        }
-        if partial
-        else None,
-    }
+    sources = config.sources.municipal_sources
+    if not sources:
+        return {"cached": False, "partial": None}
+    return full_status(config.sources.municipal_source(key) if key else sources[0])
 
 
 def clear_municipal_cache(config: Config) -> None:
-    """Apaga a cache da cartografia municipal (é obtida de novo na próxima corrida)."""
+    """Apaga a cache da cartografia municipal da área (é obtida de novo na próxima
+    corrida; com a cópia do concelho, volta a ser recortada dela)."""
+    import shutil
+
     path = municipal_path(config)
     for p in (path, _cache_meta(path), path.with_name(path.name + ".fetch.json")):
-        p.unlink(missing_ok=True)  # com a cópia do concelho, volta a ser recortada dela
+        p.unlink(missing_ok=True)
+    shutil.rmtree(area_dir(config) / "municipal", ignore_errors=True)  # recortes por câmara
 
 
 def review_store_path(config: Config) -> Path:

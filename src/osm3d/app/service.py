@@ -281,13 +281,18 @@ class ReviewService:
     def walls_info(self) -> dict[str, Any]:
         """Estado das fontes dos muros, avisos de dados em falta e contagens."""
         from osm3d.acquisition.municipal import barriers_meta
+        from osm3d.municipal_area import sources_for_area
 
-        m = self.cfg.sources.municipal
+        try:
+            here = [s for s in sources_for_area(self.cfg, network=False) if s.barriers]
+        except FileNotFoundError:
+            here = []
         path = barriers_path(self.cfg)
         warnings = []
-        if not m.barriers:
+        if not here:
             warnings.append(
-                "Sem camadas de muros do geoportal configuradas (sources.municipal.barriers)."
+                "Sem camadas de muros configuradas nas câmaras desta área (barriers em "
+                "sources.municipalities)."
             )
         elif not path.exists():
             warnings.append('Muros municipais por obter: usar "obter do geoportal".')
@@ -305,9 +310,9 @@ class ReviewService:
             status, archived = self._wall_status(w.key)
             counts["archived" if archived else status] += 1
         return {
-            "configured": bool(m.barriers),
-            "source": m.name,
-            "layers": [layer.label or layer.feature_class for layer in m.barriers],
+            "configured": bool(here),
+            "source": ", ".join(s.name for s in here),
+            "layers": [layer.label or layer.feature_class for s in here for layer in s.barriers],
             "fetched": path.exists(),
             "fetched_at": meta.get("fetched_at"),
             "warnings": warnings,

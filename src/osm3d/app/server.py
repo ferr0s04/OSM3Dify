@@ -462,9 +462,10 @@ def create_app(
         return ctx.municipal.state()
 
     @app.post("/api/municipal/download")
-    def municipal_download_start() -> dict[str, Any]:
-        """Descarrega toda a cartografia municipal do concelho (fica para todas as áreas)."""
-        return guarded(ctx.download_municipality)
+    def municipal_download_start(source: str | None = None) -> dict[str, Any]:
+        """Descarrega toda a cartografia municipal de um concelho (``?source=<câmara>``;
+        fica para todas as áreas)."""
+        return guarded(ctx.download_municipality, source)
 
     @app.delete("/api/municipal/download")
     def municipal_download_cancel() -> dict[str, Any]:

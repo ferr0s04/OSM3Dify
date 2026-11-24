@@ -226,11 +226,26 @@ class AppContext:
 
     # ------------------------------------------------------- cartografia municipal
 
-    def download_municipality(self) -> dict[str, Any]:
-        """Descarrega (em segundo plano) todos os edifícios do concelho."""
-        if not self.base.sources.municipal.configured:
-            raise ValueError("Sem geoportal municipal configurado (sources.municipal)")
-        return self.municipal.start(self.base.sources.municipal)
+    def download_municipality(self, source: str | None = None) -> dict[str, Any]:
+        """Descarrega (em segundo plano) todo o concelho de uma câmara (edifícios e muros).
+
+        Sem ``source``: a primeira câmara que cobre a área ativa (ou a primeira).
+        """
+        sources = self.base.sources.municipal_sources
+        if not sources:
+            raise ValueError("Sem câmaras configuradas (sources.municipalities)")
+        if source:
+            try:
+                return self.municipal.start(self.base.sources.municipal_source(source))
+            except KeyError as exc:
+                raise ValueError(str(exc)) from exc
+        from osm3d.municipal_area import sources_for_area
+
+        try:
+            here = sources_for_area(self.cfg, network=False)
+        except FileNotFoundError:
+            here = []
+        return self.municipal.start((here or sources)[0])
 
     # ------------------------------------------------------------------ opções
 

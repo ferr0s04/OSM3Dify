@@ -70,7 +70,8 @@ export const api = {
   deleteArea: (name) => request("DELETE", `/api/areas/${encodeURIComponent(name)}`),
   osmRelation: (id) => request("GET", `/api/osm/relation/${id}`),
   municipalDownload: () => request("GET", "/api/municipal/download"),
-  startMunicipalDownload: () => request("POST", "/api/municipal/download"),
+  startMunicipalDownload: (source = null) =>
+    request("POST", `/api/municipal/download${source ? `?source=${encodeURIComponent(source)}` : ""}`),
   cancelMunicipalDownload: () => request("DELETE", "/api/municipal/download"),
   processing: () => request("GET", "/api/processing"),
   startProcessing: (opts) => request("POST", "/api/processing", opts),

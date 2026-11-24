@@ -61,6 +61,8 @@ class MunicipalDownload:
             self._cancel.clear()
             self._state = {
                 "running": True,
+                "source": cfg.key,
+                "source_name": cfg.name,
                 "done": 0,
                 "total": None,
                 "found": 0,
