@@ -3,12 +3,10 @@
 Material para avaliar e calibrar o pipeline. Só se versionam ficheiros pequenos
 (GeoJSON, CSV, imagens). Ver `.gitignore`.
 
-## Imagens
+## Observações no LiDAR da DGT
 
-### `dgt-lidar-rgb-sem-fachadas.png`
-
-Captura do visualizador LiDAR da DGT: nuvem de pontos colorida (RGB) numa zona
-rural/periurbana, em vista oblíqua.
+Vista oblíqua da nuvem de pontos colorida (RGB) no visualizador LiDAR da DGT, numa
+zona rural/periurbana (a imagem não é versionada: os dados são da DGT, CC BY 4.0).
 
 O que se observa:
 

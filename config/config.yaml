@@ -132,4 +132,7 @@ export:
   roof_colour: true                # false: não acrescentar/alterar roof:colour estimado (a cor escolhida à mão na revisão vai na mesma)
   export_parts_to_osm: false       # Fase 6
   include_pending: false           # só os edifícios aceites na aplicação de revisão
-  josm_upload: "true"              # "never" faz o JOSM recusar o upload; "false" só avisa
+  # "false": o JOSM avisa antes do upload; "never": recusa-o; "true": upload normal sem
+  # aviso. Confirmar primeiro que as fontes (DGT, câmaras) podem ir para o OSM sob a
+  # ODbL: é da responsabilidade de quem usa a ferramenta (ver README).
+  josm_upload: "false"

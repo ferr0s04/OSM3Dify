@@ -233,11 +233,10 @@ nenhum caso real de laranja (chapa, não telha), por isso o limiar (tom ≥ 58°
 C* ≥ 15) não está validado. Os limiares do ortofoto são desta folha e deste ano;
 outras folhas podem ter radiometria diferente.
 
-**v9 — cartografia municipal nos candidatos** (uso autorizado pela Câmara Municipal
-de Vila do Conde; ver `acquisition/municipal.py`):
+**v9 — cartografia municipal nos candidatos** (ver `acquisition/municipal.py`):
 
-- **Fonte:** cartografia topográfica vetorial 1:5000 homologada (~2017) do geoportal
-  MapGuide (`sig.cm-viladoconde.pt`). Polígonos `const_poligonos` com o tipo
+- **Fonte:** cartografia topográfica vetorial 1:5000 homologada (~2017) de um
+  geoportal municipal MapGuide. Polígonos `const_poligonos` com o tipo
   (`descr`), mas sem altura nem telhado. São obtidos por `SELECTFEATURES` em caixas de
   250 m e guardados em cache (`municipal_buildings.geojson`). Na quadrícula 156482
   são 1046 polígonos, a ~0,4 m do OSM e do ortofoto.

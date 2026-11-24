@@ -3,6 +3,9 @@ name = "osm3d"
 version = "0.1.0"
 description = "Geração de edifícios 3D simples (Simple 3D Buildings) para o OpenStreetMap a partir de LiDAR, MDT e ortofotos."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Gonçalo Ferros" }]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",

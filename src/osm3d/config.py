@@ -331,7 +331,10 @@ class ExportConfig(BaseModel):
     # no JOSM; com false, só os "accepted" (aplicação de revisão) são exportados.
     include_pending: bool = False
     # "true": upload normal no JOSM; "false": JOSM avisa; "never": JOSM recusa o upload.
-    josm_upload: Literal["never", "false", "true"] = "true"
+    # Por omissão "false": o JOSM avisa antes do upload, para quem usa a ferramenta
+    # confirmar que pode contribuir os dados para o OSM (ver README, "Licenças e
+    # responsabilidade"); "true" no local.yaml tira o aviso.
+    josm_upload: Literal["never", "false", "true"] = "false"
 
 
 class TopologyConfig(BaseModel):

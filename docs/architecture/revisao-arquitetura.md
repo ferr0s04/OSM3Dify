@@ -175,7 +175,7 @@ com o eixo do edifício (o S3DB renderiza mal telhados inclinados em partes irre
 ## 6. Cores
 
 - **Fonte principal: o RGB dos próprios pontos LiDAR.** A nuvem da DGT vem colorida
-  (ver [`data/reference/dgt-lidar-rgb-sem-fachadas.png`](../../data/reference/dgt-lidar-rgb-sem-fachadas.png)),
+  (visível no visualizador LiDAR da DGT),
   com cores de telhado próximas das reais. Como a cor já está associada a cada ponto,
   amostrar só os pontos que encaixam no modelo de telhado ajustado (inliers) evita o
   problema do deslocamento da ortofoto e exclui chaminés, claraboias e vegetação. A
@@ -223,10 +223,10 @@ com o eixo do edifício (o S3DB renderiza mal telhados inclinados em partes irre
   OSM (há um modelo de *waiver* da OSMF) e confirmar o estado na página
   *Contributors* / lista de fontes PT. Se não for obtida, o projeto continua útil para
   GeoPackage/GLB/visualização, mas não para publicar no OSM.
-- **Estado (2026-11-11): licença obtida.** A exportação `.osm` deixou de bloquear o
-  upload no JOSM (`export.josm_upload: "true"`).
-  - **Por fazer:** guardar o documento da autorização e confirmar a atribuição na
-    página *Contributors* do OSM.
+- **Estado: responsabilidade de quem usa a ferramenta.** O projeto é uma prova de
+  conceito e não garante que as fontes possam ir para o OSM. Por omissão, o JOSM avisa
+  antes do upload da exportação `.osm` (`export.josm_upload: "false"`); cada
+  utilizador confirma as licenças das suas fontes (DGT, câmaras) antes de submeter.
   - **Modelo de edição (decisão do projeto):** as alterações são preenchidas pela
     importação do `.osm` gerado, mas a submissão é sempre manual, no JOSM. Antes de
     submeter, qualquer edifício pode ser ajustado ou descartado. O sistema nunca faz

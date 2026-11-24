@@ -18,8 +18,9 @@ Camada esperada: cartografia topográfica vetorial homologada (1:5000/1:10000), 
 atributos ``gid``, ``geom`` e ``descr`` (tipo: "Vivenda Casa", "Garagem",
 "Telheiro, Alpendre"…; ver :data:`BUILDING_TAGS`). Sem altura, pisos nem telhado.
 
-**Uso autorizado pelo município.** Não é um serviço publicado: a sessão é obtida
-da página do visualizador e o município pode mudar o acesso sem aviso. Os pedidos
+**Só com autorização do município** (da responsabilidade de quem configura a fonte).
+Não é um serviço publicado: a sessão é obtida da página do visualizador e o município
+pode mudar o acesso sem aviso. Os pedidos
 são pequenos (caixas de 250 m por área, 1 km para o concelho) e espaçados
 (``delay_s``).
 

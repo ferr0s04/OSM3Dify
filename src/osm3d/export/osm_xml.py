@@ -8,11 +8,12 @@ Regras:
 - As tags são juntas com :func:`osm3d.export.s3db_tags.merge_tags`: tags mapeadas por
   humanos não são sobrescritas (salvo opção explícita) e os conflitos vão para o
   relatório.
-- Upload permitido por omissão (sem atributo ``upload``). O upload é sempre feito
-  por uma pessoa, no JOSM. ``josm_upload: never`` no config volta a bloqueá-lo.
+- O atributo ``upload`` do ficheiro vem de ``export.josm_upload`` (por omissão
+  ``false``: o JOSM avisa antes do upload; ``never`` recusa-o). O upload é sempre feito
+  por uma pessoa, no JOSM.
 - ``building:part``: cada parte é uma way nova ligada ao contorno (ver ``_attach_parts``).
-- Edifícios em falta no OSM (candidatos do LiDAR, ``new/<id>``) aceites: way nova com
-  nós novos (ids negativos) e ``building=yes`` + as tags S3DB.
+- Edifícios em falta no OSM (da cartografia municipal, ``new/<id>``) aceites: way nova
+  com nós novos (ids negativos), a tag ``building`` e as tags S3DB.
 """
 
 from __future__ import annotations
