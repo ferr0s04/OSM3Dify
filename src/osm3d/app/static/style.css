@@ -275,3 +275,6 @@ label.redo select { font: inherit; padding: 2px 4px; border: 1px solid var(--bor
 .muni-src { padding: 6px 0; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 3px; }
 .muni-src:first-child { border-top: 0; }
 .muni-src > div { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+/* Divisão: building:part ou vários edifícios. */
+.split-mode { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }

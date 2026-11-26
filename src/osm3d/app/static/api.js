@@ -29,6 +29,10 @@ export const api = {
   saveReview: (key, status, note, overrides, parts = null) =>
     request("PUT", `${path(key)}/review`, { status, note, overrides, parts }),
   resetReview: (key) => request("DELETE", `${path(key)}/review`),
+  // Contorno editado no mapa: [[id do nó do OSM ou null, lon, lat], ...] → detalhe.
+  buildingGeometry: (key) => request("GET", `${path(key)}/geometry`),
+  saveBuildingGeometry: (key, nodes) => request("PUT", `${path(key)}/geometry`, { nodes }),
+  resetBuildingGeometry: (key) => request("DELETE", `${path(key)}/geometry`),
   export: () => request("POST", "/api/export"),
   osmContext: () => request("GET", "/api/osm-context"),
   walls: () => request("GET", "/api/walls"),

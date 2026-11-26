@@ -166,6 +166,12 @@ class ReviewStore:
                 "CREATE TABLE IF NOT EXISTS geometry_edits ("
                 " key TEXT PRIMARY KEY, data TEXT NOT NULL, edited_at TEXT NOT NULL)"
             )
+            # Reconstrução de um edifício com o contorno editado (ver footprint_edits.py):
+            # assinatura do contorno + edifício reajustado (JSON).
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS footprint_fits ("
+                " key TEXT PRIMARY KEY, signature TEXT NOT NULL, data TEXT NOT NULL)"
+            )
 
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path)
@@ -237,6 +243,23 @@ class ReviewStore:
                 "INSERT OR REPLACE INTO geometry_edits (key, data, edited_at) VALUES (?, ?, ?)",
                 [(k, d, now) for k, d in new.items() if old.get(k) != d],
             )
+
+    def footprint_fits(self) -> dict[str, tuple[str, str]]:
+        """Edifícios reajustados a um contorno editado: chave → (assinatura, JSON)."""
+        with self._conn() as c:
+            rows = c.execute("SELECT key, signature, data FROM footprint_fits").fetchall()
+        return {k: (s, d) for k, s, d in rows}
+
+    def save_footprint_fit(self, key: str, signature: str, data: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO footprint_fits (key, signature, data) VALUES (?, ?, ?)",
+                (key, signature, data),
+            )
+
+    def delete_footprint_fits(self, keys: list[str]) -> None:
+        with self._conn() as c:
+            c.executemany("DELETE FROM footprint_fits WHERE key = ?", [(k,) for k in keys])
 
 
 # ------------------------------------------------------------------- correções

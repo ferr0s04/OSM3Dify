@@ -232,3 +232,27 @@ def test_legacy_single_municipality_config_still_works() -> None:
         "camara-municipal-do-porto",
     ]
     assert s.municipal_source("camara-municipal-do-porto").kind == "arcgis"
+
+
+def test_area_walls_are_cut_from_the_full_copy_without_asking(tmp_path: Path) -> None:
+    """Com a cópia do concelho (edifícios e muros) descarregada, os muros da área saem dela
+    sem esperar pela fase candidates nem pelo "obter do geoportal"."""
+    from osm3d.pipeline import barriers_path, local_area_barriers
+
+    gpkg = tmp_path / "ndd2.gpkg"
+    _write_gpkg(gpkg, (-44900, 179100))
+    src = _file_source(tmp_path, gpkg, "Câmara A", bbox=(-46000, 178000, -44000, 181000))
+    cfg = Config(
+        area=AreaConfig(name="a", tiles=["155480"]),
+        paths=PathsConfig(processed=tmp_path / "processed", output=tmp_path / "out"),
+        sources=SourcesConfig(municipalities=[src]),
+    )
+    assert local_area_barriers(cfg) is None  # sem cópia: só o "obter do geoportal"
+    fetch_full_municipality(src)
+    gpkg.unlink()  # nada de ir à fonte: o recorte vem só da cópia
+    path = local_area_barriers(cfg)
+    assert path == barriers_path(cfg) and path.exists()
+    walls = json.loads(path.read_text(encoding="utf-8"))["features"]
+    assert [f["properties"]["barrier"] for f in walls] == ["wall"]
+    made = path.stat().st_mtime
+    assert local_area_barriers(cfg) == path and path.stat().st_mtime == made  # em cache

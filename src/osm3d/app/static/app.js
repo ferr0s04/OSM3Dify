@@ -6,6 +6,7 @@ import { BuildingMap, basemapOptions } from "./map.js";
 import { renderResults } from "./results.js";
 import { Viewer } from "./viewer.js";
 import { PART_COLORS, PartsEditor } from "./parts-editor.js";
+import { SQUARE_MESSAGES, posKey, squareRings } from "./geom-editor.js";
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -81,9 +82,17 @@ const state = {
 };
 
 const viewer = new Viewer($("#viewer"));
-const map = new BuildingMap("map", $("#legend"), (key) => select(key), (key) => selectWall(key));
+const map = new BuildingMap("map", $("#legend"), (key, shift) => (shift ? toggleMulti(key) : select(key)), (key) => selectWall(key));
 map.onSelectLanduse = (key) => selectLanduse(key);
+map.onSelectOsmBuilding = (key, shift) => (shift ? toggleMulti(key) : selectOsmBuilding(key));
+map.onMultiMenu = (point) => {
+  const n = state.multi?.items.size ?? 0;
+  map.editor.openMenu(point, [{ label: `Esquadrar ${n} edifícios`, hint: "Q", enabled: n > 0, run: () => squareMulti(),
+    title: "Esquadra todos os edifícios selecionados (os vértices partilhados entre eles movem-se juntos)" }]);
+};
 map.onEditCommit = (target, coords, ids, others) => commitEdit(target, coords, ids, others);
+map.onStatus = (msg) => toast(msg, 4500);
+map.onDeselect = () => deselect();
 const dataView = new DataView({ mapEl: $("#data-map"), panelEl: $("#data-panel"), hoverEl: $("#data-hover"), baseEl: $("#d-base"), toast: (m, ms) => toast(m, ms) });
 
 function toast(msg, ms = 3500) {
@@ -115,10 +124,16 @@ function renderFilterLabels() {
   menu.classList.toggle("on", names.length > 0);
 }
 
-// Só os edifícios da cartografia municipal (em falta no OSM) se revêem; os do OSM são
-// uma camada do mapa ("Camadas" → edifícios do OSM).
+// A lista tem só os edifícios da cartografia municipal (em falta no OSM); os do OSM são
+// uma camada do mapa ("Camadas" → edifícios do OSM) e abrem-se clicando neles.
 const municipalRows = (rows) => rows.filter((r) => r.candidate);
 const municipalGeojson = (gj) => ({ ...gj, features: gj.features.filter((f) => f.properties.candidate) });
+
+function setRows(rows) {
+  state.rows = municipalRows(rows);
+  // Edifícios do OSM com análise 3D (os outros só se editam como geometria).
+  state.osmKeys = new Set(rows.filter((r) => !r.candidate).map((r) => r.key));
+}
 
 function applyFilters() {
   renderFilterLabels();
@@ -225,6 +240,7 @@ function move(delta) {
 
 async function select(key) {
   if (!key) return;
+  clearMulti();
   const token = ++state.token;
   state.selected = key;
   state.wall = null;
@@ -241,6 +257,7 @@ async function select(key) {
     state.parts = { view: null, active: false, layout: null, overrides: [], info: null, selected: null };
     map.select(key, detail.bbox);
     renderDetail();
+    startBuildingEdit();
     if (detail.has_layout || state.viewMode === "plan") loadParts(key, token);
     viewer.setModel(mesh);
     viewer.frame(mesh);
@@ -252,6 +269,190 @@ async function select(key) {
   } catch (e) {
     if (token === state.token) $("#viewer-status").textContent = `erro: ${e.message}`;
   }
+}
+
+function deselect() {
+  // Clique no fundo do mapa ou dentro de um landuse (ou Esc): nada selecionado, como no iD.
+  if (state.multi) clearMulti();
+  else if (!state.selected && !state.wall && !state.landuse) return;
+  state.token++;
+  state.selected = null;
+  state.detail = null;
+  state.wall = null;
+  state.landuse = null;
+  state.touched = new Set();
+  state.parts = { view: null, active: false, layout: null, overrides: [], info: null, selected: null };
+  map.stopEditing();
+  map.select(null);
+  map.selectWall(null);
+  viewer.clearAll();
+  $("#viewer-status").textContent = "";
+  $("#detail").innerHTML = '<p class="muted pad">Selecione um edifício na lista ou no mapa.</p>';
+}
+
+// ------------------------------------------------------- seleção múltipla
+
+function selectAny(key) {
+  // Um só edifício: o detalhe completo (com análise 3D) ou só o contorno (fora dela).
+  if (key.startsWith("new/") || state.osmKeys?.has(key)) return select(key);
+  return selectLanduse(key);
+}
+
+function currentBuildingItem() {
+  // O edifício selecionado agora (para começar uma seleção múltipla com ele).
+  const d = state.detail;
+  if (state.selected && d?.geometry) {
+    const g = d.geometry;
+    return { key: d.key, nodes: g.nodes, shared: new Set(Object.keys(g.shared ?? {}).map(Number)), inReview: true, editable: g.editable, reason: g.reason };
+  }
+  const l = state.landuse;
+  if (l?.is_building) {
+    return { key: l.key, nodes: l.nodes, shared: new Set(Object.keys(l.shared ?? {}).map(Number)), inReview: false, editable: true, reason: null };
+  }
+  return null;
+}
+
+async function fetchRing(key) {
+  if (key.startsWith("new/") || state.osmKeys?.has(key)) {
+    const g = await api.buildingGeometry(key);
+    return { key, nodes: g.nodes, shared: new Set(Object.keys(g.shared ?? {}).map(Number)), inReview: true, editable: g.editable, reason: g.reason };
+  }
+  const d = await api.landuse(Number(key.slice(4)));
+  return { key, nodes: d.nodes, shared: new Set(Object.keys(d.shared ?? {}).map(Number)), inReview: false, editable: true, reason: null };
+}
+
+async function toggleMulti(key) {
+  // Shift + clique: junta o edifício à seleção (ou tira-o, se já lá está), como no iD.
+  if (!state.multi) {
+    const current = currentBuildingItem();
+    if (!current) return key.startsWith("way/") ? selectOsmBuilding(key) : select(key);
+    if (current.key === key) return;
+    state.token++;
+    state.selected = null;
+    state.detail = null;
+    state.wall = null;
+    state.landuse = null;
+    state.parts = { view: null, active: false, layout: null, overrides: [], info: null, selected: null };
+    map.stopEditing();
+    map.select(null);
+    map.selectWall(null);
+    viewer.clearAll();
+    $("#viewer-status").textContent = "seleção múltipla: sem vista 3D";
+    state.multi = { items: new Map([[current.key, current]]), undo: [] };
+  }
+  const items = state.multi.items;
+  if (items.has(key)) items.delete(key);
+  else {
+    try {
+      items.set(key, await fetchRing(key));
+    } catch (e) {
+      return toast(`${key}: ${e.message}`);
+    }
+  }
+  if (items.size === 1) {
+    const [only] = items.keys();
+    return selectAny(only);
+  }
+  if (!items.size) return deselect();
+  renderMulti();
+}
+
+function clearMulti() {
+  if (!state.multi) return;
+  state.multi = null;
+  map.setMulti([]);
+}
+
+function renderMulti() {
+  const m = state.multi;
+  if (!m) return;
+  const items = [...m.items.values()];
+  map.setMulti(items.filter((i) => i.nodes?.length >= 3).map((i) => ({ key: i.key, coords: i.nodes.map((n) => [n[1], n[2]]) })));
+  const blocked = items.filter((i) => !i.editable);
+  $("#detail").innerHTML = `
+    <h2>${items.length} edifícios selecionados</h2>
+    <p class="small muted">Shift + clique junta ou tira edifícios da seleção. Q, o botão abaixo ou o botão direito
+      dentro de um deles esquadram-nos todos; os vértices partilhados entre eles (casas geminadas) movem-se juntos.
+      Ctrl+Z desfaz. Esc ou clique no fundo do mapa tira a seleção. As edições são gravadas logo e vão na exportação.</p>
+    <div class="actions"><button class="btn" id="m-square" ${items.length > blocked.length ? "" : "disabled"}>⊾ Esquadrar todos</button></div>
+    <table class="kv">${items.map((i) => `<tr><th><a href="#" data-key="${esc(i.key)}">${esc(i.key)}</a></th>
+      <td>${i.key.startsWith("new/") ? "cartografia municipal" : i.inReview ? "OSM" : "OSM (sem análise 3D)"}${i.editable ? "" : ` · <span class="warn-text">${esc(i.reason ?? "não editável")}</span>`}</td></tr>`).join("")}</table>`;
+  $("#m-square").onclick = () => squareMulti();
+  document.querySelectorAll("#detail [data-key]").forEach((a) => (a.onclick = (e) => {
+    e.preventDefault();
+    selectAny(a.dataset.key);
+  }));
+}
+
+function squareMulti() {
+  const m = state.multi;
+  if (!m) return;
+  const items = [...m.items.values()].filter((i) => i.editable && i.nodes?.length >= 3);
+  if (!items.length) return toast("Nenhum dos edifícios selecionados se edita aqui.");
+  const owners = map.vertexOwners();
+  const rings = items.map((i) => ({
+    key: i.key,
+    coords: i.nodes.map((n) => [n[1], n[2]]),
+    ids: i.nodes.map((n) => n[0]),
+    // Vértice ligado a outro elemento (nó partilhado do OSM ou o mesmo ponto): não sai.
+    keep: (k) => {
+      const [id, lon, lat] = i.nodes[k];
+      if (id != null && i.shared.has(id)) return true;
+      return [...(owners.get(posKey([lon, lat])) ?? [])].some((o) => o !== i.key);
+    },
+  }));
+  const { rings: out, errors } = squareRings(rings);
+  const changed = out.filter((r) => r.changed);
+  if (errors.length) {
+    const why = [...new Set(errors.map((e) => e.error))].map((e) => SQUARE_MESSAGES[e] ?? e).join(" ");
+    toast(`${errors.length} de ${items.length} não esquadrados (${errors.map((e) => e.key).join(", ")}): ${why}`, 7000);
+  }
+  if (!changed.length) return;
+  m.undo.push(changed.map((r) => ({ key: r.key, nodes: m.items.get(r.key).nodes })));
+  const saves = changed.map((r) => ({ key: r.key, nodes: r.coords.map((c, k) => [r.ids?.[k] ?? null, c[0], c[1]]) }));
+  for (const sv of saves) m.items.get(sv.key).nodes = sv.nodes;
+  renderMulti();
+  saveMulti(saves);
+}
+
+function undoMulti() {
+  const m = state.multi;
+  const prev = m?.undo.pop();
+  if (!prev) return;
+  for (const p of prev) if (m.items.has(p.key)) m.items.get(p.key).nodes = p.nodes;
+  renderMulti();
+  saveMulti(prev);
+}
+
+function saveMulti(saves) {
+  // Em fila com as outras edições do mapa (a exportação espera por elas).
+  editQueue = editQueue.then(async () => {
+    toast(`A gravar ${saves.length} contornos (o 3D de cada edifício é reajustado ao LiDAR)…`, 4000);
+    let failed = 0;
+    for (const { key, nodes } of saves) {
+      try {
+        if (key.startsWith("new/") || state.osmKeys?.has(key)) await api.saveBuildingGeometry(key, nodes);
+        else await api.saveLanduse(Number(key.slice(4)), nodes);
+      } catch (e) {
+        failed++;
+        toast(`${key}: não gravado (${e.message})`, 7000);
+      }
+    }
+    await reloadEditedMap();
+    // Os contornos como ficaram no servidor (nós novos, ligações).
+    const m = state.multi;
+    if (m) {
+      for (const { key } of saves) {
+        if (!m.items.has(key)) continue;
+        try {
+          const fresh = await fetchRing(key);
+          if (state.multi === m && m.items.has(key)) m.items.set(key, fresh);
+        } catch { /* fica o local */ }
+      }
+      if (state.multi === m) renderMulti();
+    }
+    if (!failed) toast(`${saves.length} contornos gravados.`, 2500);
+  });
 }
 
 function overrides() {
@@ -346,6 +547,55 @@ function renderTags(tags, existing) {
     ${Object.keys(tags.conflicts).length ? `<p class="small muted">Conflitos: mantém-se o valor do OSM (não sobrescrever trabalho de mapeadores).</p>` : ""}`;
 }
 
+function renderGeometry(d) {
+  // Contorno do edifício: edita-se no mapa como no iD (vértices, esquadrar).
+  const g = d.geometry;
+  if (!g) return "";
+  const shared = Object.values(g.shared ?? {}).flat();
+  const others = [...new Set(shared)];
+  const where = g.kind === "osm"
+    ? "Vai no .osm da exportação, aplicado aos dados atuais do OSM (como os landuse), mesmo sem aceitar as tags 3D."
+    : "Vai no edifício novo, ao aceitar.";
+  return `<h3>Contorno ${g.edited ? '<span class="chip">editado à mão</span>' : ""}</h3>
+    ${g.editable
+      ? `${BUILDING_EDIT_HINT}
+         ${others.length ? `<p class="small">Vértices cinzentos são partilhados com: ${others.map(esc).join(", ")}. Movê-los move-os também nesses elementos.</p>` : ""}
+         <p class="small muted">${where} Ao mudar o contorno, o telhado, a altura e a cor são reajustados ao LiDAR.</p>
+         <div class="actions">
+           <button class="btn" id="g-square" title="Esquadrar o contorno inteiro (Q no mapa; com um vértice selecionado, só esse canto)">⊾ Esquadrar</button>
+           <button class="btn" id="g-reset" ${g.edited ? "" : "disabled"}>Repor contorno ${g.kind === "osm" ? "do OSM" : "municipal"}</button>
+         </div>`
+      : `<p class="small muted">${esc(g.reason ?? "Contorno não editável aqui.")}</p>`}`;
+}
+
+function startBuildingEdit() {
+  // Edifício selecionado: o contorno fica logo editável no mapa (como os muros e landuse),
+  // exceto com uma divisão em partes ativa (as partes dependem do contorno).
+  const d = state.detail;
+  if (!d || state.parts.active || !d.geometry?.editable) return map.stopEditing();
+  map.editBuilding(d.key, d.geometry);
+}
+
+function rerenderDetail() {
+  // Volta a desenhar o detalhe sem perder as correções ainda não guardadas.
+  const values = {};
+  for (const f of state.touched) {
+    const el = document.querySelector(`[name="${f}"]`);
+    if (el) values[f] = el.value;
+  }
+  const note = document.querySelector('[name="note"]')?.value;
+  renderDetail();
+  for (const [f, v] of Object.entries(values)) {
+    const el = document.querySelector(`[name="${f}"]`);
+    if (el) {
+      el.value = v;
+      el.closest("label")?.classList.add("touched");
+    }
+  }
+  if (note !== undefined && document.querySelector('[name="note"]')) document.querySelector('[name="note"]').value = note;
+  if (state.parts.view) renderPartsSection();
+}
+
 function renderDetail() {
   const d = state.detail;
   const eff = d.effective ?? {};
@@ -376,13 +626,15 @@ function renderDetail() {
       <button class="btn" id="b-reset" title="U" ${d.reviewed_at ? "" : "disabled"}>Repor</button>
     </div>
 
+    ${renderGeometry(d)}
+
     <h3>Correções</h3>
     <form class="form" id="edit-form" autocomplete="off">
       ${renderTopology(d, val, t)}
       ${renderGround(d, val, t)}
       ${d.candidate ? `<label class="full ${t("building")}">building (tipo do edifício novo) <span class="est">da cartografia municipal: ${esc(d.estimated_building ?? "yes")}</span>
         <select name="building">${buildingTypeOptions(val("building", d.building_type ?? "yes"))}</select></label>` : ""}
-      <label class="${t("roof_shape")}">forma do telhado <span class="est">estimado: ${fmt(est.roof_shape)} (${fmt(est.roof_shape_conf)})</span>
+      <label class="${t("roof_shape")}">forma do telhado (roof:shape) <span class="est">estimado: ${fmt(est.roof_shape)} (${fmt(est.roof_shape_conf)})</span>
         <select name="roof_shape">${shapeOpts(val("roof_shape", eff.roof_shape))}</select></label>
       <label class="${t("height")}">height (m) <span class="est">estimado: ${fmt(est.height)}</span>
         <input name="height" type="number" step="0.5" min="0" value="${val("height", eff.height)}"></label>
@@ -425,6 +677,8 @@ function renderDetail() {
   $("#b-accept").onclick = () => review("accepted");
   $("#b-reject").onclick = () => review("rejected");
   $("#b-reset").onclick = () => resetReview();
+  if ($("#g-square")) $("#g-square").onclick = () => map.editor.editing(d.key) && map.editor.square("way");
+  if ($("#g-reset")) $("#g-reset").onclick = () => resetGeometry();
   if ($("#josm-link")) $("#josm-link").onclick = (e) => {
     e.preventDefault();
     const obj = e.target.dataset.obj;
@@ -477,7 +731,8 @@ async function afterReviewChange(detail, advance) {
   applyFilters();
   // Atualiza os telhados 3D deste edifício no mapa (forma/cores podem ter mudado).
   if (map.roofs) map.updateBuilding(await api.sceneOne(current));
-  if (advance) {
+  // Edifício do OSM (aberto no mapa, fora da lista): fica selecionado.
+  if (advance && idx >= 0) {
     // Avança para o próximo da lista filtrada (o atual pode ter saído do filtro).
     const next = state.filtered[Math.min(idx, state.filtered.length - 1)];
     const target = next && next.key !== current ? next : state.filtered[idx + 1];
@@ -579,6 +834,7 @@ function wire() {
   $("#btn-export").addEventListener("click", async (e) => {
     e.target.disabled = true;
     try {
+      await editQueue; // as edições do mapa ainda a gravar entram nesta exportação
       const r = await api.export();
       const topo = r.topology ? ` · Topologia: ${r.topology} (pormenor no CSV)` : "";
       toast(`${r.exported} edifícios exportados (${r.conflicts} com conflitos de tags) → ${r.path}${topo}`, 14000);
@@ -590,7 +846,16 @@ function wire() {
   });
 
   document.addEventListener("keydown", (e) => {
+    // Seleção múltipla: Q esquadra todos, Ctrl+Z desfaz, Esc tira a seleção.
+    if (!state.multi || e.target.closest("input, select, textarea")) return;
+    const k = e.key.toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && k === "z") { e.preventDefault(); undoMulti(); }
+    else if (!e.ctrlKey && !e.metaKey && !e.altKey && k === "q") { e.preventDefault(); squareMulti(); }
+    else if (e.key === "Escape") deselect();
+  });
+  document.addEventListener("keydown", (e) => {
     if (e.target.closest("input, select, textarea") || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (state.multi) return; // só as teclas da seleção múltipla
     const k = e.key.toLowerCase();
     if (state.landuse && !state.selected) return; // landuse: só as teclas do editor
     if (state.wall && !state.selected) {
@@ -648,7 +913,8 @@ async function showTab(name) {
 
 const editor = new PartsEditor($("#planner"), {
   onChange: (layout) => {
-    state.parts.layout = layout;
+    // O editor da planta só conhece a geometria: o modo da divisão mantém-se.
+    state.parts.layout = { ...layout, split: state.parts.layout?.split ?? "parts" };
     schedulePartsPreview();
   },
   onSelectPart: (i) => {
@@ -681,6 +947,7 @@ async function loadParts(key, token) {
       state.parts.active = true;
       state.parts.layout = view.layout;
       state.parts.overrides = view.overrides ?? [];
+      map.stopEditing(); // dividido em partes: o contorno fica fixo
     }
     editor.load({ outline: view.outline, points: view.points, layout: state.parts.active ? state.parts.layout : null });
     renderPartsSection();
@@ -690,23 +957,24 @@ async function loadParts(key, token) {
   }
 }
 
-function activateParts(layout) {
+function activateParts(layout, split = "parts") {
   state.parts.active = true;
-  state.parts.layout = layout;
+  state.parts.layout = { ...layout, split };
   state.parts.overrides = [];
   state.parts.info = null;
+  map.stopEditing(); // as partes estão em coordenadas do contorno: este fica fixo
   editor.load({ outline: state.parts.view.outline, layout }, true);
   setViewMode("plan");
   renderPartsSection();
   schedulePartsPreview(0);
 }
 
-async function startParts(kind) {
+async function startParts(kind, split = "parts") {
   if (!state.parts.view) await loadParts(state.selected, state.token);
-  if (kind === "suggested" && state.parts.view?.suggested) return activateParts(state.parts.view.suggested);
+  if (kind === "suggested" && state.parts.view?.suggested) return activateParts(state.parts.view.suggested, split);
   try {
     const { layout } = await api.partsStart(state.selected);
-    activateParts(layout);
+    activateParts(layout, split);
     editor.selectPart(0);
     editor.startSplit();
   } catch (e) {
@@ -721,6 +989,7 @@ async function deactivateParts() {
   state.parts.info = null;
   editor.load({ outline: state.parts.view.outline, layout: null }, true);
   renderPartsSection();
+  startBuildingEdit();
   viewer.setModel(await api.mesh(state.selected));
   toast("Divisão descartada (fica em vigor ao aceitar/rejeitar).");
 }
@@ -762,63 +1031,99 @@ function schedulePartsPreview(delay = 300) {
   }, delay);
 }
 
+function pieceName(i) {
+  // Parte (building:part) ou edifício (divisão em vários edifícios), com a sua cor.
+  if (state.parts.layout?.split !== "buildings") return `building:part ${i + 1}`;
+  return i === 0 ? "edifício 1 (fica com a way original)" : `edifício ${i + 1} (novo)`;
+}
+
 function renderPartTags(parts) {
   if (!parts?.length) return "";
   return parts
-    .map((p, i) => `<div class="small" style="margin-top:6px"><b style="color:${PART_COLORS[i % PART_COLORS.length]}">building:part ${i + 1}</b> ${Object.entries(p.tags)
+    .map((p, i) => `<div class="small" style="margin-top:6px"><b style="color:${PART_COLORS[i % PART_COLORS.length]}">${esc(pieceName(i))}</b> ${Object.entries(p.tags)
       .map(([k, v]) => `<code>${esc(k)}=${esc(v)}</code>`).join(" ")}</div>`)
     .join("");
 }
 
-const PART_FIELDS = ["roof_shape", "height", "min_height", "roof_height", "roof_direction", "roof_colour"];
+const PART_NUMERIC = ["height", "min_height", "roof_height", "roof_direction"];
+
+function partValue(i, f) {
+  // Valor de um campo de uma parte: a correção, senão o valor em vigor (o estimado).
+  const ov = state.parts.overrides[i]?.[f];
+  if (ov !== null && ov !== undefined && ov !== "") return ov;
+  const v = state.parts.info?.parts?.[i]?.[f];
+  return v === null || v === undefined ? "" : v;
+}
 
 function renderPartsSection() {
   const el = $("#parts-section");
   if (!el) return;
   const d = state.detail;
   if (!d.parts_editable) {
-    el.innerHTML = `<p class="muted small">Divisão em partes indisponível para este edifício.</p>`;
+    el.innerHTML = `<p class="muted small">Divisão em partes indisponível: ${esc(d.parts_reason ?? "este edifício não se divide aqui")}.</p>`;
     return;
   }
   if (!state.parts.active) {
     el.innerHTML = `<div class="actions">
-        ${d.has_suggestion ? `<button class="btn" id="p-suggested" title="Volume principal + volumes secundários detetados no LiDAR">Dividir em partes (sugerido)</button>` : ""}
-        <button class="btn" id="p-manual">Dividir manualmente</button>
+        ${d.has_suggestion ? `<button class="btn" id="p-suggested" title="Volume principal + volumes secundários detetados no LiDAR">Dividir em building:part (sugerido)</button>` : ""}
+        <button class="btn" id="p-manual" title="Partes do mesmo edifício (building:part), com alturas e telhados próprios">Dividir em building:part</button>
+        <button class="btn" id="p-buildings" title="Vários edifícios: cada peça passa a ser um edifício (building=*) com as suas tags 3D">Dividir em vários edifícios</button>
       </div>
       ${d.has_suggestion ? `<p class="small muted">A análise encontrou volumes com alturas diferentes neste contorno.</p>` : ""}`;
     $("#p-suggested")?.addEventListener("click", () => startParts("suggested"));
     $("#p-manual").addEventListener("click", () => startParts("manual"));
+    $("#p-buildings").addEventListener("click", () => startParts("manual", "buildings"));
     return;
   }
   const n = state.parts.layout.parts.length;
-  const ov = (i, f) => state.parts.overrides[i]?.[f] ?? "";
-  const shapeOpts = (i) => ["", "flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "round"]
-    .map((s) => `<option value="${s}" ${ov(i, "roof_shape") === s ? "selected" : ""}>${s ? SHAPE_LABELS[s] : "— estimado —"}</option>`).join("");
+  const split = state.parts.layout.split ?? "parts";
+  const touched = (i, f) => (state.parts.overrides[i]?.[f] ?? null) !== null;
+  const t = (i, f) => (touched(i, f) ? "touched" : "");
+  const shapeOpts = (i) => ["flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "round", "unknown"]
+    .map((sh) => `<option value="${sh}" ${partValue(i, "roof_shape") === sh ? "selected" : ""}>${SHAPE_LABELS[sh]} (${sh})</option>`).join("");
+  const orientOpts = (i) => `<option value="">—</option>` + [["along", "along (cumeeira ao longo)"], ["across", "across (cumeeira através)"]]
+    .map(([v, l]) => `<option value="${v}" ${partValue(i, "roof_orientation") === v ? "selected" : ""}>${l}</option>`).join("");
+  const colour = (i) => toHex(partValue(i, "roof_colour") || "#b5533c");
   el.innerHTML = `
+    <div class="split-mode small">
+      <label class="check" title="Partes do mesmo edifício: o contorno fica e as partes são ways building:part dentro dele">
+        <input type="radio" name="p-split" value="parts" ${split === "parts" ? "checked" : ""}> partes do mesmo edifício (building:part)</label>
+      <label class="check" title="O edifício é dividido: cada peça é um edifício (building=*) com as tags do original (sem as 3D) e as suas tags 3D. No OSM, a way original fica com a 1.ª peça.">
+        <input type="radio" name="p-split" value="buildings" ${split === "buildings" ? "checked" : ""}> vários edifícios (dividir o edifício)</label>
+    </div>
     <div id="parts-problems" class="problems"></div>
     <div class="parts-list">
       ${Array.from({ length: n }, (_, i) => `
         <div class="part-card ${i === state.parts.selected ? "sel" : ""}" data-part="${i}" style="border-left-color:${PART_COLORS[i % PART_COLORS.length]}">
-          <h4><span>Parte ${i + 1}</span><span class="est small muted" data-est="${i}"></span></h4>
+          <h4><span>${esc(pieceName(i))}</span><span class="est small muted" data-est="${i}"></span></h4>
           <div class="form">
-            <label>forma<select data-f="roof_shape" data-i="${i}">${shapeOpts(i)}</select></label>
-            <label>height (m)<input data-f="height" data-i="${i}" type="number" step="0.5" min="0" value="${ov(i, "height")}"></label>
-            <label>min_height (m)<input data-f="min_height" data-i="${i}" type="number" step="0.5" min="0" value="${ov(i, "min_height")}"></label>
-            <label>roof:height (m)<input data-f="roof_height" data-i="${i}" type="number" step="0.5" min="0" value="${ov(i, "roof_height")}"></label>
-            <label>roof:direction (°)<input data-f="roof_direction" data-i="${i}" type="number" step="1" min="0" max="359" value="${ov(i, "roof_direction")}"></label>
-            <label>roof:colour<input data-f="roof_colour" data-i="${i}" type="color" list="palette" value="${ov(i, "roof_colour") || "#b5533c"}">
-              ${swatches(ov(i, "roof_colour"), `data-i="${i}"`)}</label>
+            <label class="${t(i, "roof_shape")}">forma do telhado (roof:shape)<select data-f="roof_shape" data-i="${i}">${shapeOpts(i)}</select></label>
+            <label class="${t(i, "height")}">height (m)<input data-f="height" data-i="${i}" type="number" step="0.5" min="0" value="${partValue(i, "height")}"></label>
+            <label class="${t(i, "min_height")}">min_height (m)<input data-f="min_height" data-i="${i}" type="number" step="0.5" min="0" value="${partValue(i, "min_height")}"></label>
+            <label class="${t(i, "roof_height")}">roof:height (m)<input data-f="roof_height" data-i="${i}" type="number" step="0.5" min="0" value="${partValue(i, "roof_height")}"></label>
+            <label class="${t(i, "roof_orientation")}">roof:orientation<select data-f="roof_orientation" data-i="${i}">${orientOpts(i)}</select></label>
+            <label class="${t(i, "roof_direction")}">roof:direction (°, uma água)<input data-f="roof_direction" data-i="${i}" type="number" step="1" min="0" max="359" value="${partValue(i, "roof_direction")}"></label>
+            <label class="${t(i, "roof_colour")}">roof:colour<input data-f="roof_colour" data-i="${i}" type="color" list="palette" value="${colour(i)}">
+              ${swatches(colour(i), `data-i="${i}"`)}</label>
           </div>
         </div>`).join("")}
     </div>
-    <p class="small muted">Campos vazios = valor estimado (indicado ao lado do título). Edita a geometria na vista <b>Planta</b>.</p>
+    <p class="small muted">Os campos mostram o valor em vigor (estimado, ou corrigido a laranja); mudar um campo corrige-o. Edita a geometria na vista <b>Planta</b>.</p>
     <div class="actions"><button class="btn" id="p-single">Voltar a edifício único</button></div>`;
+  el.querySelectorAll('[name="p-split"]').forEach((r) =>
+    r.addEventListener("input", (e) => {
+      state.parts.layout = { ...state.parts.layout, split: e.target.value };
+      renderPartsSection();
+      schedulePartsPreview(0);
+    }),
+  );
   el.querySelectorAll("[data-f]").forEach((input) =>
     input.addEventListener("input", (e) => {
       const i = Number(e.target.dataset.i), f = e.target.dataset.f;
       const o = (state.parts.overrides[i] = { ...(state.parts.overrides[i] ?? {}) });
       const v = e.target.value;
-      o[f] = v === "" ? null : ["height", "min_height", "roof_height", "roof_direction"].includes(f) ? Number(v) : v;
+      o[f] = v === "" ? null : PART_NUMERIC.includes(f) ? Number(v) : v;
+      e.target.closest("label")?.classList.toggle("touched", o[f] !== null);
       schedulePartsPreview();
     }),
   );
@@ -838,11 +1143,24 @@ function updatePartsInfo() {
   const probs = $("#parts-problems");
   if (probs) probs.innerHTML = (info.problems ?? []).map((p) => `<div>⚠ ${esc(p)}</div>`).join("");
   (info.parts ?? []).forEach((p, i) => {
+    const e = p.estimated ?? p;
     const span = document.querySelector(`[data-est="${i}"]`);
     if (span) {
-      span.textContent = `${SHAPE_LABELS[p.roof_shape] ?? p.roof_shape} · ${fmt(p.height, " m")}` +
-        (p.min_height ? ` (base ${p.min_height} m)` : "") + ` · ${fmt(p.area, " m²")}`;
+      span.textContent = `estimado: ${SHAPE_LABELS[e.roof_shape] ?? e.roof_shape} · ${fmt(e.height, " m")}` +
+        (e.min_height ? ` (base ${e.min_height} m)` : "") + ` · ${fmt(p.area, " m²")}`;
     }
+    // Campos sem correção: o valor em vigor (o que vai nas tags), como no edifício único.
+    document.querySelectorAll(`#parts-section [data-i="${i}"][data-f]`).forEach((el) => {
+      const f = el.dataset.f;
+      if ((state.parts.overrides[i]?.[f] ?? null) !== null) return;
+      const v = p[f];
+      if (f === "roof_colour") {
+        if (v) {
+          el.value = toHex(v);
+          el.closest("label")?.querySelectorAll(".swatch").forEach((s) => s.classList.toggle("on", s.dataset.hex === el.value));
+        }
+      } else el.value = v === null || v === undefined ? "" : v;
+    });
   });
 }
 
@@ -957,6 +1275,7 @@ function wallFilter() {
 
 async function selectWall(key) {
   if (!key) return;
+  clearMulti();
   const token = ++state.token;
   try {
     const d = await api.wall(key);
@@ -1010,14 +1329,20 @@ function renderWallDetail() {
 // ------------------------------------------------------- edição de geometria
 
 const EDIT_HINT = `<p class="small muted">No mapa: arrastar um vértice (encaixa em muros, landuse e edifícios;
-  largado noutro muro, liga-se a ele); um vértice com contorno laranja está ligado a outros elementos e move-os também.
-  Arrastar o ponto a meio de uma aresta ou duplo clique cria um vértice. Clique (ou botão direito) num vértice ou
-  numa aresta abre as opções: apagar (Delete), desligar (D), alinhar o muro (S). Ctrl+Z desfaz.</p>`;
+  largado noutro muro, liga-se a ele); um vértice cinzento está ligado a outros elementos e move-os também.
+  Arrastar o triângulo a meio de uma aresta ou duplo clique cria um vértice. Clique (ou botão direito) num vértice ou
+  numa aresta abre as opções: apagar (Delete), desligar (D), esquadrar (Q), alinhar o muro (S). Ctrl+Z desfaz.</p>`;
+
+const BUILDING_EDIT_HINT = `<p class="small muted">No mapa, como no iD: arrastar um vértice (encaixa em edifícios,
+  landuse e muros); arrastar o triângulo a meio de uma aresta ou duplo clique cria um vértice. Clique (ou botão
+  direito) num vértice ou numa aresta abre as opções: apagar (Delete), desligar (D), esquadrar o canto, a aresta ou o
+  edifício (Q: o edifício; com um vértice selecionado, o canto). Ctrl+Z desfaz.</p>`;
 
 async function selectLanduse(key) {
   // Limite de um landuse do OSM: edita-se como no iD (os nós partilhados movem-se em
   // todas as ways que os usam).
   const id = Number(key.replace("way/", ""));
+  clearMulti();
   const token = ++state.token;
   try {
     const d = await api.landuse(id);
@@ -1036,7 +1361,7 @@ async function selectLanduse(key) {
 
 function renderLanduseDetail() {
   const d = state.landuse;
-  $("#viewer-status").textContent = "landuse: sem vista 3D";
+  $("#viewer-status").textContent = d.is_building ? "edifício fora da revisão: sem vista 3D" : "landuse: sem vista 3D";
   viewer.clearAll();
   const shared = Object.entries(d.shared ?? {});
   const others = [...new Set(shared.flatMap(([, ways]) => ways))];
@@ -1044,11 +1369,12 @@ function renderLanduseDetail() {
     <h2>${esc(d.label)} ${d.edited ? '<span class="chip">editado à mão</span>' : ""}</h2>
     <div class="links"><a href="${d.osm_url}" target="_blank" rel="noopener">abrir no OSM ↗</a>
       <span class="muted">${d.nodes.length} nós${shared.length ? ` · ${shared.length} partilhados` : ""}</span></div>
+    ${d.is_building ? `<p class="small">Edifício do OSM sem análise 3D (fora da área processada ou sem LiDAR): aqui só se edita o contorno.</p>` : ""}
     <h3>Tags</h3>
     <table class="kv">${Object.entries(d.tags).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("")}</table>
     <h3>Geometria</h3>
     ${EDIT_HINT}
-    ${others.length ? `<p class="small">Nós com contorno laranja são partilhados com: ${others.map(esc).join(", ")}. Movê-los move-os também nesses elementos.</p>` : ""}
+    ${others.length ? `<p class="small">Nós cinzentos são partilhados com: ${others.map(esc).join(", ")}. Movê-los move-os também nesses elementos.</p>` : ""}
     <p class="small muted">A edição vai no .osm da exportação, aplicada aos dados atuais do OSM (se a way mudou no OSM entretanto, não se faz e fica no relatório).</p>
     <div class="actions"><button class="btn" id="l-reset" ${d.edited ? "" : "disabled"}>Repor como no OSM</button></div>`;
   $("#l-reset").onclick = () => resetGeometry();
@@ -1062,38 +1388,120 @@ function commitEdit(target, coords, ids, others = {}) {
 }
 
 async function saveEdit(target, coords, ids, others) {
+  // Cada alteração terminada no mapa é gravada logo (vai na exportação a partir daí).
   try {
     if (target.key.startsWith("wall/")) {
       // O muro e os ligados a ele que mudaram (vértice partilhado, ligação, alinhamento).
-      const res = await api.saveWallsGeometry({ ...others, [target.key]: coords });
+      const walls = Object.fromEntries(Object.entries(others).map(([k, o]) => [k, o.coords]));
+      const res = await api.saveWallsGeometry({ ...walls, [target.key]: coords });
       const d = res.details[target.key];
       if (state.wall?.key === d.key) {
         state.wall = d;
         renderWallDetail();
       }
       await loadWalls();
+      map.editor.refreshLinks();
+      return;
+    }
+    const nodes = coords.map((c, i) => [ids?.[i] ?? null, c[0], c[1]]);
+    if (state.selected && target.key === state.selected) {
+      // Contorno do edifício em revisão (do OSM: com os nós; municipal: só o anel).
+      await saveBuildingGeometry(target.key, nodes);
     } else {
-      const id = Number(target.key.replace("way/", ""));
-      const d = await api.saveLanduse(id, coords.map((c, i) => [ids[i], c[0], c[1]]));
+      const d = await api.saveLanduse(Number(target.key.replace("way/", "")), nodes);
       if (state.landuse?.key === d.key) {
         state.landuse = d;
         renderLanduseDetail();
         if (map.editor.editing(d.key)) map.editor.setGeometry(d.nodes.map((n) => [n[1], n[2]]), d.nodes.map((n) => n[0]));
       }
-      // O landuse aparece com a edição; as ligações dos muros perto dele são refeitas.
-      await Promise.all([loadOsmContext(), loadWalls()]);
     }
+    // Os landuse e edifícios ligados a ele que mudaram com ele (vértice partilhado
+    // arrastado, ou um vértice novo onde se ligou a uma aresta deles).
+    await saveLinked(others);
+    await reloadEditedMap();
   } catch (e) {
     toast(`Edição não guardada: ${e.message}`, 6000);
     // Volta à geometria guardada.
-    if (target.key.startsWith("wall/") && state.wall) map.editWall(state.wall);
+    if (state.selected && target.key === state.selected) startBuildingEdit();
+    else if (target.key.startsWith("wall/") && state.wall) map.editWall(state.wall);
     else if (state.landuse) map.editLanduse(state.landuse);
   }
 }
 
+async function saveLinked(others) {
+  for (const [key, o] of Object.entries(others ?? {})) {
+    const nodes = o.coords.map((c, i) => [o.ids?.[i] ?? null, c[0], c[1]]);
+    try {
+      if (key.startsWith("new/")) await api.saveBuildingGeometry(key, nodes);
+      else if (key.startsWith("way/")) await api.saveLanduse(Number(key.slice(4)), nodes);
+    } catch (e) {
+      toast(`${key} (ligado ao elemento editado) não foi gravado: ${e.message}`, 7000);
+    }
+  }
+}
+
+async function reloadEditedMap() {
+  // O contexto OSM (landuse, edifícios do OSM), os municipais e os muros com as edições;
+  // depois, as ligações do elemento em edição aos vizinhos.
+  const [gj] = await Promise.all([api.geojson(), loadOsmContext(), loadWalls()]);
+  await map.setData(municipalGeojson(gj));
+  map.editor.refreshLinks();
+}
+
+async function saveBuildingGeometry(key, nodes) {
+  if (state.parts.active) {
+    // As partes estão em coordenadas do contorno: mudá-lo desfazia a divisão.
+    toast("Divisão em partes ativa: voltar a edifício único para editar o contorno.", 6000);
+    return startBuildingEdit();
+  }
+  const token = state.token;
+  $("#viewer-status").textContent = "a reajustar o telhado ao contorno novo… (LiDAR)";
+  const detail = await api.saveBuildingGeometry(key, nodes);
+  if (token !== state.token) return;
+  await afterFootprintChange(detail, token);
+}
+
+async function afterFootprintChange(detail, token) {
+  // Contorno novo: o detalhe (tags, sinalizações), o modelo e os pontos mudam (o mapa
+  // recarrega-o quem chama).
+  state.detail = detail;
+  rerenderDetail();
+  patchRow(detail);
+  const g = detail.geometry;
+  if (g?.editable && map.editor.editing(detail.key)) {
+    map.editor.setGeometry(g.nodes.map((n) => [n[1], n[2]]), g.kind === "osm" ? g.nodes.map((n) => n[0]) : null,
+      new Set(Object.keys(g.shared ?? {}).map(Number)));
+  }
+  const key = detail.key;
+  const [mesh, pts] = await Promise.all([state.touched.size ? null : api.mesh(key), api.points(key)]);
+  if (token !== state.token) return;
+  if (mesh) viewer.setModel(mesh);
+  else schedulePreview(); // com as correções por guardar
+  viewer.setPoints(pts);
+  $("#viewer-status").textContent = `${pts.count.toLocaleString("pt-PT")} pontos · rmse ${fmt(detail.effective?.rmse_m, " m")}`;
+  if (map.roofs) map.updateBuilding(await api.sceneOne(key));
+}
+
+function selectOsmBuilding(key) {
+  // Clique num edifício da camada do OSM: com análise 3D, abre-se como os da lista;
+  // sem ela (fora da área processada), edita-se só o contorno, como um landuse.
+  if (key === state.selected || map.editor.editing(key)) return;
+  if (state.osmKeys?.has(key)) return select(key);
+  selectLanduse(key);
+}
+
 async function resetGeometry() {
   try {
-    if (state.wall) {
+    if (state.selected && state.detail?.geometry) {
+      const token = state.token;
+      $("#viewer-status").textContent = "a repor o contorno…";
+      const detail = await api.resetBuildingGeometry(state.selected);
+      if (token !== state.token) return;
+      await afterFootprintChange(detail, token);
+      await reloadEditedMap();
+      startBuildingEdit(); // o histórico de edição do contorno antigo deixa de servir
+      toast("Contorno reposto.", 1500);
+    } else if (state.wall) {
       state.wall = await api.resetWallGeometry(state.wall.key);
       map.editWall(state.wall);
       renderWallDetail();
@@ -1102,7 +1510,7 @@ async function resetGeometry() {
       state.landuse = await api.resetLanduse(state.landuse.id);
       map.editLanduse(state.landuse);
       renderLanduseDetail();
-      await Promise.all([loadOsmContext(), loadWalls()]);
+      await reloadEditedMap();
     }
   } catch (e) {
     toast(`Erro ao repor: ${e.message}`);
@@ -1168,12 +1576,24 @@ async function refreshOsmContext(e) {
 
 async function reload() {
   const [rows, geojson] = await Promise.all([api.buildings(), api.geojson()]);
-  state.rows = municipalRows(rows);
+  setRows(rows);
   renderProgress();
   applyFilters();
   await map.setData(municipalGeojson(geojson));
   const current = state.filtered.find((r) => r.key === state.selected) ?? state.filtered[0];
   if (current) select(current.key);
+}
+
+function warnCandidates(c) {
+  // A lista é a dos edifícios da cartografia municipal: sem a fase candidates feita para
+  // as quadrículas desta área, fica vazia (os muros não contam para isto).
+  if (!c) return;
+  const where = "no separador Dados, Processar com \"incluir edifícios da cartografia municipal em falta no OSM\"";
+  if (!c.configured) {
+    if (!c.n) toast("Sem câmaras configuradas (config/local.yaml): a lista de edifícios municipais fica vazia. Os do OSM abrem-se clicando no mapa.", 9000);
+  } else if (c.state !== "done") {
+    toast(`Edifícios da cartografia municipal desta área por processar (${c.reason || c.state}): ${where}.`, 12000);
+  }
 }
 
 async function init() {
@@ -1194,12 +1614,13 @@ async function init() {
     state.summary = summary;
     $("#palette").innerHTML = (summary.palette ?? []).map((c) => `<option value="${c.hex}">${esc(c.label)}</option>`).join("");
     map.setPalette(summary.palette ?? [], summary.default_colours ?? { roof: "#c8c8c8" });
-    state.rows = municipalRows(rows);
+    setRows(rows);
     renderProgress();
     applyFilters();
     await map.setData(municipalGeojson(geojson));
     loadOsmContext();
     loadWalls();
+    warnCandidates(summary.candidates);
     if (state.filtered.length) select(state.filtered[0].key);
   } catch (e) {
     if (e.status === 503) {

@@ -249,6 +249,20 @@ def create_app(
     def reset_review(osm_type: str, osm_id: int) -> dict[str, Any]:
         return call(rs().reset_review, key_of(osm_type, osm_id))
 
+    @app.get("/api/buildings/{osm_type}/{osm_id}/geometry")
+    def building_geometry_get(osm_type: str, osm_id: int) -> dict[str, Any]:
+        """Contorno editável (nós, partilhados), sem o resto do detalhe."""
+        return call(rs().building_geometry, key_of(osm_type, osm_id))
+
+    @app.put("/api/buildings/{osm_type}/{osm_id}/geometry")
+    def building_geometry(osm_type: str, osm_id: int, body: LanduseGeometryIn) -> dict[str, Any]:
+        """Contorno editado no mapa (nós do OSM ou anel novo); o 3D é reajustado a ele."""
+        return call(rs().save_building_geometry, key_of(osm_type, osm_id), body.nodes)
+
+    @app.delete("/api/buildings/{osm_type}/{osm_id}/geometry")
+    def building_geometry_reset(osm_type: str, osm_id: int) -> dict[str, Any]:
+        return call(rs().reset_building_geometry, key_of(osm_type, osm_id))
+
     @app.get("/api/scene")
     def scene() -> dict[str, Any]:
         """Telhados 3D (forma e cores inferidas) de todos os edifícios, para o mapa."""
@@ -309,7 +323,8 @@ def create_app(
 
     @app.get("/api/landuse/{way_id}")
     def landuse(way_id: int) -> dict[str, Any]:
-        """Landuse do OSM editável no mapa (anel com as edições e nós partilhados)."""
+        """Landuse ou edifício do OSM editável no mapa (anel com as edições e nós
+        partilhados)."""
         return call(rs().landuse_detail, way_id)
 
     @app.put("/api/landuse/{way_id}/geometry")

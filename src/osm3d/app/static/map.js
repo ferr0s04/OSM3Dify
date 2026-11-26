@@ -1,7 +1,7 @@
 // Mapa (MapLibre): contornos coloridos por forma/estado/concordância; em modo 3D,
 // telhados com a forma e as cores inferidas (camada three.js dentro do MapLibre).
 import * as THREE from "three";
-import { GeometryEditor } from "./geom-editor.js";
+import { GeometryEditor, posKey } from "./geom-editor.js";
 import {
   CHANGE_COLORS,
   CHANGE_LABELS,
@@ -46,8 +46,16 @@ const CTX_LAYERS = {
   landuse: ["ctx-landuse-fill", "ctx-landuse-line"],
   highway: ["ctx-highway-casing", "ctx-highway", "ctx-highway-other"],
   barrier: ["ctx-barrier", "ctx-fence"],
-  building: ["ctx-building"],
+  building: ["ctx-building-fill", "ctx-building"],
 };
+// Linha do elemento em edição (o halo é o do iD): a cor da camada a que pertence.
+const EDIT_BUILDING_COLOR = "#e06e5f"; // a dos edifícios no iD
+function landuseColor(value) {
+  if (BUILT_LANDUSE.includes(value)) return OSM_CTX_COLORS.built;
+  if (GREEN_LANDUSE.includes(value)) return "#a3e635"; // mais claro que o da camada: lê-se sobre o halo
+  if (value === "forest") return "#4ade80";
+  return "#c4b5fd";
+}
 
 // Camada personalizada do MapLibre que desenha, com three.js, os telhados e paredes de
 // todos os edifícios tal como os renderizadores os vão mostrar a partir das tags.
@@ -280,54 +288,88 @@ export class BuildingMap {
     // Edição de geometria (muros e landuse), ao estilo do iD; o elemento em edição sai
     // das camadas normais enquanto é editado.
     this.onSelectLanduse = null;
+    this.onSelectOsmBuilding = null;
+    this.onDeselect = null; // clique no fundo do mapa (ou Esc sem nada no editor)
     this.onEditCommit = null;
+    this.onStatus = null;
     this.editingWall = null;
-    this.editingCtx = null;
+    this.editingCtx = null; // way do OSM em edição (landuse ou edifício): "way/<id>"
+    this.editingBuilding = null; // edifício da cartografia municipal em edição
     this.index = { walls: new Map(), ctx: new Map(), buildings: new Map() };
     this.editor = new GeometryEditor(this.map, {
       snapTargets: (point, px) => this.snapTargets(point, px),
-      wallsIndex: () => this.index.walls,
+      linkCandidates: (t) => this.linkCandidates(t),
       onCommit: (target, coords, ids, others) => {
         this.applyWallFilter(); // muros que passaram a estar ligados também se editam
         this.onEditCommit?.(target, coords, ids, others);
       },
+      onStatus: (msg) => this.onStatus?.(msg),
+      onEscape: () => this.onDeselect?.(),
     });
     this.ready.then(() => this.editor.install());
+    // Shift + arrastar fazia zoom a uma caixa: Shift + clique é a seleção múltipla.
+    this.map.boxZoom.disable();
+    this.multiKeys = [];
   }
 
   // ------------------------------------------------------------- edição
 
-  editWall(d) {
-    this.editingCtx = null;
-    this.editingWall = d.key;
+  setEditing({ wall = null, ctx = null, building = null }) {
+    // O elemento em edição sai das camadas normais: desenha-o o editor.
+    this.editingWall = wall;
+    this.editingCtx = ctx;
+    this.editingBuilding = building;
     this.applyCtxFilters();
     this.applyWallFilter();
+    this.applyFilter();
+  }
+
+  editWall(d) {
+    this.setEditing({ wall: d.key });
     this.editor.start({ key: d.key, closed: false, coords: d.coords, min: 2 });
     this.applyWallFilter(); // os muros ligados também saem das camadas (desenha-os o editor)
   }
 
   editLanduse(d) {
-    this.editingWall = null;
-    this.editingCtx = d.key;
-    this.applyCtxFilters();
-    this.applyWallFilter();
+    // Way fechada do OSM: landuse ou, fora da revisão, edifício.
+    this.setEditing({ ctx: d.key });
+    const building = !!d.is_building;
     this.editor.start({
       key: d.key,
+      kind: "area",
       closed: true,
       coords: d.nodes.map((n) => [n[1], n[2]]),
       ids: d.nodes.map((n) => n[0]),
       shared: new Set(Object.keys(d.shared ?? {}).map(Number)),
       min: 3,
+      color: building ? EDIT_BUILDING_COLOR : landuseColor(d.tags?.landuse),
+      fill: building,
+      label: building ? "edifício" : "landuse",
+    });
+  }
+
+  editBuilding(key, g) {
+    // Contorno de um edifício em revisão: do OSM (nós, como os landuse) ou municipal.
+    const osm = g.kind === "osm";
+    this.setEditing(osm ? { ctx: key } : { building: key });
+    this.editor.start({
+      key,
+      kind: "area",
+      closed: true,
+      coords: g.nodes.map((n) => [n[1], n[2]]),
+      ids: osm ? g.nodes.map((n) => n[0]) : null,
+      shared: new Set(Object.keys(g.shared ?? {}).map(Number)),
+      min: 3,
+      color: EDIT_BUILDING_COLOR,
+      fill: true,
+      label: "edifício",
     });
   }
 
   stopEditing() {
-    if (!this.editor.target && !this.editingWall && !this.editingCtx) return;
+    if (!this.editor.target && !this.editingWall && !this.editingCtx && !this.editingBuilding) return;
     this.editor.stop();
-    this.editingWall = null;
-    this.editingCtx = null;
-    this.applyCtxFilters();
-    this.applyWallFilter();
+    this.setEditing({});
   }
 
   snapTargets(point, px) {
@@ -348,7 +390,7 @@ export class BuildingMap {
       if (!g) continue;
       // Ways do OSM: o id do nó de cada vértice (anel exterior/linha, pela mesma ordem).
       const nodes = kind === "ctx" ? this.index.ctxNodes?.get(id) : null;
-      const add = (coords, k = 0) => out.push({ key: id, source: kind, coords, nodes: k === 0 && nodes?.length === coords.length ? nodes : null });
+      const add = (coords, k = 0) => out.push({ key: id, source: kind, coords, ring: k, nodes: k === 0 && nodes?.length === coords.length ? nodes : null });
       if (g.type === "LineString") add(g.coordinates);
       else if (g.type === "Polygon") g.coordinates.forEach(add);
       else if (g.type === "MultiPolygon") for (const poly of g.coordinates) poly.forEach(add);
@@ -356,13 +398,96 @@ export class BuildingMap {
     return out;
   }
 
+  buildingAt(p) {
+    // Edifício sob o ponto: o municipal (em revisão) ou o do OSM; também o que está em
+    // edição (desenhado pelo editor). { key, osm } ou null.
+    const vis = (id) => this.map.getLayer(id) && this.map.getLayoutProperty(id, "visibility") !== "none";
+    if (this.editor.target?.fill && this.map.queryRenderedFeatures(p, { layers: ["edit-fill"] }).length) {
+      const key = this.editor.target.key;
+      return { key, osm: key.startsWith("way/") };
+    }
+    const b = vis("b-fill") ? this.map.queryRenderedFeatures(p, { layers: ["b-fill"] })[0] : null;
+    if (b) return { key: b.properties.key, osm: false };
+    const m = vis("multi-fill") ? this.map.queryRenderedFeatures(p, { layers: ["multi-fill"] })[0] : null;
+    if (m) return { key: m.properties.key, osm: m.properties.key.startsWith("way/") };
+    const o = vis("ctx-building-fill")
+      ? this.map.queryRenderedFeatures(p, { layers: ["ctx-building-fill"] }).find((f) => String(f.properties.id).startsWith("way/"))
+      : null;
+    return o ? { key: o.properties.id, osm: true } : null;
+  }
+
+  setMulti(rings) {
+    // Seleção múltipla (como no iD): os edifícios selecionados com o halo; rings:
+    // [{ key, coords }] (anéis sem repetir o primeiro ponto).
+    this.multiKeys = rings.map((r) => r.key);
+    const data = {
+      type: "FeatureCollection",
+      features: rings.filter((r) => r.coords.length >= 3).map((r) => ({
+        type: "Feature",
+        properties: { key: r.key },
+        geometry: { type: "Polygon", coordinates: [[...r.coords, r.coords[0]]] },
+      })),
+    };
+    const src = this.map.getSource("multi");
+    if (src) src.setData(data);
+    else {
+      this.map.addSource("multi", { type: "geojson", data });
+      this.map.addLayer({ id: "multi-fill", type: "fill", source: "multi", paint: { "fill-color": EDIT_BUILDING_COLOR, "fill-opacity": 0.18 } });
+      this.map.addLayer({ id: "multi-halo", type: "line", source: "multi", layout: { "line-join": "round" },
+        paint: { "line-color": "#f6634f", "line-opacity": 0.7, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 8, 18, 14] } });
+      this.map.addLayer({ id: "multi-line", type: "line", source: "multi", paint: { "line-color": EDIT_BUILDING_COLOR, "line-width": 2 } });
+    }
+    this.editor.raise();
+  }
+
+  vertexOwners() {
+    // Ponto → elementos (landuse e edifícios) com um vértice nele: um vértice partilhado
+    // não sai ao esquadrar.
+    const out = new Map();
+    for (const c of this.linkCandidates({ kind: "area" })) {
+      for (const p of c.coords) {
+        const k = posKey(p);
+        if (!out.has(k)) out.set(k, new Set());
+        out.get(k).add(c.key);
+      }
+    }
+    return out;
+  }
+
+  linkCandidates(t) {
+    // Elementos a que o elemento em edição se liga (vértices no mesmo ponto), como no iD:
+    // muros com muros; landuse e edifícios (do OSM e municipais) entre si. Anéis sem
+    // repetir o primeiro ponto; ids: os nós do OSM de cada vértice.
+    if (t.kind === "wall") {
+      return [...this.index.walls]
+        .filter(([, g]) => g?.type === "LineString")
+        .map(([key, g]) => ({ key, source: "walls", closed: false, coords: g.coordinates, ids: null }));
+    }
+    const out = [];
+    for (const [key, g] of this.index.ctx) {
+      if (!String(key).startsWith("way/") || g?.type !== "Polygon" || !this.index.ctxAreas?.has(key)) continue;
+      const ring = g.coordinates[0].slice(0, -1);
+      const nodes = this.index.ctxNodes?.get(key);
+      const ids = nodes?.length === ring.length + 1 ? nodes.slice(0, -1) : ring.map(() => null);
+      out.push({ key, source: "ctx", closed: true, coords: ring, ids });
+    }
+    for (const [key, g] of this.index.buildings) {
+      if (g?.type === "Polygon") out.push({ key, source: "buildings", closed: true, coords: g.coordinates[0].slice(0, -1), ids: null });
+    }
+    return out;
+  }
+
   applyCtxFilters() {
-    // Landuse em edição: só a geometria do editor (a do contexto ainda é a antiga).
+    // Way do OSM em edição: só a geometria do editor (a do contexto ainda é a antiga).
     if (!this.map.getLayer("ctx-landuse-line")) return;
     const notEditing = ["!=", ["get", "id"], this.editingCtx ?? ""];
     const landuse = ["==", ["get", "kind"], "landuse"];
-    this.map.setFilter("ctx-landuse-fill", ["all", landuse, ["==", ["geometry-type"], "Polygon"], notEditing]);
+    const building = ["==", ["get", "kind"], "building"];
+    const polygon = ["==", ["geometry-type"], "Polygon"];
+    this.map.setFilter("ctx-landuse-fill", ["all", landuse, polygon, notEditing]);
     this.map.setFilter("ctx-landuse-line", ["all", landuse, notEditing]);
+    this.map.setFilter("ctx-building-fill", ["all", building, polygon, notEditing]);
+    this.map.setFilter("ctx-building", ["all", building, notEditing]);
   }
 
   async setOsmContext(geojson) {
@@ -370,6 +495,8 @@ export class BuildingMap {
     await this.ready;
     this.index.ctx = new Map(geojson.features.map((f) => [f.properties.id, f.geometry]));
     this.index.ctxNodes = new Map(geojson.features.filter((f) => f.properties.nodes).map((f) => [f.properties.id, f.properties.nodes]));
+    // Landuse e edifícios do OSM: ligam-se aos edifícios em edição (e entre si).
+    this.index.ctxAreas = new Set(geojson.features.filter((f) => ["landuse", "building"].includes(f.properties.kind)).map((f) => f.properties.id));
     const src = this.map.getSource("osm-ctx");
     if (src) return src.setData(geojson);
     this.map.addSource("osm-ctx", { type: "geojson", data: geojson });
@@ -392,8 +519,13 @@ export class BuildingMap {
       paint: { "line-color": BARRIER_COLOR, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 1.2, 19, 3.5] } });
     add({ id: "ctx-fence", type: "line", source: "osm-ctx", filter: ["all", kind("barrier"), ["==", ["get", "value"], "fence"]],
       paint: { "line-color": OSM_CTX_COLORS.fence, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 1.2, 19, 3], "line-dasharray": [2, 1.5] } });
+    // Edifícios do OSM: preenchimento leve (clicável: abre o edifício) e contorno tracejado.
+    add({ id: "ctx-building-fill", type: "fill", source: "osm-ctx", filter: ["all", kind("building"), ["==", ["geometry-type"], "Polygon"]],
+      paint: { "fill-color": OSM_CTX_COLORS.building, "fill-opacity": 0.06 } });
     add({ id: "ctx-building", type: "line", source: "osm-ctx", filter: kind("building"),
       paint: { "line-color": OSM_CTX_COLORS.building, "line-width": 1.2, "line-dasharray": [3, 1.5] } });
+    this.map.on("mouseenter", "ctx-building-fill", () => (this.map.getCanvas().style.cursor = "pointer"));
+    this.map.on("mouseleave", "ctx-building-fill", () => (this.map.getCanvas().style.cursor = ""));
     this.applyOsmLayers();
     this.applyCtxFilters();
     this.editor.raise();
@@ -518,7 +650,14 @@ export class BuildingMap {
     this.applyFilter();
     this.map.on("click", (e) => {
       // Muros por cima dos edifícios: um clique perto de um muro seleciona o muro.
+      // Shift + clique num edifício: junta-o (ou tira-o) da seleção, como no iD.
       const p = e.point;
+      const shift = !!e.originalEvent?.shiftKey;
+      if (shift) {
+        const hit = this.buildingAt(p);
+        if (hit) return hit.osm ? this.onSelectOsmBuilding?.(hit.key, true) : this.onSelect(hit.key, true);
+        return;
+      }
       if (this.editor.hitTest(p)) return; // vértice/aresta em edição
       const box = [[p.x - 5, p.y - 5], [p.x + 5, p.y + 5]];
       const wall = this.map.getLayer("walls-line") ? this.map.queryRenderedFeatures(box, { layers: WALL_LAYERS })[0] : null;
@@ -530,8 +669,24 @@ export class BuildingMap {
         : null;
       if (landuse) return this.onSelectLanduse?.(landuse.properties.id);
       const b = this.map.queryRenderedFeatures(p, { layers: ["b-fill"] })[0];
-      if (b) this.onSelect(b.properties.key);
+      if (b) return this.onSelect(b.properties.key);
+      // Edifício do OSM (camada "edifícios do OSM"): abre-o para rever e editar.
+      const osm = this.map.getLayer("ctx-building-fill") && this.map.getLayoutProperty("ctx-building-fill", "visibility") !== "none"
+        ? this.map.queryRenderedFeatures(p, { layers: ["ctx-building-fill"] }).find((f) => String(f.properties.id).startsWith("way/"))
+        : null;
+      if (osm) return this.onSelectOsmBuilding?.(osm.properties.id);
+      // Nada clicável (fundo, interior de um landuse): tira a seleção, como no iD.
+      this.onDeselect?.();
     });
+    // Botão direito dentro de um dos edifícios da seleção múltipla: as ações (esquadrar).
+    this.map.on("contextmenu", (e) => {
+      if (!this.multiKeys?.length || !this.map.getLayer("multi-fill")) return;
+      if (this.map.queryRenderedFeatures(e.point, { layers: ["multi-fill"] }).length) {
+        e.preventDefault();
+        this.onMultiMenu?.(e.point);
+      }
+    });
+    this.map.getCanvas().addEventListener("contextmenu", (ev) => this.multiKeys?.length && ev.preventDefault());
     this.map.on("mouseenter", "b-fill", () => (this.map.getCanvas().style.cursor = "pointer"));
     this.map.on("mouseleave", "b-fill", () => (this.map.getCanvas().style.cursor = ""));
     const b = new maplibregl.LngLatBounds();
@@ -558,7 +713,11 @@ export class BuildingMap {
   }
 
   applyFilter() {
-    const filter = this.visibleKeys ? ["in", ["get", "key"], ["literal", [...this.visibleKeys]]] : null;
+    // Filtros da barra; o edifício em edição sai (desenha-o o editor).
+    const parts = [];
+    if (this.visibleKeys) parts.push(["in", ["get", "key"], ["literal", [...this.visibleKeys]]]);
+    if (this.editingBuilding) parts.push(["!=", ["get", "key"], this.editingBuilding]);
+    const filter = parts.length ? ["all", ...parts] : null;
     for (const id of ["b-fill", "b-line"]) {
       if (this.map.getLayer(id)) this.map.setFilter(id, filter);
     }
@@ -653,6 +812,6 @@ export class BuildingMap {
       (kinds.has("landuse") ? line(c.built, "landuse construído") + line(c.green, "landuse agrícola/verde") : "") +
       (kinds.has("highway") ? line("#334155", "via (não pode atravessar edifícios)") : "") +
       (kinds.has("barrier") ? line(c.wall, "muro") + line(c.fence, "vedação", true) : "") +
-      (kinds.has("building") ? line(c.building, "edifício do OSM", true) : "");
+      (kinds.has("building") ? line(c.building, "edifício do OSM (clicar para rever e editar)", true) : "");
   }
 }

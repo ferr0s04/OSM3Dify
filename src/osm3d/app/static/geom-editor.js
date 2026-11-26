@@ -1,15 +1,20 @@
-// Edição de geometria no mapa (muros propostos e landuse do OSM), ao estilo do iD:
+// Edição de geometria no mapa (muros propostos, landuse e edifícios), ao estilo do iD:
+//  - o elemento em edição tem o halo vermelho do iD; vértices brancos (cinzentos se
+//    ligados a outros elementos) e, a meio de cada aresta, um triângulo no sentido da way;
 //  - arrastar um vértice move-o; encaixa em vértices e arestas próximos (muros, landuse,
-//    edifícios). Um vértice ligado a outros muros (o mesmo ponto) move-os a todos;
-//  - largar um vértice em cima de outro muro liga-os (numa aresta, cria lá o vértice);
+//    edifícios). Um vértice ligado a outros elementos (o mesmo ponto: muros com muros;
+//    landuse e edifícios entre si) é cinzento e move-os a todos;
+//  - largar um vértice em cima de outro elemento liga-os (numa aresta, cria lá o vértice);
 //    em cima de outro vértice do mesmo elemento, os dois juntam-se (o arrastado sai);
-//    um landuse largado num nó de outra way do OSM passa a usar esse nó;
-//  - arrastar o ponto a meio de uma aresta, ou duplo clique numa aresta, cria um vértice;
+//    uma way do OSM largada num nó de outra way do OSM passa a usar esse nó;
+//  - arrastar o triângulo a meio de uma aresta, ou duplo clique numa aresta, cria um vértice;
 //  - clique (ou botão direito) num vértice ou numa aresta abre o menu de opções: apagar o
-//    vértice (Delete), desligar (D), acrescentar um vértice, alinhar o muro (S);
+//    vértice (Delete), desligar (D), esquadrar (Q: o contorno inteiro, ou o canto do
+//    vértice selecionado; a aresta pelo menu), alinhar o muro (S);
 //  - Ctrl+Z desfaz; Esc fecha o menu ou tira a seleção.
 // Cada alteração terminada é entregue a onCommit(target, coords, ids, others), em que
-// others são os outros muros que mudaram com ela ({ chave: coords }).
+// others são os outros elementos que mudaram com ela ({ chave: { coords, ids, source } }).
+import { squareCorner, squareEdge, squareWay, SQUARE_PART_DEG, SQUARE_THRESHOLD_DEG } from "./orthogonalize.js";
 
 const SNAP_PX = 10; // encaixe num vértice
 const EDGE_SNAP_PX = 7; // encaixe numa aresta
@@ -17,11 +22,24 @@ const MID_MIN_PX = 26; // arestas mais curtas (no ecrã) não mostram o ponto a 
 const HIT_PX = 7; // clique/duplo clique numa aresta
 const SAME_DEG = 1e-8; // ~1 mm: o mesmo ponto (= o mesmo nó na exportação)
 const DISCONNECT_M = 0.05; // desligar: o vértice afasta-se 5 cm ao longo do próprio muro
+const MOVED_M = 1e-4; // esquadrar: abaixo disto (0,1 mm) o vértice não mexeu
 const EMPTY = { type: "FeatureCollection", features: [] };
-const LAYERS = ["edit-line", "edit-mid", "edit-vertex"];
+// Cores do iD: halo do elemento selecionado e vértices.
+const HALO = "#f6634f";
+const LAYERS = ["edit-fill", "edit-halo", "edit-line", "edit-mid", "edit-vertex-halo", "edit-vertex"];
+const HIT_LAYERS = ["edit-fill", "edit-line", "edit-mid", "edit-vertex"];
+const SQUARE_ERRORS = {
+  not_squarish: `Não dá para esquadrar: há cantos a mais de ${SQUARE_THRESHOLD_DEG}° de um ângulo reto (ou de um lado reto).`,
+  not_squarish_part: `Não dá para esquadrar: o ângulo está a mais de ${SQUARE_PART_DEG}° de 90°.`,
+  square_enough: "Já está esquadrado.",
+  too_few: "Vértices a menos para esquadrar.",
+};
 
 const clone = (o) => (o === undefined ? undefined : JSON.parse(JSON.stringify(o)));
 const same = (a, b) => Math.abs(a[0] - b[0]) <= SAME_DEG && Math.abs(a[1] - b[1]) <= SAME_DEG;
+// O mesmo ponto (~1 cm): ligar copia as coordenadas exatas do outro elemento.
+export const posKey = (c) => `${c[0].toFixed(7)},${c[1].toFixed(7)}`;
+const closedRing = (o) => (o.closed && o.coords.length ? [...o.coords, o.coords[0]] : o.coords);
 
 function closestOnSegment(p, a, b) {
   // Ponto de [a, b] mais perto de p (em píxeis) e o parâmetro t.
@@ -52,14 +70,94 @@ function towards(a, b, meters) {
   return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
 }
 
+function bearing(a, b) {
+  // Rumo de a para b (graus a partir do norte, sentido horário).
+  const k = Math.cos((a[1] * Math.PI) / 180);
+  return (Math.atan2((b[0] - a[0]) * k, b[1] - a[1]) * 180) / Math.PI;
+}
+
+function arrowImage() {
+  // Triângulo do iD a meio das arestas (aponta para este; roda com o rumo da aresta).
+  const size = 24;
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  const g = c.getContext("2d");
+  g.beginPath();
+  g.moveTo(18, 12);
+  g.lineTo(7, 5.5);
+  g.lineTo(7, 18.5);
+  g.closePath();
+  g.fillStyle = "rgba(238,238,238,0.85)";
+  g.strokeStyle = "rgba(68,68,68,0.8)";
+  g.lineWidth = 2;
+  g.lineJoin = "round";
+  g.fill();
+  g.stroke();
+  return g.getImageData(0, 0, size, size);
+}
+
+// Esquadrar vários contornos de uma vez (seleção múltipla, como no iD), um a seguir ao
+// outro: um vértice partilhado por dois deles (casas geminadas) move-se nos dois.
+// rings: [{ key, coords, ids, keep(i) }] (anéis sem repetir o primeiro ponto; keep: o
+// vértice está ligado a outro elemento e não pode sair). Devolve { rings: [{ key, coords,
+// ids, changed }], errors: [{ key, error }] }.
+export function squareRings(rings) {
+  const all = rings.flatMap((r) => r.coords);
+  if (!all.length) return { rings: [], errors: [] };
+  const lat0 = all.reduce((s, c) => s + c[1], 0) / all.length;
+  const kx = 111320 * Math.cos((lat0 * Math.PI) / 180), ky = 110540;
+  const [x0, y0] = all[0];
+  const fwd = (c) => [(c[0] - x0) * kx, (c[1] - y0) * ky];
+  const inv = (p) => [x0 + p[0] / kx, y0 + p[1] / ky];
+  const work = rings.map((r) => ({ key: r.key, coords: clone(r.coords), ids: r.ids ? clone(r.ids) : null, changed: false }));
+  const errors = [];
+  work.forEach((r, ri) => {
+    const coincident = (i) => {
+      const k = posKey(r.coords[i]);
+      return work.some((o, oj) => oj !== ri && o.coords.some((c) => posKey(c) === k));
+    };
+    const pts = r.coords.map(fwd);
+    const res = squareWay(pts, true, (i) => !!rings[ri].keep?.(i) || coincident(i));
+    if (res.error) return errors.push({ key: r.key, error: res.error });
+    res.coords.forEach((p, i) => {
+      if (Math.hypot(p[0] - pts[i][0], p[1] - pts[i][1]) <= MOVED_M) return;
+      const c = inv(p);
+      const before = posKey(r.coords[i]);
+      for (const o of work) {
+        if (o === r) continue;
+        o.coords.forEach((oc, k) => {
+          if (posKey(oc) !== before) return;
+          o.coords[k] = [...c];
+          o.changed = true;
+        });
+      }
+      r.coords[i] = c;
+    });
+    for (const i of [...res.removed].sort((a, b) => b - a)) {
+      if (r.coords.length <= 3) break;
+      r.coords.splice(i, 1);
+      r.ids?.splice(i, 1);
+    }
+    r.changed = true;
+  });
+  return { rings: work, errors };
+}
+
+export const SQUARE_MESSAGES = SQUARE_ERRORS;
+
 export class GeometryEditor {
-  // snapTargets(point, px): elementos à volta ({ key, source, coords }); wallsIndex():
-  // Map chave → geometria dos muros (para as ligações); onCommit: alteração terminada.
-  constructor(map, { snapTargets, wallsIndex, onCommit }) {
+  // snapTargets(point, px): elementos à volta ({ key, source, coords, ring });
+  // linkCandidates(target): elementos a que o elemento em edição se pode ligar
+  // ([{ key, source, closed, coords, ids }], anéis sem repetir o primeiro ponto);
+  // onCommit: alteração terminada; onStatus(mensagem): avisos (p.ex. não dá para esquadrar).
+  constructor(map, { snapTargets, linkCandidates, onCommit, onStatus, onEscape }) {
     this.map = map;
     this.snapTargets = snapTargets;
-    this.wallsIndex = wallsIndex;
+    this.linkCandidates = linkCandidates;
+    this.candidates = new Map();
     this.onCommit = onCommit;
+    this.onStatus = onStatus ?? (() => {});
+    this.onEscape = onEscape ?? (() => {}); // Esc sem menu nem vértice: tirar a seleção
     this.target = null;
     this.history = [];
     this.selected = null;
@@ -71,19 +169,33 @@ export class GeometryEditor {
   install() {
     const m = this.map;
     m.addSource("edit", { type: "geojson", data: EMPTY });
+    if (!m.hasImage("edit-mid-arrow")) m.addImage("edit-mid-arrow", arrowImage(), { pixelRatio: 2 });
+    m.addLayer({ id: "edit-fill", type: "fill", source: "edit", filter: ["==", ["get", "kind"], "fill"],
+      paint: { "fill-color": ["get", "color"], "fill-opacity": 0.18 } });
+    m.addLayer({ id: "edit-halo", type: "line", source: "edit", filter: ["all", ["==", ["get", "kind"], "line"], ["!", ["get", "other"]]],
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": HALO, "line-opacity": 0.7, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 8, 18, 14] } });
     m.addLayer({ id: "edit-line", type: "line", source: "edit", filter: ["==", ["get", "kind"], "line"],
       layout: { "line-cap": "round", "line-join": "round" },
-      paint: { "line-color": ["case", ["get", "other"], "#60a5fa", "#2563eb"], "line-width": ["case", ["get", "other"], 2, 3] } });
-    m.addLayer({ id: "edit-mid", type: "circle", source: "edit", filter: ["==", ["get", "kind"], "mid"],
-      paint: { "circle-radius": 4, "circle-color": "#ffffff", "circle-opacity": 0.85,
-        "circle-stroke-color": "#2563eb", "circle-stroke-width": 1.5 } });
+      paint: { "line-color": ["get", "color"], "line-width": ["case", ["get", "other"], 1.5, 2] } });
+    m.addLayer({ id: "edit-mid", type: "symbol", source: "edit", filter: ["==", ["get", "kind"], "mid"],
+      layout: {
+        "icon-image": "edit-mid-arrow",
+        "icon-rotate": ["-", ["get", "bearing"], 90],
+        "icon-rotation-alignment": "map",
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+      } });
+    m.addLayer({ id: "edit-vertex-halo", type: "circle", source: "edit", filter: ["all", ["==", ["get", "kind"], "vertex"], ["get", "selected"]],
+      paint: { "circle-radius": 9, "circle-color": HALO, "circle-opacity": 0.7 } });
     m.addLayer({ id: "edit-vertex", type: "circle", source: "edit", filter: ["==", ["get", "kind"], "vertex"],
       paint: {
-        "circle-radius": ["case", ["get", "selected"], 7, 5.5],
-        "circle-color": ["case", ["get", "selected"], "#2563eb", ["get", "snapped"], "#fde047", "#ffffff"],
-        // Vértice ligado a outros elementos (muros, landuse, vias): mexe-lhes também.
-        "circle-stroke-color": ["case", ["get", "shared"], "#ea580c", "#1d4ed8"],
-        "circle-stroke-width": ["case", ["get", "shared"], 3, 2],
+        "circle-radius": ["case", ["get", "selected"], 5.5, 4.5],
+        // Vértice ligado a outros elementos (muros, landuse, edifícios): cinzento, como no
+        // iD; mexê-lo mexe-lhes também.
+        "circle-color": ["case", ["get", "snapped"], "#fde047", ["get", "shared"], "#bbbbbb", "#ffffff"],
+        "circle-stroke-color": ["case", ["get", "selected"], "#222222", "#666666"],
+        "circle-stroke-width": ["case", ["get", "selected"], 2, 1.5],
       } });
     m.on("mousedown", "edit-vertex", (e) => this.startDrag(e, e.features[0].properties.idx, false));
     m.on("mousedown", "edit-mid", (e) => this.startDrag(e, e.features[0].properties.idx, true));
@@ -109,21 +221,31 @@ export class GeometryEditor {
 
   // ------------------------------------------------------------- estado
 
+  // target: { key, closed, coords, ids?, shared?, min?, kind?, color?, fill?, label? }
+  //  - kind: "wall" (muro proposto) ou "area" (landuse/edifício); por omissão pela chave;
+  //  - ids: nós do OSM de cada vértice (ways do OSM; null num vértice novo);
+  //  - fill: preencher o interior (edifícios); label: "edifício", "landuse"… nos menus.
   start(target) {
     this.closeMenu();
+    const kind = target.kind ?? (target.key.startsWith("wall/") ? "wall" : "area");
     const t = {
       key: target.key,
-      kind: target.key.startsWith("wall/") ? "wall" : "landuse",
+      kind,
       closed: !!target.closed,
       coords: clone(target.coords),
       ids: target.ids ? clone(target.ids) : null,
       shared: target.shared ?? new Set(),
       min: target.min ?? (target.closed ? 3 : 2),
-      links: [], // muros: por vértice, [{ key, i }] dos outros muros com o mesmo ponto
-      others: new Map(), // muros ligados: chave → coords (atualizadas ao arrastar)
+      color: target.color ?? (kind === "wall" ? "#f1f5f9" : "#fde68a"),
+      fill: !!target.fill,
+      label: target.label ?? (kind === "wall" ? "muro" : "área"),
+      // Por vértice, [{ key, i, node }] dos vértices de outros elementos no mesmo ponto
+      // (node: o mesmo nó do OSM, que o servidor move em todas as ways).
+      links: [],
+      others: new Map(), // elementos ligados: chave → { coords, ids, closed, source }
     };
     this.target = t;
-    if (t.kind === "wall") this.findLinks();
+    this.findLinks();
     this.history = [];
     this.selected = null;
     this.drag = null;
@@ -150,28 +272,50 @@ export class GeometryEditor {
   }
 
   findLinks() {
-    // Muros com um vértice no mesmo ponto que um vértice do muro em edição.
+    // Vértices de outros elementos no mesmo ponto que um vértice do elemento em edição:
+    // muros com muros; landuse e edifícios (do OSM e municipais) entre si.
     const t = this.target;
     t.links = t.coords.map(() => []);
     t.others = new Map();
-    for (const [key, g] of this.wallsIndex()) {
-      if (key === t.key || g?.type !== "LineString") continue;
-      g.coordinates.forEach((c, i) => {
-        t.coords.forEach((v, j) => {
-          if (!same(c, v)) return;
-          t.links[j].push({ key, i });
-          if (!t.others.has(key)) t.others.set(key, clone(g.coordinates));
-        });
+    this.candidates = new Map(
+      (this.linkCandidates?.(t) ?? []).filter((c) => c.key !== t.key && c.coords?.length).map((c) => [c.key, c]),
+    );
+    const at = new Map();
+    t.coords.forEach((c, j) => {
+      const k = posKey(c);
+      if (!at.has(k)) at.set(k, []);
+      at.get(k).push(j);
+    });
+    for (const cand of this.candidates.values()) {
+      cand.coords.forEach((c, i) => {
+        for (const j of at.get(posKey(c)) ?? []) {
+          const node = t.ids?.[j] != null && cand.ids?.[i] != null && t.ids[j] === cand.ids[i];
+          t.links[j].push({ key: cand.key, i, node });
+          if (!t.others.has(cand.key)) t.others.set(cand.key, this.otherOf(cand));
+        }
       });
     }
   }
 
-  setGeometry(coords, ids = null) {
+  otherOf(cand) {
+    return { coords: clone(cand.coords), ids: cand.ids ? clone(cand.ids) : null, closed: !!cand.closed, source: cand.source };
+  }
+
+  refreshLinks() {
+    // Os outros elementos mudaram (dados do mapa recarregados): refaz as ligações.
+    if (!this.target || this.drag) return;
+    this.findLinks();
+    this.render();
+  }
+
+  setGeometry(coords, ids = null, shared = null) {
     // Geometria confirmada pelo servidor (sem perder a seleção nem o histórico).
     if (!this.target || this.drag) return;
+    const resized = coords.length !== this.target.coords.length;
     this.target.coords = clone(coords);
     if (ids) this.target.ids = clone(ids);
-    if (this.target.kind === "wall") this.findLinks();
+    if (shared) this.target.shared = shared;
+    if (this.target.kind === "wall" || resized) this.findLinks();
     if (this.selected !== null && this.selected >= coords.length) this.selected = null;
     this.render();
   }
@@ -182,15 +326,18 @@ export class GeometryEditor {
   }
 
   hitTest(point) {
-    // O clique foi num vértice, ponto a meio ou aresta em edição (não seleciona outra coisa)?
+    // O clique foi no elemento em edição (vértice, triângulo, aresta ou, num edifício, o
+    // interior)? Então não seleciona outra coisa.
     if (!this.target) return false;
     const box = [[point.x - HIT_PX, point.y - HIT_PX], [point.x + HIT_PX, point.y + HIT_PX]];
-    return this.map.queryRenderedFeatures(box, { layers: LAYERS }).length > 0;
+    if (this.map.queryRenderedFeatures(box, { layers: HIT_LAYERS.filter((l) => l !== "edit-fill") }).length) return true;
+    return this.map.queryRenderedFeatures(point, { layers: ["edit-fill"] }).length > 0;
   }
 
   isShared(i) {
+    // Ligado a outro elemento (cinzento, como no iD): o mesmo ponto ou o mesmo nó do OSM.
     const t = this.target;
-    if (t.kind === "wall") return t.links[i]?.length > 0;
+    if (t.links[i]?.length > 0) return true;
     const id = t.ids?.[i];
     return id != null && t.shared.has(id);
   }
@@ -217,17 +364,21 @@ export class GeometryEditor {
     const src = this.map.getSource("edit");
     if (!src) return;
     if (!this.target) return src.setData(EMPTY);
-    const { coords, closed, others } = this.target;
+    const { coords, closed, others, color, fill } = this.target;
     const line = closed ? [...coords, coords[0]] : coords;
-    const feats = [{ type: "Feature", geometry: { type: "LineString", coordinates: line }, properties: { kind: "line", other: false } }];
-    for (const c of others.values()) {
-      feats.push({ type: "Feature", geometry: { type: "LineString", coordinates: c }, properties: { kind: "line", other: true } });
+    const feats = [];
+    if (fill && closed && coords.length >= 3) {
+      feats.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [line] }, properties: { kind: "fill", color } });
+    }
+    feats.push({ type: "Feature", geometry: { type: "LineString", coordinates: line }, properties: { kind: "line", other: false, color } });
+    for (const o of others.values()) {
+      feats.push({ type: "Feature", geometry: { type: "LineString", coordinates: closedRing(o) }, properties: { kind: "line", other: true, color: "#93c5fd" } });
     }
     for (const [i, j] of this.segments()) {
       const a = this.map.project(coords[i]), b = this.map.project(coords[j]);
       if (Math.hypot(a.x - b.x, a.y - b.y) < MID_MIN_PX) continue;
       const mid = [(coords[i][0] + coords[j][0]) / 2, (coords[i][1] + coords[j][1]) / 2];
-      feats.push({ type: "Feature", geometry: { type: "Point", coordinates: mid }, properties: { kind: "mid", idx: i } });
+      feats.push({ type: "Feature", geometry: { type: "Point", coordinates: mid }, properties: { kind: "mid", idx: i, bearing: bearing(coords[i], coords[j]) } });
     }
     coords.forEach((c, i) => {
       feats.push({
@@ -258,7 +409,7 @@ export class GeometryEditor {
     t.ids = s.ids;
     t.links = s.links;
     t.others = new Map(s.others);
-    // Os muros ligados que mudaram desde então voltam também (são gravados).
+    // Os elementos ligados que mudaram desde então voltam também (são gravados).
     return [...before.keys()].filter((k) => JSON.stringify(before.get(k)) !== JSON.stringify(t.others.get(k)));
   }
 
@@ -269,41 +420,46 @@ export class GeometryEditor {
     const t = this.target;
     t.coords.splice(i, 0, c);
     if (t.ids) t.ids.splice(i, 0, null);
-    if (t.kind === "wall") t.links.splice(i, 0, []);
+    t.links.splice(i, 0, []);
   }
 
   removeVertex(i) {
     const t = this.target;
     t.coords.splice(i, 1);
     if (t.ids) t.ids.splice(i, 1);
-    if (t.kind === "wall") {
-      const gone = t.links.splice(i, 1)[0] ?? [];
-      // Os muros que só estavam ligados por este vértice deixam de acompanhar a edição.
-      for (const { key } of gone) if (!t.links.some((ls) => ls.some((l) => l.key === key))) t.others.delete(key);
-    }
+    this.unlink(t.links.splice(i, 1)[0] ?? []);
+  }
+
+  unlink(gone) {
+    // Os elementos que só estavam ligados por estes vértices deixam de acompanhar a edição.
+    const t = this.target;
+    for (const { key } of gone) if (!t.links.some((ls) => ls.some((l) => l.key === key))) t.others.delete(key);
   }
 
   moveVertex(i, c) {
     const t = this.target;
     t.coords[i] = c;
-    for (const { key, i: j } of t.links[i] ?? []) t.others.get(key)[j] = [...c];
+    for (const { key, i: j } of t.links[i] ?? []) {
+      const o = t.others.get(key);
+      if (o) o.coords[j] = [...c];
+    }
   }
 
   mergeOnDrop(i, snap) {
     // Largado num vértice: como no iD, os dois passam a ser um só e o arrastado sai.
-    // Devolve o índice do vértice que fica (ou null se não juntou).
+    // Devolve { idx, self } (self: juntou-se a um vértice do próprio elemento) ou null.
     const t = this.target;
     if (!snap || snap.vertex === undefined) return null;
     let j = null;
     if (snap.source === "self") j = snap.vertex;
-    else if (t.kind === "landuse" && snap.nodes?.[snap.vertex] > 0) {
-      // Nó de outra way do OSM: o landuse passa a usá-lo (ou junta-se ao seu, se já o tem).
+    else if (t.ids && snap.nodes?.[snap.vertex] > 0) {
+      // Nó de outra way do OSM: a way em edição passa a usá-lo (ou junta-se ao seu, se já o tem).
       const node = snap.nodes[snap.vertex];
       const k = t.ids.indexOf(node);
       if (k < 0) {
         t.ids[i] = node;
         t.shared.add(node);
-        return i;
+        return { idx: i, self: false };
       }
       j = k;
     }
@@ -313,52 +469,57 @@ export class GeometryEditor {
     if (!t.closed && n > 2 && ((i === 0 && j === n - 1) || (i === n - 1 && j === 0))) return null;
     if (n <= t.min) return null;
     t.coords[j] = [...t.coords[i]];
-    if (t.kind === "wall") {
-      // Os muros ligados ao arrastado passam a estar ligados ao que fica.
-      const keep = t.links[j];
-      for (const l of t.links[i]) if (!keep.some((x) => x.key === l.key && x.i === l.i)) keep.push(l);
-      t.links[i] = [];
-    }
+    // Os elementos ligados ao arrastado passam a estar ligados ao que fica.
+    const keep = t.links[j];
+    for (const l of t.links[i]) if (!keep.some((x) => x.key === l.key && x.i === l.i)) keep.push(l);
+    t.links[i] = [];
     this.removeVertex(i);
     this.selected = j > i ? j - 1 : j;
-    return this.selected;
+    return { idx: this.selected, self: true };
   }
 
-  connectToWall(i, snap) {
-    // Largado em cima de outro muro: liga-se a ele (num vértice ou, numa aresta, cria-o).
+  connectTo(i, snap) {
+    // Largado em cima de outro elemento a que se pode ligar (muros com muros; landuse e
+    // edifícios entre si): liga-se a ele num vértice ou, numa aresta, cria-o lá (como no
+    // iD). Devolve as chaves dos elementos que mudaram (para gravar).
     const t = this.target;
-    if (t.kind !== "wall" || !snap || snap.source !== "walls" || snap.key === t.key) return [];
+    if (!snap || snap.source === "self" || snap.key === t.key || (snap.ring ?? 0) !== 0) return [];
+    const cand = this.candidates.get(snap.key);
+    if (!cand) return [];
     if (t.links[i].some((l) => l.key === snap.key)) return [];
-    const coords = t.others.get(snap.key) ?? clone(snap.coords);
+    if (!t.others.has(snap.key)) t.others.set(snap.key, this.otherOf(cand));
+    const o = t.others.get(snap.key);
+    const n = o.coords.length;
     let j;
-    if (snap.vertex !== undefined) j = snap.vertex;
+    let changed = false;
+    if (snap.vertex !== undefined) j = o.closed ? snap.vertex % n : snap.vertex;
     else {
       j = snap.seg + 1;
-      coords.splice(j, 0, [...t.coords[i]]);
-      // Índices do outro muro depois do vértice novo andam uma posição.
+      o.coords.splice(j, 0, [...t.coords[i]]);
+      if (o.ids) o.ids.splice(j, 0, null);
+      // Índices do outro elemento depois do vértice novo andam uma posição.
       for (const ls of t.links) for (const l of ls) if (l.key === snap.key && l.i >= j) l.i += 1;
+      changed = true;
     }
-    t.others.set(snap.key, coords);
-    t.links[i].push({ key: snap.key, i: j });
-    return snap.vertex !== undefined ? [] : [snap.key];
+    const node = t.ids?.[i] != null && o.ids?.[j] != null && t.ids[i] === o.ids[j];
+    t.links[i].push({ key: snap.key, i: j, node });
+    return changed ? [snap.key] : [];
   }
 
   disconnect(i) {
-    // Desliga o vértice i dos outros elementos (como o "Desligar" do iD).
+    // Desliga o vértice i dos outros elementos (como o "Desligar" do iD): passa a ter o
+    // seu próprio ponto (nó novo, numa way do OSM), 5 cm para dentro do elemento; os
+    // outros ficam onde estão.
     const t = this.target;
     if (!this.isShared(i)) return;
     this.pushHistory();
-    if (t.kind === "wall") {
-      // O muro passa a ter o seu próprio ponto, 5 cm para dentro dele (os outros ficam).
-      const n = t.coords.length;
-      const neighbour = i > 0 ? t.coords[i - 1] : t.coords[Math.min(1, n - 1)];
-      const gone = t.links[i];
-      t.links[i] = [];
-      for (const { key } of gone) if (!t.links.some((ls) => ls.some((l) => l.key === key))) t.others.delete(key);
-      t.coords[i] = towards(t.coords[i], neighbour, DISCONNECT_M);
-    } else {
-      t.ids[i] = null; // nó novo só deste landuse, no mesmo sítio
-    }
+    const n = t.coords.length;
+    const neighbour = i > 0 ? t.coords[i - 1] : t.closed ? t.coords[n - 1] : t.coords[Math.min(1, n - 1)];
+    const gone = t.links[i];
+    t.links[i] = [];
+    this.unlink(gone);
+    if (t.ids) t.ids[i] = null;
+    t.coords[i] = towards(t.coords[i], neighbour, DISCONNECT_M);
     this.commit([]);
     this.render();
   }
@@ -379,6 +540,44 @@ export class GeometryEditor {
     }
     this.selected = null;
     this.commit([...changed]);
+    this.render();
+  }
+
+  plane() {
+    // Plano local em metros à volta do elemento (para esquadrar).
+    const t = this.target;
+    const lat0 = t.coords.reduce((s, c) => s + c[1], 0) / t.coords.length;
+    const kx = 111320 * Math.cos((lat0 * Math.PI) / 180), ky = 110540;
+    const [x0, y0] = t.coords[0];
+    return {
+      fwd: (c) => [(c[0] - x0) * kx, (c[1] - y0) * ky],
+      inv: (p) => [x0 + p[0] / kx, y0 + p[1] / ky],
+    };
+  }
+
+  square(what = "way", index = null) {
+    // Esquadrar como o "Q" do iD: o contorno inteiro, um canto (vértice) ou uma aresta.
+    // Num contorno inteiro, os vértices em troços retos saem (os ligados a outros
+    // elementos ficam, sobre o lado).
+    const t = this.target;
+    if (!t || !t.closed) return;
+    const { fwd, inv } = this.plane();
+    const pts = t.coords.map(fwd);
+    const res = what === "corner" ? squareCorner(pts, index)
+      : what === "edge" ? squareEdge(pts, index)
+      : squareWay(pts, true, (i) => this.isShared(i));
+    if (res.error) {
+      const key = res.error === "not_squarish" && what !== "way" ? "not_squarish_part" : res.error;
+      return this.onStatus(SQUARE_ERRORS[key]);
+    }
+    this.pushHistory();
+    res.coords.forEach((p, i) => {
+      if (Math.hypot(p[0] - pts[i][0], p[1] - pts[i][1]) > MOVED_M) t.coords[i] = inv(p);
+    });
+    const removed = [...res.removed].sort((a, b) => b - a);
+    for (const i of removed) if (t.coords.length > Math.max(t.min, 3)) this.removeVertex(i);
+    if (what !== "corner" || removed.length) this.selected = null;
+    this.commit([]);
     this.render();
   }
 
@@ -417,9 +616,11 @@ export class GeometryEditor {
     if (!d) return;
     this.drag = null;
     if (d.moved) {
-      const linked = (this.target.links[d.idx] ?? []).map((l) => l.key);
+      // Os elementos ligados a este vértice mudaram com ele (os que partilham o mesmo nó
+      // do OSM, move-os o servidor).
+      const linked = (this.target.links[d.idx] ?? []).filter((l) => !l.node).map((l) => l.key);
       const merged = this.mergeOnDrop(d.idx, d.snap);
-      const extra = merged === null ? this.connectToWall(d.idx, d.snap) : [];
+      const extra = merged?.self ? [] : this.connectTo(merged?.idx ?? d.idx, d.snap);
       this.commit([...new Set([...linked, ...extra])]);
     } else {
       // Só clicou: o ponto a meio não fica; o vértice fica selecionado e abre o menu.
@@ -449,7 +650,14 @@ export class GeometryEditor {
     const hit = this.edgeAt(e.point);
     if (hit) {
       e.preventDefault();
-      this.openEdgeMenu(hit, e.point);
+      return this.openEdgeMenu(hit, e.point);
+    }
+    // Dentro do edifício em edição: as ações do edifício (como o menu do iD).
+    if (this.target.fill && this.target.closed && this.map.queryRenderedFeatures(e.point, { layers: ["edit-fill"] }).length) {
+      e.preventDefault();
+      const t = this.target;
+      this.openMenu(e.point, [{ label: `Esquadrar ${t.label}`, hint: "Q", enabled: t.coords.length >= 3, run: () => this.square("way"),
+        title: `Todos os cantos a menos de ${SQUARE_THRESHOLD_DEG}° de 90° passam a retos (como o Q do iD)` }]);
     }
   }
 
@@ -503,6 +711,8 @@ export class GeometryEditor {
 
   onKey(e) {
     if (!this.target || e.target.closest?.("input, select, textarea")) return;
+    // A vista "Planta" (partes) tem as suas teclas.
+    if (e.target.closest?.("#planner")) return;
     const k = e.key.toLowerCase();
     if ((e.ctrlKey || e.metaKey) && k === "z") {
       e.preventDefault();
@@ -524,13 +734,21 @@ export class GeometryEditor {
       e.preventDefault();
       this.closeMenu();
       this.disconnect(this.selected);
+    } else if (k === "q" && this.target.closed) {
+      // Como no iD: com um vértice selecionado, só esse canto; senão, o contorno todo.
+      e.preventDefault();
+      this.closeMenu();
+      if (this.selected !== null) this.square("corner", this.selected);
+      else this.square("way");
     } else if (k === "s" && this.target.kind === "wall") {
       e.preventDefault();
       this.closeMenu();
       this.straighten();
     } else if (e.key === "Escape") {
+      // Como no iD: fecha o menu, depois tira o vértice e, por fim, o elemento.
       if (this.menu) this.closeMenu();
-      else this.selected = null;
+      else if (this.selected !== null) this.selected = null;
+      else return this.onEscape();
       this.render();
     }
   }
@@ -549,8 +767,9 @@ export class GeometryEditor {
       const d = Math.hypot(q.x - point.x, q.y - point.y);
       if (d <= SNAP_PX && (!best || d < best.d)) best = { d, c, s: { ...own, vertex: i % t.coords.length } };
     });
+    const coordsOf = (s) => (t.others.has(s.key) && (s.ring ?? 0) === 0 ? closedRing(t.others.get(s.key)) : s.coords);
     for (const s of targets) {
-      const coords = t.others.get(s.key) ?? s.coords;
+      const coords = coordsOf(s);
       coords.forEach((c, i) => {
         if (same(c, origin)) return;
         const q = this.map.project(c);
@@ -566,7 +785,7 @@ export class GeometryEditor {
       if (c.d <= EDGE_SNAP_PX && (!edge || c.d < edge.d)) edge = { ...c, s: { ...own, seg: a } };
     }
     for (const s of targets) {
-      const coords = t.others.get(s.key) ?? s.coords;
+      const coords = coordsOf(s);
       for (let i = 0; i < coords.length - 1; i++) {
         if (same(coords[i], origin) || same(coords[i + 1], origin)) continue; // aresta que se move com ele
         const c = closestOnSegment(point, this.map.project(coords[i]), this.map.project(coords[i + 1]));
@@ -583,7 +802,10 @@ export class GeometryEditor {
   commit(otherKeys) {
     const t = this.target;
     const others = {};
-    for (const k of otherKeys) if (t.others.has(k)) others[k] = clone(t.others.get(k));
+    for (const k of otherKeys) {
+      const o = t.others.get(k);
+      if (o) others[k] = { coords: clone(o.coords), ids: clone(o.ids), source: o.source };
+    }
     this.onCommit(t, clone(t.coords), clone(t.ids), others);
   }
 
@@ -593,16 +815,27 @@ export class GeometryEditor {
     this.selected = i;
     this.render();
     const t = this.target;
-    this.openMenu(point, [
+    const items = [
       { label: "Apagar vértice", hint: "Delete", enabled: t.coords.length > t.min, run: () => this.deleteVertex(i) },
       { label: "Desligar", hint: "D", enabled: this.isShared(i), run: () => this.disconnect(i),
-        title: t.kind === "wall" ? "Este muro deixa de partilhar o ponto com os outros muros" : "Este landuse passa a ter o seu próprio nó (os outros elementos ficam com o deles)" },
-    ]);
+        title: t.kind === "wall" ? "Este muro deixa de partilhar o ponto com os outros muros" : `Este ${t.label} passa a ter o seu próprio vértice (os outros elementos ficam com o deles)` },
+    ];
+    if (t.closed) {
+      items.push({ label: "Esquadrar canto", hint: "Q", enabled: t.coords.length >= 3, run: () => this.square("corner", i),
+        title: `O ângulo neste vértice passa a reto (só este vértice mexe; até ${SQUARE_PART_DEG}° de diferença)` });
+    }
+    this.openMenu(point, items);
   }
 
   openEdgeMenu(hit, point) {
     const t = this.target;
     const items = [{ label: "Acrescentar vértice aqui", hint: "duplo clique", enabled: true, run: () => this.addVertexAt(hit) }];
+    if (t.closed) {
+      items.push({ label: "Esquadrar aresta", hint: "", enabled: t.coords.length >= 4, run: () => this.square("edge", hit.i),
+        title: "A aresta fica perpendicular aos lados vizinhos (os seus vértices deslizam ao longo deles)" });
+      items.push({ label: `Esquadrar ${t.label}`, hint: "Q", enabled: t.coords.length >= 3, run: () => this.square("way"),
+        title: `Todos os cantos a menos de ${SQUARE_THRESHOLD_DEG}° de 90° passam a retos (como o Q do iD)` });
+    }
     if (t.kind === "wall") {
       items.push({ label: "Alinhar muro", hint: "S", enabled: t.coords.length > 2, run: () => this.straighten(),
         title: "Muro reto do início ao fim: os pontos intermédios saem (os ligados a outros muros passam para a reta)" });
@@ -619,7 +852,7 @@ export class GeometryEditor {
       b.type = "button";
       b.disabled = !it.enabled;
       if (it.title) b.title = it.title;
-      b.innerHTML = `<span>${it.label}</span><kbd>${it.hint}</kbd>`;
+      b.innerHTML = `<span>${it.label}</span>${it.hint ? `<kbd>${it.hint}</kbd>` : ""}`;
       b.addEventListener("click", (ev) => {
         ev.stopPropagation();
         this.closeMenu();

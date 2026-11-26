@@ -248,7 +248,10 @@ def run_stage(
             from osm3d.review import ReviewStore, apply_review
 
             reviews = ReviewStore(review_store_path(config)).all()
-            buildings = [apply_review(b, reviews.get(b.key)) for b in review_buildings(config)]
+            buildings = [
+                apply_review(b, reviews.get(b.key))
+                for b in with_footprint_edits(config, review_buildings(config))
+            ]
             walls = accepted_walls(config, reviews)
             path, n_selected, records, topo = export_area(config, buildings, progress, walls)
             if progress:
@@ -334,11 +337,73 @@ def review_buildings(config: Config) -> list[Building]:
     from osm3d.export.geopackage import read_buildings
 
     qa = _require(artefact_path(config, Stage.QA), Stage.QA)
-    buildings = read_buildings(qa)
-    candidates = artefact_path(config, Stage.CANDIDATES)
-    if candidates.exists():
-        buildings += [b for b in read_buildings(candidates) if is_municipal(b)]
-    return buildings
+    return read_buildings(qa) + area_candidates(config)
+
+
+def area_candidates(config: Config) -> list[Building]:
+    """Edifícios da cartografia municipal em falta no OSM, nas quadrículas da área.
+
+    Se as quadrículas da área mudaram e a fase candidates não foi refeita (p.ex. sem
+    câmaras configuradas para a área nova), os da corrida anterior que ficam fora delas
+    não contam: nem na revisão nem na exportação.
+    """
+    from osm3d.export.geopackage import read_buildings
+
+    path = artefact_path(config, Stage.CANDIDATES)
+    if not path.exists():
+        return []
+    return in_area(config, [b for b in read_buildings(path) if is_municipal(b)])
+
+
+def footprint_refitter(config: Config) -> Any:
+    """Reajuste de um edifício a um contorno editado, lendo o LiDAR das quadrículas."""
+    from osm3d.footprint_edits import FootprintRefitter
+    from osm3d.geospatial.point_clouds import index_tiles, read_points
+
+    def points_around(bounds: tuple[float, float, float, float]) -> Any:
+        from osm3d.footprint_edits import tiles_covering
+
+        laz = tiles_covering(index_tiles(config.sources.lidar_dir, (".laz", ".las")), bounds, 0.0)
+        return read_points(laz, bounds)
+
+    return FootprintRefitter(
+        config,
+        points_around,
+        lambda: index_tiles(config.sources.dtm_dir, (".tif", ".tiff")),
+        lambda: ortho_files(config),
+    )
+
+
+def with_footprint_edits(
+    config: Config, buildings: list[Building], refit: Any = None
+) -> list[Building]:
+    """Edifícios com o contorno editado na revisão reajustados a ele (os reajustes
+    guardados servem enquanto o contorno e o edifício de origem não mudam)."""
+    from pyproj import Transformer
+
+    from osm3d.footprint_edits import apply_footprint_edits, edited_footprints
+    from osm3d.geometry_edits import ContextIndex
+    from osm3d.review import ReviewStore
+
+    store = ReviewStore(review_store_path(config))
+    edits = store.geometry_edits()
+    path = context_path(config)
+    ctx = (
+        ContextIndex.of(json.loads(path.read_text(encoding="utf-8")))
+        if path.exists() and not edits.landuse_empty
+        else None
+    )
+    to_crs = Transformer.from_crs("EPSG:4326", config.processing_crs, always_xy=True)
+    footprints = edited_footprints(buildings, ctx, edits, to_crs)
+    if not footprints:
+        return buildings
+    return apply_footprint_edits(
+        buildings,
+        footprints,
+        store.footprint_fits(),
+        refit or footprint_refitter(config),
+        store.save_footprint_fit,
+    )
 
 
 def is_municipal(b: Building) -> bool:
@@ -411,6 +476,53 @@ def fetch_area_barriers(
     from osm3d.municipal_area import area_barriers
 
     return area_barriers(config, force=force, progress=progress)
+
+
+_BARRIERS_LOCK = threading.Lock()
+
+
+def local_area_barriers(config: Config) -> Path | None:
+    """Muros da área recortados das cópias dos concelhos, sem pedidos à rede.
+
+    Faz o recorte se está em falta, é de outras quadrículas ou é mais antigo do que as
+    cópias, desde que todas as câmaras da área com muros tenham a cópia do concelho.
+    ``None``: não há cópias que cheguem (aí só "obter do geoportal" os traz).
+    """
+    from osm3d.acquisition.municipal import full_barriers_usable
+    from osm3d.municipal_area import sources_for_area
+
+    def usable(src: Any) -> bool:
+        # Ler a cópia (dezenas de MB) só uma vez por versão do ficheiro.
+        full = src.full_barriers_path
+        if not full.exists():
+            return False
+        key = (str(full), full.stat().st_mtime, json.dumps(src.model_dump(mode="json")))
+        if key not in _FULL_BARRIERS_USABLE:
+            _FULL_BARRIERS_USABLE[key] = full_barriers_usable(src)
+        return _FULL_BARRIERS_USABLE[key]
+
+    with _BARRIERS_LOCK:
+        try:
+            sources = [s for s in sources_for_area(config, network=False) if s.barriers]
+        except FileNotFoundError:
+            return None
+        fulls = [s.full_barriers_path for s in sources]
+        if not sources or not all(p.exists() for p in fulls):
+            return None
+        path = barriers_path(config)
+        newest = max(p.stat().st_mtime for p in fulls)
+        if (
+            path.exists()
+            and cache_matches(path, config.area.tiles)
+            and path.stat().st_mtime >= newest
+        ):
+            return path
+        if not all(usable(s) for s in sources):
+            return None
+        return fetch_area_barriers(config)
+
+
+_FULL_BARRIERS_USABLE: dict[tuple[str, float, str], bool] = {}
 
 
 def municipal_path(config: Config) -> Path:
@@ -798,7 +910,7 @@ def export_topology(
     O que se fez e os conflitos que ficam vão para o relatório.
     """
     from osm3d.export.osm_edits import fetch_for_edit, plan_edits
-    from osm3d.export.osm_xml import ExportRecord, has_parts
+    from osm3d.export.osm_xml import ExportRecord, has_parts, is_split
     from osm3d.reconstruction.walls import with_run_vertices
     from osm3d.validation.topology import (
         CONFLICT_CODES,
@@ -826,14 +938,22 @@ def export_topology(
     adjustments += _wall_adjustments(config, walls)
     lines = [(w.key, with_run_vertices(w), w.tags) for w in walls]
     ways = [b for b in fixed if b.osm_type == "way"]
+    # Vértices dos edifícios novos ligados no mapa a nós do OSM (landuse, edifícios):
+    # esses nós vão no ficheiro e os edifícios usam-nos (pedem-se as ways deles).
+    connected = _connected_nodes(config, [b for b in fixed if b.osm_type == "new"], ctx)
     plan = {
-        "skip_ways": {b.osm_id for b in ways if has_parts(b)},
+        "skip_ways": {b.osm_id for b in ways if has_parts(b) or is_split(b)},
         "versions": {b.osm_id: b.osm_version for b in ways},
         "lines": lines,
+        "keep_nodes": set(connected),
     }
     edits: OsmEdits | None = None
-    if adjustments or manual:
-        way_ids = [a.feature.osm_id for a in adjustments] + list(manual)
+    if adjustments or manual or connected:
+        way_ids = (
+            [a.feature.osm_id for a in adjustments]
+            + list(manual)
+            + [w for parents in connected.values() for w in parents]
+        )
         if progress:
             progress(f"  a obter do Overpass as {len(set(way_ids))} ways do OSM a ajustar")
         try:
@@ -912,11 +1032,11 @@ def export_topology(
 
 
 def manual_landuse(config: Config) -> dict[int, ManualRing]:
-    """Landuse editados à mão na revisão, para a exportação: (nós no OSM quando se editou,
-    anel novo com (id do nó ou None, x, y) no CRS de processamento)."""
+    """Landuse e edifícios do OSM editados à mão na revisão, para a exportação: (nós no
+    OSM quando se editou, anel novo com (id do nó ou None, x, y) no CRS de processamento)."""
     from pyproj import Transformer
 
-    from osm3d.geometry_edits import ContextIndex, edited_landuse, landuse_ring
+    from osm3d.geometry_edits import ContextIndex, edited_areas, landuse_ring
 
     edits = geometry_edits(config)
     path = context_path(config)
@@ -925,13 +1045,43 @@ def manual_landuse(config: Config) -> dict[int, ManualRing]:
     ctx = ContextIndex.of(json.loads(path.read_text(encoding="utf-8")))
     to_crs = Transformer.from_crs("EPSG:4326", config.processing_crs, always_xy=True)
     out: dict[int, ManualRing] = {}
-    for wid in edited_landuse(ctx, edits):
+    for wid in edited_areas(ctx, edits):
         ring = landuse_ring(ctx, edits, wid)
         xs, ys = to_crs.transform([n[1] for n in ring], [n[2] for n in ring])
         out[wid] = (
             list(ctx.refs[wid]),
             [(n[0], float(x), float(y)) for n, x, y in zip(ring, xs, ys, strict=True)],
         )
+    return out
+
+
+def _connected_nodes(
+    config: Config, buildings: list[Building], ctx_path: Path
+) -> dict[int, list[int]]:
+    """Nós do OSM (contexto, com as edições) no mesmo ponto (≤ 1 mm) que um vértice de um
+    edifício novo: nó → ways do contexto que o usam."""
+    if not buildings or not ctx_path.exists():
+        return {}
+    import numpy as np
+    import shapely
+    from pyproj import Transformer
+
+    from osm3d.geometry_edits import ContextIndex
+
+    ctx = ContextIndex.of(json.loads(ctx_path.read_text(encoding="utf-8")))
+    ids = [n for n in ctx.nodes if n > 0]
+    if not ids:
+        return {}
+    to_crs = Transformer.from_crs("EPSG:4326", config.processing_crs, always_xy=True)
+    xs, ys = to_crs.transform([ctx.nodes[n][0] for n in ids], [ctx.nodes[n][1] for n in ids])
+    tree = shapely.STRtree(shapely.points(np.column_stack([xs, ys])))
+    out: dict[int, list[int]] = {}
+    for b in buildings:
+        for poly in getattr(b.footprint, "geoms", [b.footprint]):
+            for x, y in poly.exterior.coords[:-1]:
+                for k in tree.query(shapely.Point(x, y), predicate="dwithin", distance=0.001):
+                    nid = ids[int(k)]
+                    out.setdefault(nid, ctx.parents(nid))
     return out
 
 

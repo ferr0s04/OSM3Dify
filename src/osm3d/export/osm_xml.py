@@ -35,6 +35,9 @@ from osm3d.export.osm_edits import OsmEdits
 from osm3d.export.s3db_tags import TagPolicy, format_metres, merge_tags, part_to_tags
 from osm3d.parts import SNAP_M, on_segment
 
+# Vértice de um edifício novo ligado no mapa a um nó do OSM: o mesmo ponto (≤ 1 mm).
+SAME_EXISTING_NODE_M = 0.001
+
 UploadPolicy = Literal["never", "false", "true"]
 
 
@@ -73,16 +76,23 @@ def plan_export(
             reason = "sinalizado: " + ",".join(f.code for f in b.qa_flags if f.severity != "info")
         elif not b.parts:
             reason = "sem partes"
-        elif has_parts(b) and b.osm_type not in ("way", "new"):
+        elif (has_parts(b) or is_split(b)) and b.osm_type not in ("way", "new"):
             reason = "partes só em contornos simples (way), não em multipolígonos"
-        elif len(b.parts) > 1 and not has_parts(b):
+        elif len(b.parts) > 1 and not has_parts(b) and not is_split(b):
             reason = "várias partes sem divisão definida"
         if reason:
             records.append(ExportRecord(b.key, False, reason))
             continue
         merge = merge_tags(b.existing_tags, outline_tags(b, policy), overwrite=overwrite)
-        changed = merge.has_changes or has_parts(b)  # partes novas são sempre alteração
-        ok = f"ok ({len(b.parts)} partes)" if has_parts(b) else "ok"
+        # Partes novas (ou a divisão em vários edifícios) são sempre alteração.
+        changed = merge.has_changes or has_parts(b) or is_split(b)
+        ok = (
+            f"ok ({len(b.parts)} partes)"
+            if has_parts(b)
+            else f"ok (dividido em {len(b.parts)} edifícios)"
+            if is_split(b)
+            else "ok"
+        )
         record = ExportRecord(
             b.key,
             changed,
@@ -97,15 +107,40 @@ def plan_export(
     return selected, records
 
 
-def has_parts(b: Building) -> bool:
+def _divided(b: Building) -> bool:
     return b.layout is not None and len(b.parts) == len(b.layout.parts) and len(b.parts) > 1
+
+
+def has_parts(b: Building) -> bool:
+    """Dividido em ``building:part`` dentro do contorno."""
+    return _divided(b) and b.layout is not None and b.layout.split == "parts"
+
+
+def is_split(b: Building) -> bool:
+    """Dividido em vários edifícios (cada peça um edifício com as suas tags 3D)."""
+    return _divided(b) and b.layout is not None and b.layout.split == "buildings"
+
+
+# Tags que não passam do edifício original para as peças novas de uma divisão em vários
+# edifícios: as 3D (cada peça tem as suas).
+_SPLIT_DROP = {"height", "min_height", "building:levels", "building:min_level", "building:part"}
+
+
+def split_piece_tags(
+    b: Building, i: int, policy: TagPolicy, base: dict[str, str]
+) -> dict[str, str]:
+    """Tags da peça ``i`` (≥ 1) de um edifício dividido em vários: as do edifício original
+    (``base``, já com as finais) sem as 3D, mais as 3D da própria peça."""
+    keep = {k: v for k, v in base.items() if k not in _SPLIT_DROP and not k.startswith("roof:")}
+    return {**keep, **part_to_tags(b.parts[i], policy)}
 
 
 def outline_tags(b: Building, policy: TagPolicy) -> dict[str, str]:
     """Tags propostas para o contorno.
 
     Com partes, o contorno leva só a altura total (a da parte mais alta). A forma
-    e as cores ficam em cada ``building:part``.
+    e as cores ficam em cada ``building:part``. Dividido em vários edifícios, o
+    contorno (a way original) fica com a 1.ª peça e as suas tags.
     """
     if not has_parts(b):
         return part_to_tags(b.parts[0], policy)
@@ -145,6 +180,75 @@ def _attach_parts(
     - vértice sobre um lado do contorno → nó novo, **inserido nesse lado do contorno**;
     - vértice interior → nó novo, partilhado pelas partes que o usam.
     """
+    ring, vertex_node, inserts = _layout_nodes(way, b, index, nodes, ids, crs)
+
+    if inserts:
+        for nd in way.findall("nd"):
+            way.remove(nd)
+        new_ring: list[int] = []
+        for i, ref in enumerate(ring):
+            new_ring.append(ref)
+            new_ring += [nid for _, nid in sorted(inserts.get(i, []))]
+        for ref in [*new_ring, new_ring[0]]:
+            ET.SubElement(way, "nd", ref=str(ref))
+        # As tags ficam depois dos nós, como no formato OSM.
+        for tag in way.findall("tag"):
+            way.remove(tag)
+            way.append(tag)
+        way.set("action", "modify")
+
+    assert b.layout is not None
+    for k, part in enumerate(b.parts):
+        el = ET.Element("way", id=str(ids.new()), action="modify", visible="true")
+        part_ring = [vertex_node[i] for i in b.layout.parts[k]]
+        for ref in [*part_ring, part_ring[0]]:
+            ET.SubElement(el, "nd", ref=str(ref))
+        for key, value in sorted(part_way_tags(part, policy).items()):
+            ET.SubElement(el, "tag", k=key, v=value)
+        new_ways.append(el)
+
+
+def _split_way(
+    way: ET.Element,
+    b: Building,
+    index: dict[tuple[str, int], ET.Element],
+    nodes: dict[int, ET.Element],
+    new_ways: list[ET.Element],
+    ids: _NodeIds,
+    policy: TagPolicy,
+    crs: str,
+) -> None:
+    """Edifício do OSM dividido em vários edifícios: a way fica com a 1.ª peça (a sua
+    história e as tags finais) e as outras peças são ways novas com as tags do edifício
+    sem as 3D, mais as suas. Os nós do contorno mantêm-se; as peças vizinhas partilham
+    os nós da parede comum."""
+    assert b.layout is not None
+    _, vertex_node, _ = _layout_nodes(way, b, index, nodes, ids, crs)
+    base = {t.attrib["k"]: t.attrib["v"] for t in way.findall("tag")}
+    first = [vertex_node[i] for i in b.layout.parts[0]]
+    _replace_nodes(way, [str(r) for r in [*first, first[0]]])
+    way.set("action", "modify")
+    for k in range(1, len(b.parts)):
+        el = ET.Element("way", id=str(ids.new()), action="modify", visible="true")
+        piece = [vertex_node[i] for i in b.layout.parts[k]]
+        for ref in [*piece, piece[0]]:
+            ET.SubElement(el, "nd", ref=str(ref))
+        for key, value in sorted(split_piece_tags(b, k, policy, base).items()):
+            ET.SubElement(el, "tag", k=key, v=value)
+        new_ways.append(el)
+
+
+def _layout_nodes(
+    way: ET.Element,
+    b: Building,
+    index: dict[tuple[str, int], ET.Element],
+    nodes: dict[int, ET.Element],
+    ids: _NodeIds,
+    crs: str,
+) -> tuple[list[int], list[int], dict[int, list[tuple[float, int]]]]:
+    """Nó de cada vértice da divisão: o do contorno no mesmo ponto, ou um nó novo (com o
+    lado do contorno onde fica, se fica sobre um). Devolve (anel do contorno, nó de cada
+    vértice, inserções por lado)."""
     assert b.layout is not None
     to_crs = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
     to_wgs = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
@@ -178,30 +282,7 @@ def _attach_parts(
             if t is not None:
                 inserts.setdefault(i, []).append((t, nid))
                 break
-
-    if inserts:
-        for nd in way.findall("nd"):
-            way.remove(nd)
-        new_ring: list[int] = []
-        for i, ref in enumerate(ring):
-            new_ring.append(ref)
-            new_ring += [nid for _, nid in sorted(inserts.get(i, []))]
-        for ref in [*new_ring, new_ring[0]]:
-            ET.SubElement(way, "nd", ref=str(ref))
-        # As tags ficam depois dos nós, como no formato OSM.
-        for tag in way.findall("tag"):
-            way.remove(tag)
-            way.append(tag)
-        way.set("action", "modify")
-
-    for k, part in enumerate(b.parts):
-        el = ET.Element("way", id=str(ids.new()), action="modify", visible="true")
-        part_ring = [vertex_node[i] for i in b.layout.parts[k]]
-        for ref in [*part_ring, part_ring[0]]:
-            ET.SubElement(el, "nd", ref=str(ref))
-        for key, value in sorted(part_way_tags(part, policy).items()):
-            ET.SubElement(el, "tag", k=key, v=value)
-        new_ways.append(el)
+    return ring, vertex_node, inserts
 
 
 def _add_new_buildings(
@@ -211,12 +292,15 @@ def _add_new_buildings(
     ids: _NodeIds,
     crs: str,
     policy: TagPolicy,
+    existing: list[tuple[int, float, float]] | None = None,
 ) -> None:
     """Edifícios em falta no OSM (candidatos aceites): nós e ways novos (ids negativos).
 
     Candidatos contíguos (uma mancha LiDAR dividida em vários edifícios) e as
     ``building:part`` de cada um partilham nós: vértices coincidentes são o mesmo nó e
     um vértice sobre o lado de outro anel é inserido nesse lado (sem junções em T).
+    ``existing``: nós do OSM (id, x, y no CRS) a que os edifícios foram ligados no mapa:
+    um vértice no mesmo ponto (≤ 1 mm) usa esse nó em vez de um novo.
     No JOSM confere-se com a ortofoto antes do upload.
     """
     if not selected:
@@ -224,8 +308,18 @@ def _add_new_buildings(
     from osm3d.parts import layout_from_polygons
 
     to_wgs = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-    # Anéis: contornos primeiro, depois as partes de cada edifício com partes.
-    rings: list[tuple[Polygon, dict[str, str]]] = [(b.footprint, tags) for b, tags in selected]
+    # Anéis: contornos primeiro (dividido em vários edifícios: cada peça, a 1.ª com as tags
+    # finais), depois as partes de cada edifício com partes.
+    rings: list[tuple[Polygon, dict[str, str]]] = []
+    for b, tags in selected:
+        if is_split(b):
+            assert b.layout is not None
+            rings += [
+                (b.layout.polygon(i), tags if i == 0 else split_piece_tags(b, i, policy, tags))
+                for i in range(len(b.parts))
+            ]
+        else:
+            rings.append((b.footprint, tags))
     for b, _ in selected:
         if has_parts(b):
             assert b.layout is not None
@@ -235,9 +329,9 @@ def _add_new_buildings(
     shared = layout_from_polygons([g for g, _ in rings])
     if len(shared.parts) != len(rings):  # anel degenerado: sem partilha, um a um
         for g, tags in rings:
-            _write_rings([tags], layout_from_polygons([g]), nodes, new_ways, ids, to_wgs)
+            _write_rings([tags], layout_from_polygons([g]), nodes, new_ways, ids, to_wgs, existing)
         return
-    _write_rings([t for _, t in rings], shared, nodes, new_ways, ids, to_wgs)
+    _write_rings([t for _, t in rings], shared, nodes, new_ways, ids, to_wgs, existing)
 
 
 def _write_rings(
@@ -247,11 +341,18 @@ def _write_rings(
     new_ways: list[ET.Element],
     ids: _NodeIds,
     to_wgs: Transformer,
+    existing: list[tuple[int, float, float]] | None = None,
 ) -> None:
     node_of: dict[int, int] = {}
+    known = np.array([(x, y) for _, x, y in existing or []], float).reshape(-1, 2)
     for k, tags in enumerate(tags_per_ring):
         refs = []
         for v in shared.parts[k]:
+            if v not in node_of and len(known):
+                d = np.hypot(*(known - np.asarray(shared.vertices[v], float)).T)
+                if d.min() <= SAME_EXISTING_NODE_M:
+                    assert existing is not None
+                    node_of[v] = existing[int(d.argmin())][0]  # nó do OSM já no ficheiro
             if v not in node_of:
                 nid = ids.new()
                 lon, lat = to_wgs.transform(*shared.vertices[v])
@@ -335,6 +436,15 @@ def write_josm_file(
             if ref not in nodes:
                 nodes[ref] = copy.deepcopy(index[("node", ref)])
 
+    existing: list[tuple[int, float, float]] = []
+    if edits is not None:
+        # Nós do OSM no ficheiro (pedidos na exportação): os edifícios novos ligados a eles
+        # no mapa usam-nos.
+        to_crs = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+        for nid, el in edits.nodes.items():
+            if nid > 0 and el.attrib.get("action") != "delete":
+                x, y = to_crs.transform(float(el.attrib["lon"]), float(el.attrib["lat"]))
+                existing.append((nid, float(x), float(y)))
     _add_new_buildings(
         [(b, tags) for b, tags in selected if b.osm_type == "new"],
         nodes,
@@ -342,6 +452,7 @@ def write_josm_file(
         ids,
         crs,
         policy,
+        existing,
     )
     for b, tags in selected:
         if b.osm_type == "new":
@@ -350,6 +461,8 @@ def write_josm_file(
             add_way(b.osm_id, tags)
             if has_parts(b):
                 _attach_parts(ways[b.osm_id], b, index, nodes, new_ways, ids, policy, crs)
+            elif is_split(b):
+                _split_way(ways[b.osm_id], b, index, nodes, new_ways, ids, policy, crs)
         else:
             rel = copy.deepcopy(index[("relation", b.osm_id)])
             _set_tags(rel, tags)

@@ -123,6 +123,7 @@ def plan_edits(
     versions: dict[int, int] | None = None,
     lines: list[tuple[str, LineString, dict[str, str]]] | None = None,
     manual: dict[int, ManualRing] | None = None,
+    keep_nodes: set[int] | None = None,
 ) -> OsmEdits:
     """Novas geometrias das ways a ajustar, a partir dos dados atuais do OSM.
 
@@ -136,6 +137,9 @@ def plan_edits(
 
     ``manual``: landuse editados à mão na revisão (ver :data:`ManualRing`), aplicados
     antes dos ajustes automáticos.
+
+    ``keep_nodes``: nós existentes que vão no ficheiro mesmo sem mudarem (p.ex. os nós
+    do OSM a que um edifício novo foi ligado no mapa), na versão atual.
     """
     edits = OsmEdits()
     root = ET.fromstring(osm_xml)
@@ -148,6 +152,9 @@ def plan_edits(
     }
     next_id = FIRST_NEW_ID
     manual_refs: dict[int, list[int]] = {}
+    # Nós novos das edições à mão: no mesmo ponto em duas ways (um vértice ligado a dois
+    # elementos no mapa), o mesmo nó.
+    manual_new = _NodeIndex()
     for wid, (before, hand_ring) in sorted((manual or {}).items()):
         why = _manual_problem(wid, before, hand_ring, original_refs, node_el)
         if why is not None:
@@ -156,8 +163,11 @@ def plan_edits(
         refs_new: list[int] = []
         for nid, x, y in hand_ring:
             lon, lat = to_wgs.transform(x, y)
-            if nid is None:
+            if nid is None and (found := manual_new.find(x, y, set())) is not None:
+                nid = found
+            elif nid is None:
                 nid, next_id = next_id, next_id - 1
+                manual_new.add(nid, x, y)
                 node_el[nid] = ET.Element(
                     "node", id=str(nid), action="modify", visible="true",
                     lat=f"{lat:.7f}", lon=f"{lon:.7f}",
@@ -335,6 +345,9 @@ def plan_edits(
             el = copy.deepcopy(node_el[r])
             el.set("action", "delete")
             edits.nodes[r] = el
+    for r in keep_nodes or ():
+        if r in node_el and r not in edits.nodes:
+            edits.nodes[r] = copy.deepcopy(node_el[r])
     return edits
 
 

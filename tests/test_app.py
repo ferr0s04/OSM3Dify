@@ -460,3 +460,16 @@ def test_municipal_full_download(client: TestClient) -> None:
     state = client.get("/api/municipal/download").json()
     assert state["ok"] is True and state["done"] == 2 and state["found"] == 20
     assert calls and client.get("/api/areas").json()["municipal"]["download"]["ok"] is True
+
+
+def test_candidates_of_other_tiles_are_left_out(tmp_path: Path) -> None:
+    """Área com outras quadrículas e a fase candidates por refazer (p.ex. sem câmaras
+    configuradas para elas): os edifícios propostos da área anterior não aparecem."""
+    from osm3d.app.service import ReviewService
+    from osm3d.pipeline import review_buildings
+
+    cfg = _app_with_candidate(tmp_path).state.ctx.cfg
+    assert "new/123456" in ReviewService(cfg).base
+    far = cfg.model_copy(update={"area": AreaConfig(name="teste", tiles=["150485"])})
+    assert "new/123456" not in ReviewService(far).base
+    assert all(b.osm_type != "new" for b in review_buildings(far))

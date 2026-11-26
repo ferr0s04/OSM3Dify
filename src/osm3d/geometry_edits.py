@@ -1,17 +1,21 @@
 """Edições manuais de geometria feitas na revisão (ao estilo do editor iD do OSM).
 
-Dois tipos de elemento editáveis no mapa:
+Três tipos de elemento editáveis no mapa:
 
-- **landuse do OSM** (ways fechadas do contexto): como no iD, editam-se **nós**. Mover um
-  nó move-o em todas as ways que o usam (dois landuse colados continuam colados); um
-  landuse pode também ganhar nós novos ou perder nós. Guarda-se:
+- **landuse e edifícios do OSM** (ways fechadas do contexto): como no iD, editam-se
+  **nós**. Mover um nó move-o em todas as ways que o usam (dois landuse colados, ou um
+  edifício encostado a outro, continuam colados); a way pode também ganhar nós novos ou
+  perder nós. Guarda-se:
 
   - ``node/<id>`` → posição nova (lon, lat) de um nó existente do OSM;
-  - ``way/<id>``  → o anel do landuse quando a sequência de nós muda (nós acrescentados
+  - ``way/<id>``  → o anel da way quando a sequência de nós muda (nós acrescentados
     ou tirados): ``before`` (os nós no OSM quando se editou) e ``ring`` (id do nó ou
     ``None`` para um nó novo, lon, lat), sem repetir o primeiro.
 
 - **muros propostos**: ``wall/<id>`` → a linha toda (lon, lat).
+
+- **edifícios novos** (cartografia municipal): ``new/<id>`` → o contorno (lon, lat), sem
+  repetir o primeiro vértice.
 
 O contexto OSM com estas edições (:func:`apply_to_context`) é o que a revisão mostra e o
 que se usa nas ligações dos muros ao landuse e na topologia dos edifícios novos. Na
@@ -38,6 +42,12 @@ def same_position(a: LonLat, b: LonLat) -> bool:
     return abs(a[0] - b[0]) <= SAME_POSITION_DEG and abs(a[1] - b[1]) <= SAME_POSITION_DEG
 
 
+def new_node_key(lon: float, lat: float) -> tuple[float, float]:
+    """Posição de um nó novo arredondada a ~1 cm: o mesmo ponto em duas ways é o mesmo nó
+    (o editor copia as coordenadas exatas ao ligar um vértice a outro elemento)."""
+    return (round(lon, 7), round(lat, 7))
+
+
 @dataclass
 class LanduseRing:
     before: list[int]  # nós da way no OSM quando se editou (anel fechado)
@@ -59,9 +69,11 @@ class GeometryEdits:
     nodes: dict[int, LonLat] = field(default_factory=dict)
     ways: dict[int, LanduseRing] = field(default_factory=dict)
     walls: dict[str, list[LonLat]] = field(default_factory=dict)
+    buildings: dict[str, list[LonLat]] = field(default_factory=dict)  # "new/<id>" → anel
 
     @property
     def landuse_empty(self) -> bool:
+        """Sem edições do contexto OSM (nós ou anéis de landuse/edifícios do OSM)."""
         return not self.nodes and not self.ways
 
     def signature(self) -> str:
@@ -71,6 +83,7 @@ class GeometryEdits:
                 "n": sorted((k, v) for k, v in self.nodes.items()),
                 "w": sorted((k, v.to_json()) for k, v in self.ways.items()),
                 "m": sorted(self.walls.items()),
+                "b": sorted(self.buildings.items()),
             },
             sort_keys=True,
         )
@@ -81,6 +94,7 @@ class GeometryEdits:
         out: dict[str, Any] = {f"node/{k}": list(v) for k, v in self.nodes.items()}
         out |= {f"way/{k}": v.to_json() for k, v in self.ways.items()}
         out |= {k: [list(c) for c in v] for k, v in self.walls.items()}
+        out |= {k: [list(c) for c in v] for k, v in self.buildings.items()}
         return out
 
     @classmethod
@@ -94,6 +108,8 @@ class GeometryEdits:
                 edits.ways[int(ident)] = LanduseRing.from_json(data)
             elif kind == "wall":
                 edits.walls[key] = [(float(c[0]), float(c[1])) for c in data]
+            elif kind == "new":
+                edits.buildings[key] = [(float(c[0]), float(c[1])) for c in data]
         return edits
 
 
@@ -125,16 +141,28 @@ class ContextIndex:
                     nodes[int(nid)] = (float(p["lon"]), float(p["lat"]))
         return cls(nodes, refs, tags)
 
-    def is_landuse(self, way_id: int) -> bool:
+    def _closed_with(self, way_id: int, keys: tuple[str, ...]) -> bool:
         r = self.refs.get(way_id)
-        return bool(r and "landuse" in self.tags.get(way_id, {}) and len(r) >= 4 and r[0] == r[-1])
+        tags = self.tags.get(way_id, {})
+        return bool(r and any(k in tags for k in keys) and len(r) >= 4 and r[0] == r[-1])
+
+    def is_landuse(self, way_id: int) -> bool:
+        return self._closed_with(way_id, ("landuse",))
+
+    def is_building(self, way_id: int) -> bool:
+        return self._closed_with(way_id, ("building",))
+
+    def is_area(self, way_id: int) -> bool:
+        """Way fechada editável no mapa: landuse ou edifício."""
+        return self._closed_with(way_id, ("landuse", "building"))
 
     def parents(self, node_id: int) -> list[int]:
         return [w for w, r in self.refs.items() if node_id in r]
 
 
 def landuse_ring(ctx: ContextIndex, edits: GeometryEdits, way_id: int) -> list[RingNode]:
-    """Anel atual (com as edições) de um landuse, sem repetir o primeiro nó."""
+    """Anel atual (com as edições) de uma way fechada (landuse ou edifício), sem repetir o
+    primeiro nó."""
 
     def position(nid: int, default: LonLat) -> LonLat:
         return edits.nodes.get(nid) or ctx.nodes.get(nid, default)
@@ -153,25 +181,31 @@ def is_edited(ctx: ContextIndex, edits: GeometryEdits, way_id: int) -> bool:
 
 def edited_landuse(ctx: ContextIndex, edits: GeometryEdits) -> list[int]:
     """Landuse com alguma edição (anel novo ou um nó movido)."""
+    return [w for w in edited_areas(ctx, edits) if ctx.is_landuse(w)]
+
+
+def edited_areas(ctx: ContextIndex, edits: GeometryEdits) -> list[int]:
+    """Landuse e edifícios do OSM com alguma edição (anel novo ou um nó movido)."""
     moved = set(edits.nodes)
     return sorted(
         w
         for w in ctx.refs
-        if ctx.is_landuse(w) and (w in edits.ways or moved.intersection(ctx.refs[w]))
+        if ctx.is_area(w) and (w in edits.ways or moved.intersection(ctx.refs[w]))
     )
 
 
 def set_landuse(
     ctx: ContextIndex, edits: GeometryEdits, way_id: int, ring: list[RingNode]
 ) -> GeometryEdits:
-    """Edições com o landuse ``way_id`` a passar a ``ring`` (validado à parte).
+    """Edições com a way fechada ``way_id`` (landuse ou edifício) a passar a ``ring``
+    (validado à parte).
 
     Os nós existentes que mudaram de posição ficam movidos (em todas as ways que os
     usam); os que voltaram à posição do OSM deixam de estar. O anel só se guarda se a
     sequência de nós mudou.
     """
-    if not ctx.is_landuse(way_id):
-        raise ValueError(f"way/{way_id} não é um landuse fechado do contexto OSM")
+    if not ctx.is_area(way_id):
+        raise ValueError(f"way/{way_id} não é um landuse ou edifício fechado do contexto OSM")
     out = copy.deepcopy(edits)
     for nid, lon, lat in ring:
         if nid is None:
@@ -191,7 +225,8 @@ def set_landuse(
 
 
 def reset_landuse(ctx: ContextIndex, edits: GeometryEdits, way_id: int) -> GeometryEdits:
-    """Repõe o landuse como no OSM (também os seus nós nas ways vizinhas)."""
+    """Repõe a way (landuse ou edifício) como no OSM (também os seus nós nas ways
+    vizinhas)."""
     out = copy.deepcopy(edits)
     out.ways.pop(way_id, None)
     for nid in ctx.refs.get(way_id, []):
@@ -206,18 +241,20 @@ def apply_to_context(data: dict[str, Any], edits: GeometryEdits) -> dict[str, An
     ctx = ContextIndex.of(data)
     out = dict(data)
     elements = []
-    new_id = -1  # nós novos: ids negativos (só para esta cópia)
+    # Nós novos: ids negativos (só para esta cópia). Dois nós novos no mesmo ponto (um
+    # vértice ligado a dois elementos, como no iD) são o mesmo nó.
+    new_ids: dict[tuple[float, float], int] = {}
     for el in data.get("elements", []):
         if el.get("type") != "way" or not el.get("nodes"):
             elements.append(el)
             continue
         wid = int(el["id"])
-        if wid in edits.ways and ctx.is_landuse(wid):
+        if wid in edits.ways and ctx.is_area(wid):
             ring = landuse_ring(ctx, edits, wid)
             ids = []
-            for i, _, _ in ring:
+            for i, lon, lat in ring:
                 if i is None:
-                    i, new_id = new_id, new_id - 1
+                    i = new_ids.setdefault(new_node_key(lon, lat), -1 - len(new_ids))
                 ids.append(i)
             el = {
                 **el,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import pytest
 from pyproj import Transformer
@@ -265,3 +266,72 @@ def test_effective_context_is_safe_with_parallel_requests(tmp_path: Path) -> Non
         for t in threads:
             t.join()
     assert errors == []
+
+
+def test_a_new_vertex_shared_by_two_ways_is_one_node() -> None:
+    """Um vértice ligado no mapa a dois elementos (largado na aresta do vizinho) é o mesmo
+    nó: no contexto editado e no .osm da exportação."""
+    x, y = 0.0, 0.0  # a meio do limite comum (y = 0)
+    lon, lat = TO_WGS.transform(x, y)
+    ctx = ContextIndex.of(_context())
+    res = landuse_ring(ctx, GeometryEdits(), 300)
+    res.insert(2, (None, float(lon), float(lat)))  # entre os nós 2 e 3
+    edits = set_landuse(ctx, GeometryEdits(), 300, res)
+    farm = landuse_ring(ctx, edits, 301)
+    farm.append((None, float(lon), float(lat)))  # entre os nós 3 e 2
+    edits = set_landuse(ctx, edits, 301, farm)
+    out = {e["id"]: e for e in apply_to_context(_context(), edits)["elements"]}
+    new = [n for n in out[300]["nodes"] if n < 0]
+    assert len(new) == 1 and new[0] in out[301]["nodes"]
+    # Exportação: o mesmo nó novo nas duas ways.
+    mid = (None, x, y)
+    res_ring = [(1, -50.0, 50.0), (2, -50.0, 0.0), mid, (3, 50.0, 0.0), (4, 50.0, 50.0)]
+    farm_ring = [(2, -50.0, 0.0), (5, -50.0, -50.0), (6, 50.0, -50.0), (3, 50.0, 0.0), mid]
+    manual = {300: ([1, 2, 3, 4, 1], res_ring), 301: ([2, 5, 6, 3, 2], farm_ring)}
+    plan = plan_edits([], _osm_xml(NODES, WAYS), CRS, RULES, manual=manual, keep_nodes={7})
+    refs = {w: [int(nd.attrib["ref"]) for nd in el.findall("nd")] for w, el in plan.ways.items()}
+    (shared,) = {r for r in refs[300] if r < 0}
+    assert shared in refs[301]
+    assert 7 in plan.nodes and "action" not in plan.nodes[7].attrib  # vai sem mudar
+
+
+def test_new_building_uses_the_osm_node_it_was_connected_to(tmp_path: Path) -> None:
+    from shapely.geometry import Polygon
+
+    from osm3d.domain.models import Building
+    from osm3d.export.osm_xml import write_josm_file
+
+    plan = plan_edits([], _osm_xml(NODES, WAYS), CRS, RULES, keep_nodes={4})
+    source = tmp_path / "fetch.osm"
+    source.write_bytes(_osm_xml({}, {}))
+    # Edifício novo com um canto no nó 4 (50, 50) do residencial.
+    fp = Polygon([(40, 40), (50, 40), (50, 50), (40, 50)])
+    b = Building(osm_type="new", osm_id=1, osm_version=0, footprint=fp)
+    out = write_josm_file(
+        [(b, {"building": "yes"})], source, tmp_path / "out.osm", crs=CRS, edits=plan
+    )
+    root = ET.parse(out).getroot()
+    (way,) = [w for w in root.iter("way") if w.find("tag[@k='building']") is not None]
+    refs = [int(nd.attrib["ref"]) for nd in way.findall("nd")]
+    assert 4 in refs and len(set(refs)) == 4
+    assert sum(n.attrib["id"] == "4" for n in root.iter("node")) == 1
+
+
+def test_connected_nodes_of_new_buildings(tmp_path: Path) -> None:
+    from shapely.geometry import Polygon
+
+    from osm3d.domain.models import Building
+    from osm3d.pipeline import _connected_nodes
+    from tests.test_app import _app_with_candidate
+
+    cfg = _app_with_candidate(tmp_path).state.ctx.cfg
+    path = tmp_path / "ctx.json"
+    path.write_text(json.dumps(_context()), encoding="utf-8")
+    # Um canto no nó 4 (partilhado pelo residencial e pela via); os outros soltos.
+    fp = Polygon([(40, 40), (50, 40), (50, 50), (40, 50)])
+    b = Building(osm_type="new", osm_id=1, osm_version=0, footprint=fp)
+    assert _connected_nodes(cfg, [b], path) == {4: [300, 400]}
+    far = Building(
+        osm_type="new", osm_id=2, osm_version=0, footprint=Polygon([(0, 0), (5, 0), (5, 5)])
+    )
+    assert _connected_nodes(cfg, [far], path) == {}

@@ -143,6 +143,9 @@ class PartsLayout(BaseModel):
     # Resultado do ajuste de cada parte (mesma ordem de ``parts``); vazio se não ajustado.
     fitted: list[BuildingPart] = Field(default_factory=list)
     source: Literal["suggested", "manual"] = "suggested"
+    # "parts": building:part dentro do contorno; "buildings": o edifício é dividido em
+    # vários edifícios (no OSM, a way fica com a 1.ª peça e as outras são ways novas).
+    split: Literal["parts", "buildings"] = "parts"
 
     def polygon(self, i: int) -> Polygon:
         return Polygon([self.vertices[k] for k in self.parts[i]])

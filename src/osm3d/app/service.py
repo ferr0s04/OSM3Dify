@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import shapely
@@ -24,8 +25,16 @@ from osm3d.evaluation.benchmark import evaluate, normalize_osm_shape
 from osm3d.export.geopackage import read_buildings
 from osm3d.export.mesh import Mesh, roof_mesh, wall_mesh
 from osm3d.export.osm_changes import ChangeSummary, classify_change
-from osm3d.export.osm_xml import has_parts, outline_tags, part_way_tags, plan_export
+from osm3d.export.osm_xml import (
+    has_parts,
+    is_split,
+    outline_tags,
+    part_way_tags,
+    plan_export,
+    split_piece_tags,
+)
 from osm3d.export.s3db_tags import TagMerge, merge_tags
+from osm3d.footprint_edits import FootprintRefitter, apply_footprint_edits, edited_footprints
 from osm3d.geometry_edits import (
     ContextIndex,
     GeometryEdits,
@@ -41,6 +50,7 @@ from osm3d.parts import layout_from_polygons, merge_parts, split_part, validate_
 from osm3d.pipeline import (
     Stage,
     accepted_walls,
+    area_candidates,
     area_dir,
     artefact_path,
     barriers_path,
@@ -50,10 +60,11 @@ from osm3d.pipeline import (
     effective_walls,
     export_area,
     fetch_area_barriers,
-    is_municipal,
+    local_area_barriers,
     ortho_files,
     refresh_context,
     review_store_path,
+    stage_state,
     tag_policy,
     wall_proposals,
 )
@@ -85,6 +96,8 @@ from osm3d.validation.topology import (
     resolve_topology,
 )
 
+log = logging.getLogger(__name__)
+
 MAX_BUILDING_POINTS = 40_000
 MAX_EDITOR_POINTS = 6_000
 
@@ -94,6 +107,8 @@ class LayoutIn(BaseModel):
 
     vertices: list[tuple[float, float]]
     parts: list[list[int]]
+    # building:part dentro do contorno, ou vários edifícios (ver PartsLayout.split).
+    split: Literal["parts", "buildings"] = "parts"
 
     @model_validator(mode="after")
     def _check_indices(self) -> LayoutIn:
@@ -150,10 +165,8 @@ class ReviewService:
         self.base: dict[str, Building] = {b.key: b for b in read_buildings(self.source)}
         # Edifícios da cartografia municipal em falta no OSM (fase candidates, opcional):
         # revistos como os outros, com a chave "new/<id>". Candidatos só do LiDAR de
-        # artefactos antigos ficam de fora.
-        candidates = artefact_path(cfg, Stage.CANDIDATES)
-        if candidates.exists():
-            self.base |= {b.key: b for b in read_buildings(candidates) if is_municipal(b)}
+        # artefactos antigos e os de outras quadrículas (a área mudou) ficam de fora.
+        self.base |= {b.key: b for b in area_candidates(cfg)}
         self.store = ReviewStore(review_store_path(cfg))
         self.reviews: dict[str, Review] = self.store.all()
         self.points = TilePointCache(
@@ -177,6 +190,17 @@ class ReviewService:
         # indexado por nós (para editar nós partilhados, como no iD).
         self.edits: GeometryEdits = self.store.geometry_edits()
         self._ctx_index: tuple[float, ContextIndex] | None = None
+        # Contornos editados no mapa: ``base`` passa a ter, para esses edifícios, a
+        # reconstrução reajustada ao contorno novo; ``original`` é a do pipeline.
+        self.original: dict[str, Building] = dict(self.base)
+        self._edited: set[str] = set()
+        self.refitter = FootprintRefitter(
+            cfg,
+            self.points.around,
+            lambda: index_tiles(cfg.sources.dtm_dir, (".tif", ".tiff")),
+            lambda: ortho_files(cfg),
+        )
+        self._sync_footprints(None)
 
     def refresh_points(self) -> None:
         """Volta a indexar os LAZ (ficheiros raw descarregados ou apagados)."""
@@ -258,6 +282,7 @@ class ReviewService:
     def walls(self) -> list[WallProposal]:
         """Propostas de muros, com as edições do mapa (recalculadas quando os muros
         municipais, o OSM ou as edições mudam)."""
+        self._local_barriers()
         b, c = barriers_path(self.cfg), context_path(self.cfg)
         sig = (
             b.stat().st_mtime if b.exists() else None,
@@ -267,6 +292,15 @@ class ReviewService:
         if self._walls is None or self._walls[0] != sig:
             self._walls = (sig, effective_walls(self.cfg, self.edits))
         return self._walls[1]
+
+    def _local_barriers(self) -> None:
+        """Com a cópia do concelho descarregada, os muros da área recortam-se dela sem
+        esperar pela fase candidates nem pelo "obter do geoportal" (sem pedidos à rede).
+        Falhar aqui não impede nada: os muros ficam por obter, os edifícios não mudam."""
+        try:
+            local_area_barriers(self.cfg)
+        except Exception:
+            log.exception("Recorte dos muros da cópia do concelho falhou")
 
     def _wall(self, key: str) -> WallProposal:
         for w in self.walls():
@@ -283,6 +317,7 @@ class ReviewService:
         from osm3d.acquisition.municipal import barriers_meta
         from osm3d.municipal_area import sources_for_area
 
+        self._local_barriers()
         try:
             here = [s for s in sources_for_area(self.cfg, network=False) if s.barriers]
         except FileNotFoundError:
@@ -464,11 +499,18 @@ class ReviewService:
             self._ctx_index = (mtime, ContextIndex.of(json.loads(path.read_text(encoding="utf-8"))))
         return self._ctx_index[1]
 
+    def _context_or_none(self) -> ContextIndex | None:
+        try:
+            return self._context_index()
+        except NotFound:
+            return None
+
     def landuse_detail(self, way_id: int) -> dict[str, Any]:
-        """Landuse do OSM editável no mapa: o anel (com as edições) e os nós partilhados."""
+        """Landuse ou edifício do OSM editável no mapa: o anel (com as edições) e os nós
+        partilhados."""
         ctx = self._context_index()
-        if not ctx.is_landuse(way_id):
-            raise NotFound(f"way/{way_id} (landuse)")
+        if not ctx.is_area(way_id):
+            raise NotFound(f"way/{way_id} (landuse ou edifício)")
         ring = landuse_ring(ctx, self.edits, way_id)
         shared: dict[str, list[str]] = {}
         for nid, _, _ in ring:
@@ -489,16 +531,20 @@ class ReviewService:
             "edited": is_edited(ctx, self.edits, way_id),
             "osm_url": f"https://www.openstreetmap.org/way/{way_id}",
             "bbox": [min(lons), min(lats), max(lons), max(lats)],
+            "is_building": ctx.is_building(way_id),
+            # Edifício do OSM com análise 3D (revê-se no detalhe do edifício).
+            "building_key": f"way/{way_id}" if f"way/{way_id}" in self.original else None,
         }
 
     def save_landuse(
         self, way_id: int, nodes: list[tuple[int | None, float, float]]
     ) -> dict[str, Any]:
-        """Landuse editado no mapa: nós movidos (em todas as ways que os usam), novos ou
-        tirados. Devolve o detalhe e as outras ways que mudaram (nós partilhados)."""
+        """Landuse ou edifício do OSM editado no mapa: nós movidos (em todas as ways que
+        os usam), novos ou tirados. Devolve o detalhe e as outras ways que mudaram (nós
+        partilhados); os edifícios cujo contorno mudou são reajustados."""
         ctx = self._context_index()
-        if not ctx.is_landuse(way_id):
-            raise NotFound(f"way/{way_id} (landuse)")
+        if not ctx.is_area(way_id):
+            raise NotFound(f"way/{way_id} (landuse ou edifício)")
         ring = [(None if n is None else int(n), float(x), float(y)) for n, x, y in nodes]
         if len(ring) >= 2 and ring[0][0] is not None and ring[0][0] == ring[-1][0]:
             ring = ring[:-1]  # anel fechado: o primeiro nó não se repete
@@ -512,21 +558,144 @@ class ReviewService:
         )
         if poly is None or not poly.is_valid or poly.area < 1.0:
             raise ValueError(
-                "Geometria inválida: o landuse precisa de 3 vértices e não se pode cruzar"
+                "Geometria inválida: o contorno precisa de 3 vértices e não se pode cruzar"
             )
         before = landuse_ring(ctx, self.edits, way_id)
         old = {n: (x, y) for n, x, y in before if n is not None}
         moved = {n for n, x, y in ring if n in old and not same_position(old[n], (x, y))}
         self._save_edits(set_landuse(ctx, self.edits, way_id, ring))
         changed = sorted({w for n in moved for w in ctx.parents(n)} - {way_id})
+        self._sync_footprints(self._building_keys([way_id, *changed]))
         return self.landuse_detail(way_id) | {"changed": [f"way/{w}" for w in changed]}
 
     def reset_landuse(self, way_id: int) -> dict[str, Any]:
         ctx = self._context_index()
-        if not ctx.is_landuse(way_id):
-            raise NotFound(f"way/{way_id} (landuse)")
+        if not ctx.is_area(way_id):
+            raise NotFound(f"way/{way_id} (landuse ou edifício)")
+        touched = {w for n in ctx.refs[way_id] for w in ctx.parents(n)}
         self._save_edits(reset_landuse(ctx, self.edits, way_id))
+        self._sync_footprints(self._building_keys(touched))
         return self.landuse_detail(way_id)
+
+    # ------------------------------------------------- contornos dos edifícios
+
+    def _building_keys(self, way_ids: Any) -> set[str]:
+        """Edifícios do OSM em revisão entre estas ways."""
+        return {k for w in way_ids if (k := f"way/{w}") in self.original}
+
+    def _sync_footprints(self, keys: set[str] | None) -> None:
+        """Põe em ``base`` a reconstrução de cada edifício com o contorno atual (editado ou
+        não). ``None``: todos. Reajusta ao LiDAR os que mudaram desde o último reajuste."""
+        ctx = self._context_or_none()
+        if keys is None:
+            keys = set(self.original)
+        todo = [self.original[k] for k in sorted(keys) if k in self.original]
+        footprints = edited_footprints(todo, ctx, self.edits, self._to_crs)
+        fits = self.store.footprint_fits()
+        fitted = apply_footprint_edits(
+            todo, footprints, fits, self.refitter, self.store.save_footprint_fit
+        )
+        gone = [b.key for b in todo if b.key not in footprints and b.key in fits]
+        if gone:
+            self.store.delete_footprint_fits(gone)
+        for b in fitted:
+            self.base[b.key] = b
+            self._wgs84.pop(b.key, None)
+            self._scene_cache.pop(b.key, None)
+        self._edited = (self._edited - {b.key for b in todo}) | set(footprints)
+        self._topology_changed()
+
+    def _geometry(self, key: str) -> dict[str, Any]:
+        """Contorno editável no mapa (como os landuse): nós (id do OSM ou None se novo),
+        nós partilhados com outras ways e se pode ser editado."""
+        b = self.original[key]
+        out: dict[str, Any] = {
+            "key": key,
+            "editable": False,
+            "reason": None,
+            "kind": "new" if b.osm_type == "new" else "osm",
+            "nodes": [],
+            "shared": {},
+            "edited": key in self._edited,
+        }
+        review = self.reviews.get(key)
+        if review is not None and review.parts is not None:
+            return out | {
+                "reason": "Dividido em partes: voltar a edifício único (e guardar a revisão) "
+                "para editar o contorno"
+            }
+        if b.osm_type == "new":
+            ring = self.edits.buildings.get(key)
+            if ring is None:
+                fp = b.footprint
+                if fp.geom_type != "Polygon" or len(fp.interiors):
+                    return out | {"reason": "Contorno com mais de um anel: editar no JOSM"}
+                xs, ys = self._to_wgs84.transform(*np.asarray(fp.exterior.coords[:-1]).T)
+                ring = list(zip(xs, ys, strict=True))
+            nodes = [[None, round(float(x), 8), round(float(y), 8)] for x, y in ring]
+            return out | {"editable": True, "nodes": nodes}
+        if b.osm_type != "way":
+            return out | {"reason": "Multipolígono: editar o contorno no JOSM"}
+        ctx = self._context_or_none()
+        if ctx is None or not ctx.is_area(b.osm_id):
+            return out | {
+                "reason": "A way não está no contexto OSM: usar Camadas → atualizar do OSM"
+            }
+        d = self.landuse_detail(b.osm_id)
+        return out | {"editable": True, "nodes": d["nodes"], "shared": d["shared"]}
+
+    def building_geometry(self, key: str) -> dict[str, Any]:
+        """Só o contorno editável (para juntar o edifício a uma seleção múltipla)."""
+        if key not in self.original:
+            raise NotFound(key)
+        return self._geometry(key)
+
+    def save_building_geometry(
+        self, key: str, nodes: list[tuple[int | None, float, float]]
+    ) -> dict[str, Any]:
+        """Contorno do edifício editado no mapa; o 3D é reajustado ao contorno novo."""
+        if key not in self.original:
+            raise NotFound(key)
+        info = self._geometry(key)
+        if not info["editable"]:
+            raise ValueError(info["reason"])
+        b = self.original[key]
+        if b.osm_type == "way":
+            self.save_landuse(b.osm_id, nodes)
+            return self.detail(key)
+        ring = [(float(x), float(y)) for _, x, y in nodes]
+        if len(ring) >= 2 and same_position(ring[0], ring[-1]):
+            ring = ring[:-1]
+        poly = Polygon(self._line_in_crs(ring).coords) if len(ring) >= 3 else None
+        if poly is None or not poly.is_valid or poly.area < 1.0:
+            raise ValueError(
+                "Geometria inválida: o contorno precisa de 3 vértices e não se pode cruzar"
+            )
+        edits = copy.deepcopy(self.edits)
+        orig = np.asarray(b.footprint.exterior.coords[:-1])
+        now = np.asarray(poly.exterior.coords[:-1])
+        if orig.shape == now.shape and np.abs(orig - now).max() < 0.01:
+            edits.buildings.pop(key, None)
+        else:
+            edits.buildings[key] = ring
+        self._save_edits(edits)
+        self._sync_footprints({key})
+        return self.detail(key)
+
+    def reset_building_geometry(self, key: str) -> dict[str, Any]:
+        if key not in self.original:
+            raise NotFound(key)
+        b = self.original[key]
+        if b.osm_type == "way":
+            ctx = self._context_or_none()
+            if ctx is not None and ctx.is_area(b.osm_id):
+                self.reset_landuse(b.osm_id)
+        else:
+            edits = copy.deepcopy(self.edits)
+            edits.buildings.pop(key, None)
+            self._save_edits(edits)
+            self._sync_footprints({key})
+        return self.detail(key)
 
     def fetch_walls(self) -> dict[str, Any]:
         """Volta a obter os muros municipais da área (geoportal)."""
@@ -537,7 +706,7 @@ class ReviewService:
     def refresh_osm_context(self) -> dict[str, Any]:
         """Volta a pedir o contexto OSM ao Overpass (p.ex. depois de editar no OSM)."""
         refresh_context(self.cfg, force=True)
-        self._topology_changed()
+        self._sync_footprints(None)  # os nós dos edifícios do OSM podem ter mudado
         ctx = self.osm_context()
         return {"date": ctx.get("date"), "n": len(ctx["features"])}
 
@@ -594,7 +763,7 @@ class ReviewService:
             "roof_height": self._rh(part.roof.height.value) if part and part.roof.height else None,
             "osm_roof_shape": b.existing_tags.get("roof:shape"),
             "match": (osm_shape == exportable) if osm_shape and exportable != "unknown" else None,
-            "edited": bool(review and not review.overrides.is_empty()),
+            "edited": bool(review and not review.overrides.is_empty()) or b.key in self._edited,
             "area": _num(b.footprint.area, 0),
             "lon": round(c.x, 7),
             "lat": round(c.y, 7),
@@ -663,8 +832,21 @@ class ReviewService:
             "added": merge.added,
             "conflicts": {k: {"osm": a, "proposed": p} for k, (a, p) in merge.conflicts.items()},
             # Com partes: tags de cada building:part (novas ways).
-            "parts": [part_way_tags(p, self.policy) for p in b.parts] if has_parts(b) else [],
+            "parts": self._piece_tags(b, merge.tags),
+            "split": "buildings" if is_split(b) else "parts" if has_parts(b) else None,
         }
+
+    def _piece_tags(self, b: Building, final: dict[str, str]) -> list[dict[str, str]]:
+        """Tags de cada peça: building:part, ou cada um dos edifícios em que foi dividido
+        (o 1.º fica com as tags finais do contorno)."""
+        if has_parts(b):
+            return [part_way_tags(p, self.policy) for p in b.parts]
+        if is_split(b):
+            return [
+                final if i == 0 else split_piece_tags(b, i, self.policy, final)
+                for i in range(len(b.parts))
+            ]
+        return []
 
     def _part_colours(self, b: Building, part: BuildingPart) -> dict[str, str]:
         """Cores de uma building:part (tags da própria parte, senão por omissão)."""
@@ -764,7 +946,10 @@ class ReviewService:
             "has_layout": b.layout is not None,
             "has_suggestion": base.suggested_layout is not None,
             "parts_editable": self._editable(b) is None,
+            "parts_reason": self._editable(b),
             "n_parts": len(b.parts),
+            # Contorno editável no mapa (nós, partilhados) e se já foi editado.
+            "geometry": self._geometry(key),
             "offset": list(b.registration_offset_m),
             "bbox": list(self._geom_wgs84(key).bounds),
             # Sobreposições com o OSM: o modo em uso e o padrão da origem do contorno.
@@ -809,7 +994,7 @@ class ReviewService:
         if not b.parts or b.ground_elevation_m is None:
             return out
         ground = b.ground_elevation_m
-        multi = has_parts(b)
+        multi = has_parts(b) or is_split(b)
         dx, dy = b.registration_offset_m
         meshes = []
         for p in b.parts:
@@ -873,7 +1058,7 @@ class ReviewService:
             return None
         ground = b.ground_elevation_m
         dx, dy = b.registration_offset_m
-        multi = has_parts(b)
+        multi = has_parts(b) or is_split(b)
         out = []
         for p in b.parts:
             geom = p.geometry if multi else b.footprint
@@ -1013,12 +1198,16 @@ class ReviewService:
             "vertices": [[round(x - ox, 3), round(y - oy, 3)] for x, y in layout.vertices],
             "parts": layout.parts,
             "source": layout.source,
+            "split": layout.split,
         }
 
     def _from_local(self, data: LayoutIn, origin: tuple[float, float]) -> PartsLayout:
         ox, oy = origin
         return PartsLayout(
-            vertices=[(x + ox, y + oy) for x, y in data.vertices], parts=data.parts, source="manual"
+            vertices=[(x + ox, y + oy) for x, y in data.vertices],
+            parts=data.parts,
+            source="manual",
+            split=data.split,
         )
 
     def _editable(self, b: Building) -> str | None:
@@ -1028,6 +1217,8 @@ class ReviewService:
             return "O edifício já tem building:part no OSM: editar no JOSM"
         if b.ground_elevation_m is None:
             return "Sem cota do terreno"
+        if b.key in self._edited:
+            return "Contorno editado no mapa: repor o contorno para dividir em partes"
         return None
 
     def parts_view(self, key: str) -> dict[str, Any]:
@@ -1087,15 +1278,23 @@ class ReviewService:
             return {"problems": problems, "parts": [], "mesh": None, "tags": None}
         fitted = self._fit(b, layout)
         built = apply_parts(b, fitted, overrides)
+        estimated = apply_parts(b, fitted, [])  # sem as correções: o valor estimado
+        tags = self._tags(built)
+        pieces = tags["parts"] or [part_way_tags(p, self.policy) for p in built.parts]
         return {
             "problems": problems,
+            "split": layout.split,
             "parts": [
                 (self._part_info(built, i) or {})
-                | {"tags": part_way_tags(p, self.policy), "area": _num(p.geometry.area, 1)}
+                | {
+                    "tags": pieces[i],
+                    "area": _num(p.geometry.area, 1),
+                    "estimated": self._part_info(estimated, i),
+                }
                 for i, p in enumerate(built.parts)
             ],
             "mesh": self.mesh_for(built),
-            "tags": self._tags(built),
+            "tags": tags,
         }
 
     def parts_split(
@@ -1113,6 +1312,7 @@ class ReviewService:
             raise ValueError("Parte inexistente")
         ox, oy = origin
         new = split_part(layout, index, (a[0] + ox, a[1] + oy), (b_pt[0] + ox, b_pt[1] + oy))
+        new = new.model_copy(update={"split": layout.split})
         return {"layout": self._to_local(new, origin)}
 
     def parts_merge(self, key: str, data: LayoutIn, index: int) -> dict[str, Any]:
@@ -1121,7 +1321,8 @@ class ReviewService:
         layout = self._from_local(data, origin)
         if not 0 <= index < len(layout.parts):
             raise ValueError("Parte inexistente")
-        return {"layout": self._to_local(merge_parts(layout, index), origin)}
+        merged = merge_parts(layout, index).model_copy(update={"split": layout.split})
+        return {"layout": self._to_local(merged, origin)}
 
     def parts_start(self, key: str) -> dict[str, Any]:
         """Divisão inicial manual: o contorno inteiro como uma só parte (para dividir)."""
@@ -1218,6 +1419,8 @@ class ReviewService:
             "candidate_sources": dict(
                 Counter(r["candidate_source"] for r in rows if r["candidate_source"])
             ),
+            # Edifícios da cartografia municipal desta área: processados ou por processar.
+            "candidates": self._candidates_status(),
             "min_colour_confidence": self.policy.min_colour_confidence,
             "default_colours": {"roof": DEFAULT_ROOF_HEX, "walls": DEFAULT_FACADE_HEX},
             "flags": dict(Counter(f for r in rows for f in r["flags"])),
@@ -1240,6 +1443,18 @@ class ReviewService:
                 "conflicts": sum(bool(r.conflicts) for r in records),
                 "reasons": dict(Counter(r.reason.split(":")[0] for r in records)),
             },
+        }
+
+    def _candidates_status(self) -> dict[str, Any]:
+        """Fase candidates da área: sem ela feita, a lista de edifícios municipais está
+        vazia (ou só com os que ainda servem de uma corrida anterior)."""
+        configured = bool(self.cfg.sources.municipal_sources)
+        state, why = stage_state(self.cfg, Stage.CANDIDATES) if configured else ("missing", "")
+        return {
+            "configured": configured,
+            "state": state,
+            "reason": why,
+            "n": sum(b.osm_type == "new" for b in self.base.values()),
         }
 
     def export(self) -> dict[str, Any]:

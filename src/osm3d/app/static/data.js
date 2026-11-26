@@ -136,7 +136,9 @@ export class DataView {
     this.setDownloads(this.status.downloads);
     this.setProcessing(this.areas.processing);
     // Edifícios municipais em falta no OSM: por omissão, se a cartografia está ativa no config.
-    if (this.processOpts.candidates === null && this.areas.municipal) {
+    // Só se decide com câmaras configuradas: configuradas depois de a página abrir (no
+    // config/local.yaml), a opção não pode ter ficado desmarcada desde o início.
+    if (this.processOpts.candidates === null && this.areas.municipal?.configured) {
       this.processOpts.candidates = !!(this.areas.municipal.configured && this.areas.municipal.enabled);
     }
     // Download do concelho em curso (p.ex. iniciado antes de recarregar a página).
