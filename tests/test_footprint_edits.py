@@ -112,7 +112,24 @@ def test_edit_municipal_building_outline(tmp_path: Path) -> None:
     d = r.json()
     assert d["geometry"]["edited"] and d["edited"] and calls == ["new/123456"]
     assert d["area"] != area and "footprint_edited" in d["info_flags"]
-    assert not d["parts_editable"] and "Contorno editado" in d["parts_reason"]
+    # Municipal: divide-se em partes também com o contorno editado (exporta-se do próprio
+    # contorno); com a divisão gravada, o contorno já não se repõe.
+    assert d["parts_editable"] and d["parts_reason"] is None
+    base = "/api/buildings/new/123456"
+    view = client.get(f"{base}/parts").json()
+    xs, ys = [q[0] for q in view["outline"]], [q[1] for q in view["outline"]]
+    mid = (min(xs) + max(xs)) / 2
+    layout = client.post(f"{base}/parts/start").json()["layout"]
+    split = client.post(
+        f"{base}/parts/split",
+        json={"layout": layout, "part": 0, "a": [mid, min(ys) - 1], "b": [mid, max(ys) + 1]},
+    ).json()["layout"]
+    parts = {"layout": split, "overrides": [{}, {}]}
+    r = client.put(f"{base}/review", json={"status": "accepted", "parts": parts})
+    assert r.status_code == 200, r.text
+    assert r.json()["n_parts"] == 2
+    assert client.delete(f"{base}/geometry").status_code == 422
+    client.put(f"{base}/review", json={"status": "accepted"})
     # A exportação (CLI) usa o reajuste guardado, sem voltar ao LiDAR.
     from osm3d.pipeline import review_buildings, with_footprint_edits
 

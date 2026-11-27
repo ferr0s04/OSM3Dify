@@ -76,17 +76,19 @@ class GeometryEdits:
         """Sem edições do contexto OSM (nós ou anéis de landuse/edifícios do OSM)."""
         return not self.nodes and not self.ways
 
-    def signature(self) -> str:
-        """Muda sempre que as edições mudam (para invalidar caches)."""
-        raw = json.dumps(
-            {
-                "n": sorted((k, v) for k, v in self.nodes.items()),
-                "w": sorted((k, v.to_json()) for k, v in self.ways.items()),
-                "m": sorted(self.walls.items()),
-                "b": sorted(self.buildings.items()),
-            },
-            sort_keys=True,
-        )
+    def signature(self, *, landuse: bool = True, walls: bool = True, buildings: bool = True) -> str:
+        """Muda sempre que as edições mudam (para invalidar caches). Com ``landuse``,
+        ``walls`` ou ``buildings`` a falso, ignora esse tipo de edição (p.ex. o contexto
+        OSM editado só depende das edições de landuse/edifícios do OSM)."""
+        data: dict[str, Any] = {}
+        if landuse:
+            data["n"] = sorted((k, v) for k, v in self.nodes.items())
+            data["w"] = sorted((k, v.to_json()) for k, v in self.ways.items())
+        if walls:
+            data["m"] = sorted(self.walls.items())
+        if buildings:
+            data["b"] = sorted(self.buildings.items())
+        raw = json.dumps(data, sort_keys=True)
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
     def records(self) -> dict[str, Any]:

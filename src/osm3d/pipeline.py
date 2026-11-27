@@ -441,7 +441,9 @@ def effective_context_path(config: Config, edits: GeometryEdits | None = None) -
         return path
     from osm3d.geometry_edits import apply_to_context
 
-    sig = f"{path.stat().st_mtime_ns}:{edits.signature()}"
+    # Só as edições do contexto (nós e anéis): editar um muro ou um edifício municipal não
+    # gera uma versão nova do contexto.
+    sig = f"{path.stat().st_mtime_ns}:{edits.signature(walls=False, buildings=False)}"
     out = path.with_name(f"osm_context.edited.{hashlib.sha1(sig.encode()).hexdigest()[:12]}.json")
     if out.exists():
         return out

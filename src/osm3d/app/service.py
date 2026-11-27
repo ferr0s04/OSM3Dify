@@ -203,7 +203,12 @@ class ReviewService:
         # Contexto OSM (landuse, vias, muros, edifícios) e a topologia dos edifícios novos
         # face a ele, com o modo escolhido na revisão; refeita quando a revisão muda.
         self._env: Surroundings | None = None
-        self._env_mtime: tuple[str, float] | None = None
+        self._env_mtime: tuple[int, str] | None = None
+        # Contexto OSM com as edições: (mtime do original, assinatura das edições de
+        # landuse) → ficheiro. Assinaturas das edições atuais: calculadas uma vez por cada
+        # versão das edições (o objeto é substituído, nunca alterado, a cada gravação).
+        self._eff_ctx: tuple[tuple[int, str], Path] | None = None
+        self._sigs: tuple[GeometryEdits, dict[str, str]] | None = None
         self._topo: dict[str, Building] | None = None
         # Para refazer a topologia só à volta de um edifício revisto: os edifícios novos
         # (ordem de ``base``) e uma árvore dos contornos (ver _review_changed).
@@ -211,7 +216,7 @@ class ReviewService:
         self._topo_pos: dict[str, int] = {}
         self._topo_tree: shapely.STRtree | None = None
         self._topo_lock = threading.RLock()
-        self._ctx_geojson: tuple[tuple[str, float], dict[str, Any]] | None = None
+        self._ctx_geojson: tuple[tuple[int, str], dict[str, Any]] | None = None
         self._walls: tuple[tuple[Any, ...], list[WallProposal]] | None = None
         # Edições de geometria no mapa (landuse do OSM e muros) e o contexto OSM original
         # indexado por nós (para editar nós partilhados, como no iD).
@@ -248,21 +253,56 @@ class ReviewService:
     def building(self, key: str) -> Building:
         if key not in self.base:
             raise NotFound(key)
-        if self.base[key].osm_type == "new" and (hit := self._topology().get(key)) is not None:
+        return self._building(key, self._topology() if self.base[key].osm_type == "new" else {})
+
+    def _building(self, key: str, topo: dict[str, Building]) -> Building:
+        if self.base[key].osm_type == "new" and (hit := topo.get(key)) is not None:
             return hit
         return apply_review(self.base[key], self.reviews.get(key))
 
     # ---------------------------------------------------------- topologia/OSM
 
-    def _surroundings(self) -> Surroundings | None:
-        path = effective_context_path(self.cfg, self.edits)
-        if not path.exists():
+    _SIGNATURES: dict[str, dict[str, bool]] = {
+        "landuse": {"walls": False, "buildings": False},  # o contexto OSM editado
+        "walls": {"buildings": False},  # as ligações dos muros ao landuse
+        "topology": {"walls": False},  # os recortes dos edifícios novos
+    }
+
+    def _signature(self, kind: str) -> str:
+        """Assinatura das edições atuais de que depende ``kind`` (ver ``_SIGNATURES``)."""
+        if self._sigs is None or self._sigs[0] is not self.edits:
+            self._sigs = (self.edits, {})
+        sigs = self._sigs[1]
+        if kind not in sigs:
+            sigs[kind] = self.edits.signature(**self._SIGNATURES[kind])
+        return sigs[kind]
+
+    def _context_key(self) -> tuple[int, str] | None:
+        """(mtime do contexto OSM, assinatura das edições de landuse); None sem contexto."""
+        try:
+            mtime = context_path(self.cfg).stat().st_mtime_ns
+        except OSError:
             return None
-        mtime = (str(path), path.stat().st_mtime)
-        if self._env is None or self._env_mtime != mtime:
+        return (mtime, self._signature("landuse"))
+
+    def _effective_context(self) -> tuple[tuple[int, str], Path] | None:
+        """O contexto OSM com as edições de landuse (gerado só quando elas mudam)."""
+        key = self._context_key()
+        if key is None:
+            return None
+        if self._eff_ctx is None or self._eff_ctx[0] != key:
+            self._eff_ctx = (key, effective_context_path(self.cfg, self.edits))
+        return self._eff_ctx
+
+    def _surroundings(self) -> Surroundings | None:
+        eff = self._effective_context()
+        if eff is None:
+            return None
+        key, path = eff
+        if self._env is None or self._env_mtime != key:
             fetched = artefact_path(self.cfg, Stage.FETCH)
             self._env = load_surroundings(path, self.cfg.processing_crs, fetched)
-            self._env_mtime = mtime
+            self._env_mtime = key
             self._topo = None
         return self._env
 
@@ -299,8 +339,11 @@ class ReviewService:
         with self._topo_lock:
             self._topo = None
 
-    def _review_changed(self, key: str) -> list[str] | None:
-        """A revisão de ``key`` mudou: refaz a topologia só do grupo de edifícios novos
+    def _review_changed(self, key: str, before: tuple[Any, ...] | None) -> list[str] | None:
+        """A revisão de ``key`` mudou (``before``: ``_topology_inputs`` antes da mudança).
+
+        Se só mudou a decisão ou a nota (aceitar um edifício), o resultado já calculado
+        serve, com o estado novo. Senão refaz a topologia só do grupo de edifícios novos
         ligados a ele por sobreposições (os outros não mudam: ver ``resolve_topology``).
 
         Devolve as chaves cujo edifício pode ter mudado, ou None se a topologia de toda a
@@ -313,6 +356,15 @@ class ReviewService:
             env = self._surroundings()
             if self._topo is None or self._topo_tree is None:
                 return None
+            after = self._topology_inputs(key)
+            hit = self._topo.get(key)
+            if hit is not None and before is not None and before == after and not after[0]:
+                now = apply_review(self.base[key], self.reviews.get(key))
+                hit = hit.model_copy(
+                    update={"review_status": now.review_status, "review_note": now.review_note}
+                )
+                self._topo[key] = hit  # uma só chave: atómico para os pedidos em curso
+                return [key]
             # Grupo: o fecho por "intersecta" dos contornos de base (contém os recortados,
             # que só encolhem), com os rejeitados também (ligam vizinhos de ambos os lados).
             group = {self._topo_pos[key]}
@@ -337,8 +389,8 @@ class ReviewService:
     def osm_context(self) -> dict[str, Any]:
         """Landuse, vias, muros/vedações e edifícios do OSM à volta da área (GeoJSON), com as
         edições de landuse feitas no mapa."""
-        path = effective_context_path(self.cfg, self.edits)
-        if not path.exists():
+        eff = self._effective_context()
+        if eff is None:
             return {
                 "type": "FeatureCollection",
                 "features": [],
@@ -346,9 +398,9 @@ class ReviewService:
                 "outdated": True,
                 "missing": ["contexto OSM (correr a fase candidates ou atualizar)"],
             }
-        mtime = (str(path), path.stat().st_mtime)
-        if self._ctx_geojson is None or self._ctx_geojson[0] != mtime:
-            self._ctx_geojson = (mtime, osm_context_geojson(path))
+        key, path = eff
+        if self._ctx_geojson is None or self._ctx_geojson[0] != key:
+            self._ctx_geojson = (key, osm_context_geojson(path))
         return self._ctx_geojson[1]
 
     # ------------------------------------------------------------------ muros
@@ -361,7 +413,8 @@ class ReviewService:
         sig = (
             b.stat().st_mtime if b.exists() else None,
             c.stat().st_mtime if c.exists() else None,
-            self.edits.signature(),
+            # As ligações dos muros dependem dos muros e do landuse, não dos edifícios.
+            self._signature("walls"),
         )
         if self._walls is None or self._walls[0] != sig:
             self._walls = (sig, effective_walls(self.cfg, self.edits))
@@ -523,8 +576,12 @@ class ReviewService:
 
     def _save_edits(self, edits: GeometryEdits) -> None:
         self.store.save_geometry_edits(edits)
+        before = self._signature("topology")
         self.edits = edits
-        self._topology_changed()
+        # A topologia dos edifícios novos não depende dos muros: editar um muro não a
+        # refaz (leva ~0,5 s para todos os edifícios da área).
+        if self._signature("topology") != before:
+            self._topology_changed()
 
     def save_wall_geometry(self, key: str, coords: list[tuple[float, float]]) -> dict[str, Any]:
         """Muro com a geometria editada no mapa (lon, lat)."""
@@ -759,6 +816,13 @@ class ReviewService:
     def reset_building_geometry(self, key: str) -> dict[str, Any]:
         if key not in self.original:
             raise NotFound(key)
+        review = self.reviews.get(key)
+        if review is not None and review.parts is not None:
+            # As partes estão nas coordenadas do contorno atual.
+            raise ValueError(
+                "Dividido em partes: voltar a edifício único (e guardar a revisão) "
+                "antes de repor o contorno"
+            )
         b = self.original[key]
         if b.osm_type == "way":
             ctx = self._context_or_none()
@@ -785,17 +849,12 @@ class ReviewService:
         return {"date": ctx.get("date"), "n": len(ctx["features"])}
 
     def all_buildings(self) -> list[Building]:
-        # A topologia uma só vez (não por edifício, como em ``building``).
-        topo = self._topology()
-        return [
-            hit
-            if b.osm_type == "new" and (hit := topo.get(k)) is not None
-            else apply_review(b, self.reviews.get(k))
-            for k, b in self.base.items()
-        ]
+        topo = self._topology()  # uma vez para todos (não por edifício)
+        return [self._building(k, topo) for k in self.base]
 
     def _geom_wgs84(self, key: str, b: Building | None = None) -> Any:
-        """Contorno em WGS84; ``b``: o edifício de ``key`` já com a revisão, se à mão."""
+        """Contorno em WGS84; ``b``: o edifício já com a revisão e a topologia (poupa
+        voltar a procurá-lo)."""
         if key not in self._wgs84:
             # Edifícios novos: o contorno que vai ser exportado (recortes incluídos).
             if key.startswith("new/"):
@@ -874,10 +933,10 @@ class ReviewService:
             "properties": props,
         }
 
-    def _after_review(self, key: str) -> dict[str, Any]:
+    def _after_review(self, key: str, before: tuple[Any, ...] | None) -> dict[str, Any]:
         """Detalhe de ``key`` depois de a revisão mudar, com os edifícios do mapa que
         mudaram com ela (``map_features``; None: recarregar o mapa todo)."""
-        changed = self._review_changed(key)
+        changed = self._review_changed(key, before)
         out = self.detail(key)
         out["map_features"] = (
             None if changed is None else [self._feature(self.building(k)) for k in changed]
@@ -1023,6 +1082,8 @@ class ReviewService:
             "ground": self._ground_info(b),
             "has_layout": b.layout is not None,
             "has_suggestion": base.suggested_layout is not None,
+            # Volumes da divisão sugerida (alturas e telhados ajustados ao LiDAR).
+            "suggestion": self._suggestion(base),
             "parts_editable": self._editable(b) is None,
             "parts_reason": self._editable(b),
             "n_parts": len(b.parts),
@@ -1288,6 +1349,19 @@ class ReviewService:
             split=data.split,
         )
 
+    def _suggestion(self, b: Building) -> list[dict[str, Any]]:
+        layout = b.suggested_layout
+        if layout is None:
+            return []
+        return [
+            {
+                "height": self._h(p.height.value),
+                "roof_shape": p.roof.shape.value.value,
+                "area": _num(layout.polygon(i).area, 0),
+            }
+            for i, p in enumerate(layout.fitted)
+        ]
+
     def _editable(self, b: Building) -> str | None:
         if b.osm_type not in ("way", "new"):
             return "Divisão em partes só para contornos simples (way), não multipolígonos"
@@ -1295,8 +1369,11 @@ class ReviewService:
             return "O edifício já tem building:part no OSM: editar no JOSM"
         if b.ground_elevation_m is None:
             return "Sem cota do terreno"
-        if b.key in self._edited:
-            return "Contorno editado no mapa: repor o contorno para dividir em partes"
+        if b.key in self._edited and b.osm_type != "new":
+            # As partes de um edifício do OSM ligam-se aos nós da way tal como estão no OSM;
+            # com o contorno editado, ficariam fora dele. Os municipais exportam-se do
+            # próprio contorno (e a sugestão é refeita para o contorno editado).
+            return "Contorno do OSM editado no mapa: repor o contorno para dividir em partes"
         return None
 
     def parts_view(self, key: str) -> dict[str, Any]:
@@ -1441,9 +1518,22 @@ class ReviewService:
             parts=layout,
             part_overrides=part_overrides,
         )
+        before = self._topology_inputs(key)
         self.store.save(review)
         self.reviews[key] = review
-        return self._after_review(key)
+        return self._after_review(key, before)
+
+    def _topology_inputs(self, key: str) -> tuple[Any, ...] | None:
+        """O que a topologia vê da revisão de um edifício: se entra (não rejeitado nem
+        arquivado) e as correções/partes; a decisão e a nota não contam. None: revisão de
+        outra versão do OSM (a decisão não se aplica)."""
+        r = self.reviews.get(key)
+        if r is None:
+            r = Review(osm_key=key, osm_version=self.base[key].osm_version, status="pending")
+        elif not r.archived and r.osm_version != self.base[key].osm_version:
+            return None
+        fields = r.model_dump(include={"overrides", "parts", "part_overrides"})
+        return (r.status == "rejected" or r.archived, fields)
 
     def archive(self, status: ReviewStatus, archived: bool = True) -> dict[str, Any]:
         """(Des)arquiva todos os aceites ou todos os rejeitados."""
@@ -1457,9 +1547,10 @@ class ReviewService:
     def reset_review(self, key: str) -> dict[str, Any]:
         if key not in self.base:
             raise NotFound(key)
+        before = self._topology_inputs(key)
         self.store.delete(key)
         self.reviews.pop(key, None)
-        return self._after_review(key)
+        return self._after_review(key, before)
 
     # ----------------------------------------------------------------- resumo
 

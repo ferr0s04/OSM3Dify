@@ -296,6 +296,7 @@ export class BuildingMap {
     this.editingCtx = null; // way do OSM em edição (landuse ou edifício): "way/<id>"
     this.editingBuilding = null; // edifício da cartografia municipal em edição
     this.index = { walls: new Map(), ctx: new Map(), buildings: new Map() };
+    this.data = { walls: null, ctx: null, buildings: null }; // as coleções mostradas (para applyLocalEdit)
     this.editor = new GeometryEditor(this.map, {
       snapTargets: (point, px) => this.snapTargets(point, px),
       linkCandidates: (t) => this.linkCandidates(t),
@@ -364,6 +365,62 @@ export class BuildingMap {
       fill: true,
       label: "edifício",
     });
+  }
+
+  applyLocalEdit(changes) {
+    // Edição terminada no mapa, mostrada já (sem esperar pelo servidor): a geometria nova de
+    // cada elemento nas camadas e nos índices de encaixe/ligação. changes: [{ key, coords,
+    // ids }] (anéis sem repetir o primeiro ponto; ids: nós do OSM, null num vértice novo).
+    // Um nó do OSM movido move-se também nas outras ways que o usam (como no servidor).
+    // A versão do servidor (recortes, nós novos) chega depois, ao recarregar as camadas.
+    const dirty = new Set();
+    const moved = new Map(); // nó do OSM → posição nova
+    const geometry = (closed, coords) => (closed
+      ? { type: "Polygon", coordinates: [[...coords, coords[0]].map((c) => [...c])] }
+      : { type: "LineString", coordinates: coords.map((c) => [...c]) });
+    const byKey = (fc, prop, key) => fc?.features.find((f) => f.properties[prop] === key && (fc !== this.data.walls || f.properties.kind === "wall"));
+    for (const { key, coords, ids } of changes) {
+      if (!coords?.length) continue;
+      ids?.forEach((id, i) => id != null && moved.set(id, coords[i]));
+      if (key.startsWith("wall/")) {
+        const f = byKey(this.data.walls, "key", key);
+        if (!f) continue;
+        f.geometry = geometry(false, coords);
+        this.index.walls.set(key, f.geometry);
+        dirty.add("walls");
+        continue;
+      }
+      const b = byKey(this.data.buildings, "key", key);
+      if (b && coords.length >= 3) {
+        b.geometry = geometry(true, coords);
+        this.index.buildings.set(key, b.geometry);
+        dirty.add("buildings");
+      }
+      const c = byKey(this.data.ctx, "id", key);
+      if (c && coords.length >= 3 && c.geometry?.type === "Polygon") {
+        c.geometry = geometry(true, coords);
+        c.properties.nodes = ids ? [...ids, ids[0]] : null;
+        this.index.ctx.set(key, c.geometry);
+        if (c.properties.nodes) this.index.ctxNodes.set(key, c.properties.nodes);
+        else this.index.ctxNodes.delete(key);
+        dirty.add("ctx");
+      }
+    }
+    if (moved.size && this.data.ctx) {
+      const keys = new Set(changes.map((c) => c.key));
+      for (const f of this.data.ctx.features) {
+        const nodes = f.properties.nodes;
+        if (keys.has(f.properties.id) || !nodes?.some((n) => moved.has(n))) continue;
+        const line = f.geometry.type === "Polygon" ? f.geometry.coordinates[0] : f.geometry.type === "LineString" ? f.geometry.coordinates : null;
+        if (!line || line.length !== nodes.length) continue;
+        const next = line.map((c, i) => (moved.has(nodes[i]) ? [...moved.get(nodes[i])] : c));
+        f.geometry = f.geometry.type === "Polygon" ? { type: "Polygon", coordinates: [next, ...f.geometry.coordinates.slice(1)] } : { type: "LineString", coordinates: next };
+        this.index.ctx.set(f.properties.id, f.geometry);
+        dirty.add("ctx");
+      }
+    }
+    const sources = { walls: "walls", buildings: "buildings", ctx: "osm-ctx" };
+    for (const d of dirty) this.map.getSource(sources[d])?.setData(this.data[d]);
   }
 
   stopEditing() {
@@ -497,6 +554,7 @@ export class BuildingMap {
     this.index.ctxNodes = new Map(geojson.features.filter((f) => f.properties.nodes).map((f) => [f.properties.id, f.properties.nodes]));
     // Landuse e edifícios do OSM: ligam-se aos edifícios em edição (e entre si).
     this.index.ctxAreas = new Set(geojson.features.filter((f) => ["landuse", "building"].includes(f.properties.kind)).map((f) => f.properties.id));
+    this.data.ctx = geojson;
     const src = this.map.getSource("osm-ctx");
     if (src) return src.setData(geojson);
     this.map.addSource("osm-ctx", { type: "geojson", data: geojson });
@@ -546,6 +604,7 @@ export class BuildingMap {
     // para ele (tracejado).
     await this.ready;
     this.index.walls = new Map(geojson.features.filter((f) => f.properties.kind === "wall").map((f) => [f.properties.key, f.geometry]));
+    this.data.walls = geojson;
     const src = this.map.getSource("walls");
     if (src) {
       src.setData(geojson);
@@ -628,6 +687,7 @@ export class BuildingMap {
     this.features = new Map(geojson.features.map((f) => [f.properties.key, f]));
     this.keyToId = new Map(geojson.features.map((f) => [f.properties.key, f.id]));
     this.index.buildings = new Map(geojson.features.map((f) => [f.properties.key, f.geometry]));
+    this.data.buildings = geojson;
     const src = this.map.getSource("buildings");
     if (src) {
       src.setData(geojson);
@@ -716,6 +776,8 @@ export class BuildingMap {
       this.keyToId.set(f.properties.key, f.id);
       this.index.buildings.set(f.properties.key, f.geometry);
     }
+    // As edições locais (applyLocalEdit) partem de data.buildings: fica igual ao mapa.
+    if (this.data.buildings) this.data.buildings = { ...this.data.buildings, features: [...this.features.values()] };
     if (typeof src.updateData === "function") src.updateData({ remove: features.map((f) => f.id), add: features });
     else src.setData({ type: "FeatureCollection", features: [...this.features.values()] });
   }

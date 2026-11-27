@@ -278,7 +278,7 @@ function prefetchNext(key, token) {
   prefetch(nearestRow(key, row)?.key);
 }
 
-async function select(key) {
+async function select(key, { keepView = false } = {}) {
   if (!key) return;
   clearMulti();
   const token = ++state.token;
@@ -288,7 +288,7 @@ async function select(key) {
   map.stopEditing();
   map.selectWall(null);
   $("#viewer-status").textContent = "a carregar…";
-  viewer.clearAll();
+  if (!keepView) viewer.clearAll();
   try {
     const load = loadBuilding(key);
     const [detail, mesh] = await Promise.all([load.detail, load.mesh]);
@@ -301,7 +301,7 @@ async function select(key) {
     startBuildingEdit();
     if (detail.has_layout || state.viewMode === "plan") loadParts(key, token);
     viewer.setModel(mesh);
-    viewer.frame(mesh);
+    if (!keepView) viewer.frame(mesh);
     $("#viewer-status").textContent = "a carregar pontos LiDAR… (a 1.ª vez por quadrícula demora)";
     const pts = await load.points;
     if (token !== state.token) return;
@@ -467,33 +467,26 @@ function undoMulti() {
 }
 
 function saveMulti(saves) {
-  // Em fila com as outras edições do mapa (a exportação espera por elas).
-  editQueue = editQueue.then(async () => {
-    toast(`A gravar ${saves.length} contornos (o 3D de cada edifício é reajustado ao LiDAR)…`, 4000);
-    let failed = 0;
-    for (const { key, nodes } of saves) {
-      try {
-        if (key.startsWith("new/") || state.osmKeys?.has(key)) await api.saveBuildingGeometry(key, nodes);
-        else await api.saveLanduse(Number(key.slice(4)), nodes);
-      } catch (e) {
-        failed++;
-        toast(`${key}: não gravado (${e.message})`, 7000);
-      }
-    }
-    await reloadEditedMap();
-    // Os contornos como ficaram no servidor (nós novos, ligações).
-    const m = state.multi;
-    if (m) {
-      for (const { key } of saves) {
-        if (!m.items.has(key)) continue;
+  // Os contornos ficam logo no mapa; gravam-se na fila com as outras edições do mapa (a
+  // exportação espera por elas). O 3D de cada edifício é reajustado ao LiDAR no servidor.
+  localEdit(saves.map(({ key, nodes }) => ({ key, coords: nodes.map((n) => [n[1], n[2]]), ids: nodes.map((n) => n[0]) })));
+  enqueueSave({
+    kind: "multi",
+    label: `${saves.length} contornos`,
+    run: async () => {
+      let failed = 0;
+      for (const { key, nodes } of saves) {
         try {
-          const fresh = await fetchRing(key);
-          if (state.multi === m && m.items.has(key)) m.items.set(key, fresh);
-        } catch { /* fica o local */ }
+          if (isReviewBuilding(key)) await api.saveBuildingGeometry(key, nodes);
+          else await api.saveLanduse(Number(key.slice(4)), nodes);
+        } catch (e) {
+          failed++;
+          toast(`${key}: não gravado (${e.message})`, 7000);
+        }
+        for (const l of layersFor(key)) reloadLayers.add(l);
       }
-      if (state.multi === m) renderMulti();
-    }
-    if (!failed) toast(`${saves.length} contornos gravados.`, 2500);
+      if (failed) for (const l of ["buildings", "ctx", "walls"]) reloadLayers.add(l);
+    },
   });
 }
 
@@ -764,20 +757,6 @@ function patchRow(detail) {
   if (i >= 0) state.rows[i] = { ...state.rows[i], ...Object.fromEntries(Object.keys(state.rows[i]).map((k) => [k, detail[k]])) };
 }
 
-// Gravações das revisões, pela ordem das teclas. A interface não espera por elas: a
-// lista, as contagens, o mapa e o edifício seguinte mudam logo (ver review).
-let reviewQueue = Promise.resolve();
-let reviewsInFlight = 0;
-window.addEventListener("beforeunload", (e) => {
-  if (reviewsInFlight) e.preventDefault(); // revisões ainda a gravar
-});
-
-function setRowStatus(key, status) {
-  const row = state.rows.find((r) => r.key === key);
-  if (row) row.status = status;
-  map.setFeatureProps(key, { status });
-}
-
 function patchRowFromFeature(f) {
   // Vizinho cuja topologia mudou com a revisão (recorte, sinalizações): a linha da lista
   // fica com o que o mapa mostra.
@@ -788,19 +767,20 @@ function patchRowFromFeature(f) {
   }
 }
 
-function applyReviewResult(detail) {
+function applyReviewResult(detail, seq) {
   // Resposta do servidor (pela ordem da fila): o estado oficial deste edifício e dos
-  // edifícios novos sobrepostos a ele, cuja topologia pode ter mudado.
+  // edifícios novos sobrepostos a ele, cuja topologia pode ter mudado. Os que foram
+  // editados no mapa depois desta revisão (seq) ficam como estão (a edição é mais recente).
   patchRow(detail);
-  const feats = detail.map_features;
+  const feats = detail.map_features?.filter((f) => isLatest(f.properties.key, seq));
   if (feats) {
     for (const f of feats) patchRowFromFeature(f);
     map.patchFeatures(feats.filter((f) => f.properties.candidate));
     forgetPrefetched(feats.map((f) => f.properties.key));
   } else {
-    // A topologia da área toda vai ser refeita: o mapa recarrega-se em segundo plano.
+    // A topologia da área toda vai ser refeita: o mapa recarrega-se quando a fila esvaziar.
     forgetPrefetched();
-    api.geojson().then((gj) => map.setData(municipalGeojson(gj))).catch(() => {});
+    reloadLayers.add("buildings");
   }
   renderProgress();
   applyFilters();
@@ -843,7 +823,9 @@ function nearestRow(key, from) {
 }
 
 function review(status) {
-  // status null: repor (volta a "por rever" e fica no mesmo edifício).
+  // Aceitar/rejeitar (status null: repor, volta a "por rever" e fica no mesmo edifício).
+  // A decisão aparece logo (lista, contagens, cor no mapa) e passa-se já ao seguinte; a
+  // gravação segue em segundo plano, na fila das edições.
   const d = state.detail;
   if (!d || state.selected !== d.key) return;
   const key = d.key;
@@ -853,47 +835,46 @@ function review(status) {
   const parts = state.parts.active
     ? { layout: state.parts.layout, overrides: state.parts.overrides.map((o) => o ?? {}) }
     : null;
-  const row = state.rows.find((r) => r.key === key);
-  const before = row?.status ?? d.status;
-  const inList = state.filtered.some((r) => r.key === key);
-  // Avança para o edifício da lista filtrada mais perto deste (por rever primeiro), e não
-  // para o seguinte na ordem da lista, que pode estar do outro lado da área. Edifício do
-  // OSM (aberto no mapa, fora da lista) ou repor: fica neste.
-  const target = status && inList ? nearestRow(key, row ?? d) : null;
-
-  // 1. Gravar, em fila. Com a fila vazia, o pedido sai já (antes dos do edifício
-  // seguinte, para o servidor já ter a revisão). Se falhar, lista e mapa voltam atrás.
-  const save = () => (status ? api.saveReview(key, status, note, ov, parts) : api.resetReview(key));
-  const sent = reviewsInFlight ? reviewQueue.then(save) : save();
-  reviewsInFlight++;
-  reviewQueue = sent
-    .then(
-      (detail) => {
-        applyReviewResult(detail);
-        // Ficou neste edifício: volta a abri-lo com o que foi gravado.
-        if (!target && state.selected === key) select(key);
-      },
-      (e) => {
-        setRowStatus(key, before);
-        renderProgress();
-        applyFilters();
-        toast(`${key}: não foi gravado (${e.message})`, 7000);
-      },
-    )
-    .catch((e) => console.error(e))
-    .finally(() => reviewsInFlight--);
-
-  // 2. Já: lista, contagens, mapa e o edifício seguinte (normalmente já pré-carregado).
-  setRowStatus(key, status ?? "pending");
-  forgetPrefetched([key]);
-  renderProgress();
-  applyFilters();
-  if (target) select(target.key);
+  const save = status ? () => api.saveReview(key, status, note, ov, parts) : () => api.resetReview(key);
+  saveDecision(key, status ?? "pending", save, !!status);
   toast(`${key}: ${status === "accepted" ? "aceite" : status === "rejected" ? "rejeitado" : "revisão reposta"}`, 1500);
 }
 
 function resetReview() {
   review(null);
+}
+
+function saveDecision(key, status, save, advance) {
+  const row = state.rows.find((r) => r.key === key);
+  const before = row ? { ...row } : null;
+  // Avança para o edifício da lista filtrada mais perto deste (por rever primeiro), e não
+  // para o seguinte na ordem da lista, que pode estar do outro lado da área. Edifício do
+  // OSM (aberto no mapa, fora da lista) ou repor: fica neste.
+  const inList = state.filtered.some((r) => r.key === key);
+  const target = advance && inList ? nearestRow(key, row ?? state.detail) : null;
+  if (row) row.status = status;
+  const seq = ++editSeq; // uma recarga do mapa ainda a caminho já não tem esta decisão
+  map.setFeatureProps(key, { status });
+  forgetPrefetched([key]);
+  renderProgress();
+  applyFilters();
+  if (target) select(target.key); // normalmente já pré-carregado
+  enqueueSave({
+    kind: "review",
+    label: "Revisão",
+    run: async () => {
+      const detail = await save();
+      applyReviewResult(detail, seq);
+      // Ficou neste edifício (do OSM, fora da lista, ou repor): mostra-o como ficou.
+      if (!target && state.selected === key) select(key, { keepView: true });
+    },
+    failed: () => {
+      if (row && before) Object.assign(row, before);
+      if (before) map.setFeatureProps(key, { status: before.status });
+      renderProgress();
+      applyFilters();
+    },
+  });
 }
 
 // ------------------------------------------------------------- arranque
@@ -967,8 +948,7 @@ function wire() {
   $("#btn-export").addEventListener("click", async (e) => {
     e.target.disabled = true;
     try {
-      await editQueue; // as edições do mapa ainda a gravar entram nesta exportação
-      await reviewQueue; // e as revisões
+      await editQueue; // as edições do mapa ainda por gravar entram nesta exportação
       const r = await api.export();
       const topo = r.topology ? ` · Topologia: ${r.topology} (pormenor no CSV)` : "";
       toast(`${r.exported} edifícios exportados (${r.conflicts} com conflitos de tags) → ${r.path}${topo}`, 14000);
@@ -1070,6 +1050,7 @@ function setViewMode(mode) {
   $("#vt-plan").classList.toggle("active", plan);
   if (plan && state.selected && !state.parts.view) loadParts(state.selected, state.token);
   if (plan) requestAnimationFrame(() => editor.render());
+  if (state.parts.active && state.detail) renderPartsSection(); // o botão "Editar na Planta"
 }
 
 async function loadParts(key, token) {
@@ -1091,21 +1072,26 @@ async function loadParts(key, token) {
   }
 }
 
-function activateParts(layout, split = "parts") {
+function activateParts(layout, split = "parts", plan = true) {
+  // plan: abrir a vista Planta (para desenhar a divisão); aplicar a sugestão fica no 3D.
   state.parts.active = true;
   state.parts.layout = { ...layout, split };
   state.parts.overrides = [];
   state.parts.info = null;
   map.stopEditing(); // as partes estão em coordenadas do contorno: este fica fixo
   editor.load({ outline: state.parts.view.outline, layout }, true);
-  setViewMode("plan");
+  if (plan) setViewMode("plan");
   renderPartsSection();
   schedulePartsPreview(0);
 }
 
 async function startParts(kind, split = "parts") {
   if (!state.parts.view) await loadParts(state.selected, state.token);
-  if (kind === "suggested" && state.parts.view?.suggested) return activateParts(state.parts.view.suggested, split);
+  if (kind === "suggested") {
+    if (!state.parts.view?.suggested) return toast("Sem divisão sugerida para este edifício.");
+    activateParts(state.parts.view.suggested, split, false);
+    return toast(`Divisão sugerida aplicada (${split === "buildings" ? "edifícios separados" : "building:part"}): fica ao aceitar.`, 3000);
+  }
   try {
     const { layout } = await api.partsStart(state.selected);
     activateParts(layout, split);
@@ -1198,13 +1184,21 @@ function renderPartsSection() {
     return;
   }
   if (!state.parts.active) {
-    el.innerHTML = `<div class="actions">
-        ${d.has_suggestion ? `<button class="btn" id="p-suggested" title="Volume principal + volumes secundários detetados no LiDAR">Dividir em building:part (sugerido)</button>` : ""}
-        <button class="btn" id="p-manual" title="Partes do mesmo edifício (building:part), com alturas e telhados próprios">Dividir em building:part</button>
-        <button class="btn" id="p-buildings" title="Vários edifícios: cada peça passa a ser um edifício (building=*) com as suas tags 3D">Dividir em vários edifícios</button>
-      </div>
-      ${d.has_suggestion ? `<p class="small muted">A análise encontrou volumes com alturas diferentes neste contorno.</p>` : ""}`;
+    const sug = d.suggestion ?? [];
+    el.innerHTML = `
+      ${sug.length ? `<div class="suggestion">
+        <p class="small">A análise encontrou <b>${sug.length} volumes</b> com alturas ou telhados diferentes neste contorno:
+          ${sug.map((p, i) => `<span class="chip" style="border-left:3px solid ${PART_COLORS[i % PART_COLORS.length]}">${fmt(p.height, " m")} · ${esc(SHAPE_LABELS[p.roof_shape] ?? p.roof_shape)}${p.area ? ` · ${p.area} m²` : ""}</span>`).join(" ")}</p>
+        <div class="actions">
+          <button class="btn primary" id="p-suggested" title="Aplica a divisão sugerida como building:part do mesmo edifício (fica ao aceitar; a geometria edita-se na vista Planta)">Aplicar sugestão: building:part</button>
+          <button class="btn" id="p-suggested-buildings" title="Aplica a divisão sugerida como edifícios separados, cada um com as suas tags 3D (fica ao aceitar)">Aplicar sugestão: edifícios separados</button>
+        </div></div>` : ""}
+      <div class="actions">
+        <button class="btn" id="p-manual" title="Desenhar a divisão na vista Planta: partes do mesmo edifício (building:part), com alturas e telhados próprios">Dividir à mão em building:part</button>
+        <button class="btn" id="p-buildings" title="Desenhar a divisão na vista Planta: cada peça passa a ser um edifício (building=*) com as suas tags 3D">Dividir à mão em vários edifícios</button>
+      </div>`;
     $("#p-suggested")?.addEventListener("click", () => startParts("suggested"));
+    $("#p-suggested-buildings")?.addEventListener("click", () => startParts("suggested", "buildings"));
     $("#p-manual").addEventListener("click", () => startParts("manual"));
     $("#p-buildings").addEventListener("click", () => startParts("manual", "buildings"));
     return;
@@ -1242,8 +1236,14 @@ function renderPartsSection() {
           </div>
         </div>`).join("")}
     </div>
-    <p class="small muted">Os campos mostram o valor em vigor (estimado, ou corrigido a laranja); mudar um campo corrige-o. Edita a geometria na vista <b>Planta</b>.</p>
-    <div class="actions"><button class="btn" id="p-single">Voltar a edifício único</button></div>`;
+    <p class="small muted">Os campos mostram o valor em vigor (estimado, ou corrigido a laranja); mudar um campo corrige-o. A divisão fica ao aceitar.</p>
+    <div class="actions">
+      ${state.viewMode === "plan" ? "" : `<button class="btn" id="p-plan" title="Mover, dividir ou juntar as partes na vista Planta">Editar a divisão na Planta</button>`}
+      <button class="btn" id="p-single">Voltar a edifício único</button></div>`;
+  $("#p-plan")?.addEventListener("click", () => {
+    setViewMode("plan");
+    renderPartsSection();
+  });
   el.querySelectorAll('[name="p-split"]').forEach((r) =>
     r.addEventListener("input", (e) => {
       state.parts.layout = { ...state.parts.layout, split: e.target.value };
@@ -1354,8 +1354,15 @@ async function setRoofColourOption(input) {
 async function loadOsmContext() {
   // Landuse, vias, muros e edifícios do OSM (camada do mapa). Avisa se faltam dados.
   try {
-    const ctx = await api.osmContext();
-    await map.setOsmContext(ctx);
+    await showOsmContext(await api.osmContext());
+  } catch (e) {
+    toast(`Camadas OSM: ${e.message}`);
+  }
+}
+
+async function showOsmContext(ctx) {
+  await map.setOsmContext(ctx);
+  {
     const date = ctx.date ? `dados OSM de ${ctx.date.slice(0, 10)}` : "sem contexto OSM";
     $("#m-osm-date").textContent = ctx.missing.length ? `${date} · em falta: ${ctx.missing.join(", ")}` : date;
     $("#m-osm").classList.toggle("warn", ctx.missing.length > 0);
@@ -1363,8 +1370,6 @@ async function loadOsmContext() {
     if (ctx.missing.length) {
       toast(`Contexto OSM incompleto (obtido por uma versão anterior): faltam ${ctx.missing.join(", ")}. Usar "camadas OSM → atualizar do OSM".`, 9000);
     }
-  } catch (e) {
-    toast(`Camadas OSM: ${e.message}`);
   }
 }
 
@@ -1375,16 +1380,19 @@ const WALL_TYPES = { wall: "muro", fence: "vedação" };
 async function loadWalls() {
   // Muros propostos e o estado das fontes; avisa se faltam dados do OSM ou do geoportal.
   try {
-    const { info, geojson } = await api.walls();
-    state.walls = geojson.features.filter((f) => f.properties.kind === "wall").map((f) => f.properties);
-    await map.setWalls(geojson);
-    renderWallsInfo(info);
-    if (info.warnings.length && !loadWalls.warned) {
-      loadWalls.warned = true;
-      toast(`Muros: ${info.warnings.join(" ")}`, 9000);
-    }
+    await showWalls(await api.walls());
   } catch (e) {
     toast(`Muros: ${e.message}`);
+  }
+}
+
+async function showWalls({ info, geojson }) {
+  state.walls = geojson.features.filter((f) => f.properties.kind === "wall").map((f) => f.properties);
+  await map.setWalls(geojson);
+  renderWallsInfo(info);
+  if (info.warnings.length && !loadWalls.warned) {
+    loadWalls.warned = true;
+    toast(`Muros: ${info.warnings.join(" ")}`, 9000);
   }
 }
 
@@ -1515,97 +1523,211 @@ function renderLanduseDetail() {
 }
 
 // Gravações em fila: cada edição só sai depois da anterior (sem corridas no servidor).
-let editQueue = Promise.resolve();
+// A edição aparece logo no mapa (map.applyLocalEdit) e grava-se em segundo plano; as
+// camadas só se recarregam do servidor (recortes, nós novos, ligações dos muros) quando a
+// fila esvazia, e essa recarga fica de parte se entretanto houve outra edição.
+const saveJobs = []; // por gravar (ainda não começadas)
+let reloadLayers = new Set(); // camadas a recarregar quando a fila esvaziar
+let editSeq = 0; // muda a cada edição local
+const latestEdit = new Map(); // chave → editSeq da última edição local desse elemento
+let editQueue = Promise.resolve(); // resolve quando tudo o que está na fila foi gravado
+let saving = false;
+window.addEventListener("beforeunload", (e) => {
+  if (saving || saveJobs.length) e.preventDefault(); // edições/revisões ainda a gravar
+});
 
-function commitEdit(target, coords, ids, others = {}) {
-  editQueue = editQueue.then(() => saveEdit(target, coords, ids, others));
+function enqueueSave(job) {
+  // Duas edições seguidas do mesmo elemento (vários arrastos rápidos) gravam-se de uma vez:
+  // cada uma leva a geometria inteira, a última basta (com os ligados de ambas).
+  const last = saveJobs.at(-1);
+  if (job.kind === "edit" && last?.kind === "edit" && last.target.key === job.target.key && last.review === job.review) {
+    Object.assign(last, { coords: job.coords, ids: job.ids, seq: job.seq, others: { ...last.others, ...job.others } });
+  } else saveJobs.push(job);
+  if (!saving) editQueue = runSaves();
+  setSaveStatus();
+  return editQueue;
 }
 
-async function saveEdit(target, coords, ids, others) {
-  // Cada alteração terminada no mapa é gravada logo (vai na exportação a partir daí).
+async function runSaves() {
+  saving = true;
+  setSaveStatus();
   try {
-    if (target.key.startsWith("wall/")) {
-      // O muro e os ligados a ele que mudaram (vértice partilhado, ligação, alinhamento).
-      const walls = Object.fromEntries(Object.entries(others).map(([k, o]) => [k, o.coords]));
-      const res = await api.saveWallsGeometry({ ...walls, [target.key]: coords });
-      const d = res.details[target.key];
-      if (state.wall?.key === d.key) {
-        state.wall = d;
-        renderWallDetail();
+    while (saveJobs.length || reloadLayers.size) {
+      if (saveJobs.length) {
+        const job = saveJobs.shift();
+        setSaveStatus();
+        try {
+          await job.run(job);
+          // Uma geometria nova muda os recortes dos vizinhos: o pré-carregado já não serve.
+          if (job.kind !== "review") forgetPrefetched();
+        } catch (e) {
+          toast(`${job.label ?? "Edição"} não guardada: ${e.message}`, 6000);
+          job.failed?.(e);
+          for (const l of ["buildings", "ctx", "walls"]) reloadLayers.add(l); // o mapa volta a ser o do servidor
+        }
+        continue;
       }
-      await loadWalls();
-      map.editor.refreshLinks();
-      return;
+      const layers = reloadLayers;
+      reloadLayers = new Set();
+      try {
+        await reloadEditedMap(layers);
+      } catch (e) {
+        toast(`Camadas do mapa não recarregadas: ${e.message}`, 6000);
+      }
     }
+  } finally {
+    saving = false;
+    setSaveStatus();
+  }
+}
+
+function setSaveStatus() {
+  // Indicador discreto no mapa enquanto há edições por gravar.
+  const el = $("#save-status");
+  if (!el) return;
+  const pending = saveJobs.length;
+  el.classList.toggle("hidden", !saving && !pending);
+  el.textContent = pending > 1 ? `a gravar… (+${pending} na fila)` : "a gravar…";
+}
+
+function localEdit(changes) {
+  // Mostra já a edição no mapa e regista-a (respostas do servidor a edições anteriores
+  // deixam de mexer na geometria do editor).
+  editSeq++;
+  for (const c of changes) latestEdit.set(c.key, editSeq);
+  map.applyLocalEdit(changes);
+  map.editor.refreshLinks();
+  return editSeq;
+}
+
+// Edifício em revisão (municipal ou do OSM com análise 3D): grava-se pelo contorno do
+// edifício; os outros (landuse, edifícios do OSM sem análise) pela way.
+const isReviewBuilding = (key) => key.startsWith("new/") || !!state.osmKeys?.has(key);
+
+const isLatest = (key, seq) => (latestEdit.get(key) ?? 0) <= seq;
+
+function layersFor(key) {
+  // O que muda no servidor com a geometria deste elemento: muro → muros; edifício
+  // municipal → edifícios (recortes); way do OSM → contexto, edifícios (topologia) e muros
+  // (ligações ao landuse).
+  if (key.startsWith("wall/")) return ["walls"];
+  if (key.startsWith("new/")) return ["buildings"];
+  return ["ctx", "buildings", "walls"];
+}
+
+function commitEdit(target, coords, ids, others = {}) {
+  const review = !!state.selected && target.key === state.selected;
+  if (review && state.parts.active) {
+    // As partes estão em coordenadas do contorno: mudá-lo desfazia a divisão.
+    toast("Divisão em partes ativa: voltar a edifício único para editar o contorno.", 6000);
+    return startBuildingEdit();
+  }
+  const changes = [{ key: target.key, coords, ids }, ...Object.entries(others).map(([key, o]) => ({ key, coords: o.coords, ids: o.ids }))];
+  const seq = localEdit(changes);
+  if (review) $("#viewer-status").textContent = "a reajustar o telhado ao contorno novo… (LiDAR)";
+  enqueueSave({ kind: "edit", target, coords, ids, others, review, seq, run: saveEdit, failed: () => revertEdit(target) });
+}
+
+function revertEdit(target) {
+  // Volta à geometria guardada.
+  if (state.selected && target.key === state.selected) startBuildingEdit();
+  else if (target.key.startsWith("wall/") && state.wall?.key === target.key) map.editWall(state.wall);
+  else if (state.landuse?.key === target.key) map.editLanduse(state.landuse);
+}
+
+async function saveEdit(job) {
+  // Cada alteração terminada no mapa é gravada logo (vai na exportação a partir daí).
+  const { target, coords, ids, others, seq } = job;
+  const layers = new Set(layersFor(target.key));
+  if (target.key.startsWith("wall/")) {
+    // O muro e os ligados a ele que mudaram (vértice partilhado, ligação, alinhamento).
+    const walls = Object.fromEntries(Object.entries(others).map(([k, o]) => [k, o.coords]));
+    const res = await api.saveWallsGeometry({ ...walls, [target.key]: coords });
+    const d = res.details[target.key];
+    if (state.wall?.key === d.key) {
+      state.wall = d;
+      renderWallDetail();
+    }
+  } else {
     const nodes = coords.map((c, i) => [ids?.[i] ?? null, c[0], c[1]]);
-    if (state.selected && target.key === state.selected) {
+    if (job.review) {
       // Contorno do edifício em revisão (do OSM: com os nós; municipal: só o anel).
-      await saveBuildingGeometry(target.key, nodes);
+      await saveBuildingGeometry(target.key, nodes, seq);
+    } else if (isReviewBuilding(target.key)) {
+      // Edifício em revisão que já não está selecionado (passou-se a outro antes de gravar).
+      await api.saveBuildingGeometry(target.key, nodes);
     } else {
       const d = await api.saveLanduse(Number(target.key.replace("way/", "")), nodes);
       if (state.landuse?.key === d.key) {
         state.landuse = d;
         renderLanduseDetail();
-        if (map.editor.editing(d.key)) map.editor.setGeometry(d.nodes.map((n) => [n[1], n[2]]), d.nodes.map((n) => n[0]));
+        if (map.editor.editing(d.key) && isLatest(d.key, seq)) map.editor.setGeometry(d.nodes.map((n) => [n[1], n[2]]), d.nodes.map((n) => n[0]));
       }
     }
     // Os landuse e edifícios ligados a ele que mudaram com ele (vértice partilhado
     // arrastado, ou um vértice novo onde se ligou a uma aresta deles).
-    await saveLinked(others);
-    await reloadEditedMap();
-  } catch (e) {
-    toast(`Edição não guardada: ${e.message}`, 6000);
-    // Volta à geometria guardada.
-    if (state.selected && target.key === state.selected) startBuildingEdit();
-    else if (target.key.startsWith("wall/") && state.wall) map.editWall(state.wall);
-    else if (state.landuse) map.editLanduse(state.landuse);
+    for (const k of await saveLinked(others)) for (const l of layersFor(k)) layers.add(l);
   }
+  for (const l of layers) reloadLayers.add(l);
 }
 
 async function saveLinked(others) {
+  const keys = [];
   for (const [key, o] of Object.entries(others ?? {})) {
     const nodes = o.coords.map((c, i) => [o.ids?.[i] ?? null, c[0], c[1]]);
     try {
       if (key.startsWith("new/")) await api.saveBuildingGeometry(key, nodes);
       else if (key.startsWith("way/")) await api.saveLanduse(Number(key.slice(4)), nodes);
+      else continue;
+      keys.push(key);
     } catch (e) {
       toast(`${key} (ligado ao elemento editado) não foi gravado: ${e.message}`, 7000);
+      for (const l of layersFor(key)) reloadLayers.add(l);
     }
   }
+  return keys;
 }
 
-async function reloadEditedMap() {
-  // O contexto OSM (landuse, edifícios do OSM), os municipais e os muros com as edições;
-  // depois, as ligações do elemento em edição aos vizinhos.
-  forgetPrefetched();
-  const [gj] = await Promise.all([api.geojson(), loadOsmContext(), loadWalls()]);
-  forgetPrefetched(); // e o que se pré-carregou entretanto
-  await map.setData(municipalGeojson(gj));
-  map.editor.refreshLinks();
-}
-
-async function saveBuildingGeometry(key, nodes) {
-  if (state.parts.active) {
-    // As partes estão em coordenadas do contorno: mudá-lo desfazia a divisão.
-    toast("Divisão em partes ativa: voltar a edifício único para editar o contorno.", 6000);
-    return startBuildingEdit();
+async function reloadEditedMap(layers = new Set(["buildings", "ctx", "walls"])) {
+  // As camadas como ficaram no servidor (o contexto OSM com as edições, os municipais com
+  // os recortes, os muros com as ligações); depois, as ligações do elemento em edição aos
+  // vizinhos. Se entretanto houve outra edição, o que veio já está desatualizado: fica o
+  // que está no mapa (a edição nova volta a pedir a recarga).
+  const seq = editSeq;
+  const [gj, ctx, walls] = await Promise.all([
+    layers.has("buildings") ? api.geojson() : null,
+    layers.has("ctx") ? api.osmContext() : null,
+    layers.has("walls") ? api.walls() : null,
+  ]);
+  if (seq !== editSeq) return false;
+  if (gj) {
+    forgetPrefetched(); // a topologia pode ter mudado (e o que se pré-carregou entretanto)
+    await map.setData(municipalGeojson(gj));
   }
+  if (ctx) await showOsmContext(ctx);
+  if (walls) await showWalls(walls);
+  map.editor.refreshLinks();
+  return true;
+}
+
+async function saveBuildingGeometry(key, nodes, seq) {
   const token = state.token;
-  $("#viewer-status").textContent = "a reajustar o telhado ao contorno novo… (LiDAR)";
   const detail = await api.saveBuildingGeometry(key, nodes);
   if (token !== state.token) return;
-  await afterFootprintChange(detail, token);
+  await afterFootprintChange(detail, token, seq);
 }
 
-async function afterFootprintChange(detail, token) {
+async function afterFootprintChange(detail, token, seq = Infinity) {
   // Contorno novo: o detalhe (tags, sinalizações), o modelo e os pontos mudam (o mapa
-  // recarrega-o quem chama). A topologia da área é refeita: o pré-carregado pode ter mudado.
+  // recarrega-o quem chama). seq: a edição local gravada (se já houve outra depois, o
+  // editor fica com a geometria local, que é mais recente).
+  // A topologia da área é refeita: o pré-carregado pode ter mudado.
   forgetPrefetched();
   state.detail = detail;
   rerenderDetail();
   patchRow(detail);
   const g = detail.geometry;
-  if (g?.editable && map.editor.editing(detail.key)) {
+  if (g?.editable && map.editor.editing(detail.key) && isLatest(detail.key, seq)) {
     map.editor.setGeometry(g.nodes.map((n) => [n[1], n[2]]), g.kind === "osm" ? g.nodes.map((n) => n[0]) : null,
       new Set(Object.keys(g.shared ?? {}).map(Number)));
   }
@@ -1627,31 +1749,45 @@ function selectOsmBuilding(key) {
   selectLanduse(key);
 }
 
-async function resetGeometry() {
-  try {
-    if (state.selected && state.detail?.geometry) {
-      const token = state.token;
-      $("#viewer-status").textContent = "a repor o contorno…";
-      const detail = await api.resetBuildingGeometry(state.selected);
-      if (token !== state.token) return;
-      await afterFootprintChange(detail, token);
-      await reloadEditedMap();
-      startBuildingEdit(); // o histórico de edição do contorno antigo deixa de servir
-      toast("Contorno reposto.", 1500);
-    } else if (state.wall) {
-      state.wall = await api.resetWallGeometry(state.wall.key);
-      map.editWall(state.wall);
-      renderWallDetail();
-      await loadWalls();
-    } else if (state.landuse) {
-      state.landuse = await api.resetLanduse(state.landuse.id);
-      map.editLanduse(state.landuse);
-      renderLanduseDetail();
-      await reloadEditedMap();
-    }
-  } catch (e) {
-    toast(`Erro ao repor: ${e.message}`);
-  }
+function resetGeometry() {
+  // Na fila, depois das edições ainda por gravar (senão uma delas desfazia a reposição).
+  const sel = state.selected && state.detail?.geometry ? state.selected : null;
+  const wall = sel ? null : state.wall?.key ?? null;
+  const landuse = sel || wall ? null : state.landuse ?? null;
+  const key = sel ?? wall ?? landuse?.key;
+  if (!key) return;
+  editSeq++; // as recargas e respostas anteriores já não servem
+  latestEdit.set(key, editSeq);
+  if (sel) $("#viewer-status").textContent = "a repor o contorno…";
+  enqueueSave({
+    kind: "reset",
+    label: "Reposição",
+    run: async () => {
+      if (sel) {
+        const token = state.token;
+        const detail = await api.resetBuildingGeometry(sel);
+        for (const l of layersFor(sel)) reloadLayers.add(l);
+        if (token !== state.token) return;
+        await afterFootprintChange(detail, token);
+        startBuildingEdit(); // o histórico de edição do contorno antigo deixa de servir
+        toast("Contorno reposto.", 1500);
+      } else if (wall) {
+        const d = await api.resetWallGeometry(wall);
+        reloadLayers.add("walls");
+        if (state.wall?.key !== wall) return;
+        state.wall = d;
+        map.editWall(d);
+        renderWallDetail();
+      } else {
+        const d = await api.resetLanduse(landuse.id);
+        for (const l of layersFor(landuse.key)) reloadLayers.add(l);
+        if (state.landuse?.key !== d.key) return;
+        state.landuse = d;
+        map.editLanduse(d);
+        renderLanduseDetail();
+      }
+    },
+  });
 }
 
 async function reviewWall(status) {

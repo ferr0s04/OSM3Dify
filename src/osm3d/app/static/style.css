@@ -112,6 +112,7 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-radius: 3
 #map { position: absolute; inset: 0; }
 .map-controls { position: absolute; top: 8px; left: 8px; display: flex; gap: 8px; background: var(--panel); padding: 6px 8px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,.15); }
 .map-controls select { border: 1px solid var(--border); border-radius: 4px; font: inherit; padding: 2px 4px; }
+.save-status { position: absolute; bottom: 28px; right: 10px; background: var(--panel); color: var(--muted); padding: 4px 10px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,.15); font-size: 12px; pointer-events: none; }
 .legend { position: absolute; bottom: 28px; left: 10px; background: var(--panel); padding: 6px 10px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,.15); font-size: 12px; }
 .legend div { display: flex; align-items: center; gap: 6px; }
 .legend .legend-body { display: block; max-height: 45vh; overflow-y: auto; margin-top: 4px; }

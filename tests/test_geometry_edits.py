@@ -335,3 +335,49 @@ def test_connected_nodes_of_new_buildings(tmp_path: Path) -> None:
         osm_type="new", osm_id=2, osm_version=0, footprint=Polygon([(0, 0), (5, 0), (5, 5)])
     )
     assert _connected_nodes(cfg, [far], path) == {}
+
+
+def test_review_and_wall_edits_reuse_cached_topology(tmp_path: Path) -> None:
+    """Aceitar um edifício novo (só muda a decisão) e editar um muro não refazem a
+    topologia nem o contexto OSM editado; o resultado é o mesmo que refazê-los."""
+    from osm3d.app.service import Overrides
+    from osm3d.geometry_edits import GeometryEdits
+    from osm3d.pipeline import context_path
+    from tests.test_app import _app_with_candidate
+
+    app = _app_with_candidate(tmp_path)
+    svc = app.state.ctx.svc
+    context_path(svc.cfg).write_text(json.dumps(_context()), encoding="utf-8")
+    key = "new/123456"
+
+    def full() -> dict:  # type: ignore[type-arg]
+        svc._topology_changed()
+        return svc.building(key).model_dump()
+
+    svc.building(key)
+    topo = svc._topo
+    svc.save_review(key, "accepted", "ok", Overrides(), None)
+    assert svc._topo is topo  # não foi refeita
+    fast = svc.building(key).model_dump()
+    assert fast["review_status"] == "accepted" and fast == full()
+    # Rejeitar tira-o da topologia: aí refaz-se.
+    topo = svc._topo
+    svc.save_review(key, "rejected", None, Overrides(), None)
+    assert svc._topo is not topo
+    svc.reset_review(key)
+    assert svc.building(key).review_status == "pending"
+
+    # Um landuse editado gera uma versão do contexto; editar só um muro não gera outra.
+    d = svc.landuse_detail(300)
+    nodes = d["nodes"]
+    lon, lat = TO_WGS.transform(50, -2)
+    nodes[2] = [3, lon, lat]
+    svc.save_landuse(300, nodes)
+    path = svc._effective_context()[1]
+    walls = GeometryEdits(**{**svc.edits.__dict__, "walls": {"wall/1": [(0.0, 0.0), (1.0, 1.0)]}})
+    assert walls.signature() != svc.edits.signature()
+    assert walls.signature(walls=False, buildings=False) == svc.edits.signature(
+        walls=False, buildings=False
+    )
+    svc._save_edits(walls)
+    assert svc._effective_context()[1] == path
