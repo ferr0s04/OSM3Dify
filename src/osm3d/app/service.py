@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import math
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any, Literal
@@ -154,6 +155,26 @@ class NotFound(KeyError):
     pass
 
 
+# Propriedades de cada edifício no GeoJSON do mapa (cores, filtros, legenda).
+_FEATURE_PROPS = (
+    "key",
+    "status",
+    "shape",
+    "shape_conf",
+    "height",
+    "needs_review",
+    "match",
+    "roof_colour",
+    "building_colour",
+    "osm3d",
+    "change",
+    "archived",
+    "candidate",
+    "candidate_source",
+    "building_type",
+)
+
+
 class ReviewService:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -184,6 +205,12 @@ class ReviewService:
         self._env: Surroundings | None = None
         self._env_mtime: tuple[str, float] | None = None
         self._topo: dict[str, Building] | None = None
+        # Para refazer a topologia só à volta de um edifício revisto: os edifícios novos
+        # (ordem de ``base``) e uma árvore dos contornos (ver _review_changed).
+        self._topo_keys: list[str] = []
+        self._topo_pos: dict[str, int] = {}
+        self._topo_tree: shapely.STRtree | None = None
+        self._topo_lock = threading.RLock()
         self._ctx_geojson: tuple[tuple[str, float], dict[str, Any]] | None = None
         self._walls: tuple[tuple[Any, ...], list[WallProposal]] | None = None
         # Edições de geometria no mapa (landuse do OSM e muros) e o contexto OSM original
@@ -193,6 +220,9 @@ class ReviewService:
         # Contornos editados no mapa: ``base`` passa a ter, para esses edifícios, a
         # reconstrução reajustada ao contorno novo; ``original`` é a do pipeline.
         self.original: dict[str, Building] = dict(self.base)
+        # id de cada edifício no GeoJSON do mapa (fixo: as chaves de ``base`` não mudam),
+        # para o cliente atualizar só os que mudam.
+        self._feature_ids: dict[str, int] = {k: i for i, k in enumerate(self.base)}
         self._edited: set[str] = set()
         self.refitter = FootprintRefitter(
             cfg,
@@ -241,24 +271,68 @@ class ReviewService:
 
         Os rejeitados e os arquivados não entram (não vão ser exportados).
         """
-        env = self._surroundings()
-        if self._topo is None:
-            active = [
-                b
-                for k, base in self.base.items()
-                if base.osm_type == "new"
-                and not (b := apply_review(base, self.reviews.get(k))).review_archived
-                and b.review_status != "rejected"
-            ]
-            if env is not None:
-                rules = TopologyRules.from_config(self.cfg.topology)
-                active = resolve_topology(active, env, rules)[0]
-            self._topo = {b.key: b for b in active}
-            self._wgs84 = {k: v for k, v in self._wgs84.items() if not k.startswith("new/")}
-        return self._topo
+        with self._topo_lock:
+            env = self._surroundings()
+            if self._topo is None:
+                keys = [k for k, b in self.base.items() if b.osm_type == "new"]
+                self._topo_keys = keys
+                self._topo_pos = {k: i for i, k in enumerate(keys)}
+                self._topo_tree = shapely.STRtree([self.base[k].footprint for k in keys])
+                self._topo = self._resolve(keys, env)
+                self._wgs84 = {k: v for k, v in self._wgs84.items() if not k.startswith("new/")}
+            return self._topo
+
+    def _resolve(self, keys: list[str], env: Surroundings | None) -> dict[str, Building]:
+        """Topologia dos edifícios novos ``keys`` (na ordem de ``base``) que estão ativos."""
+        active = [
+            b
+            for k in keys
+            if not (b := apply_review(self.base[k], self.reviews.get(k))).review_archived
+            and b.review_status != "rejected"
+        ]
+        if env is not None:
+            rules = TopologyRules.from_config(self.cfg.topology)
+            active = resolve_topology(active, env, rules)[0]
+        return {b.key: b for b in active}
 
     def _topology_changed(self) -> None:
-        self._topo = None
+        with self._topo_lock:
+            self._topo = None
+
+    def _review_changed(self, key: str) -> list[str] | None:
+        """A revisão de ``key`` mudou: refaz a topologia só do grupo de edifícios novos
+        ligados a ele por sobreposições (os outros não mudam: ver ``resolve_topology``).
+
+        Devolve as chaves cujo edifício pode ter mudado, ou None se a topologia de toda a
+        área vai ser refeita (o contexto OSM mudou entretanto).
+        """
+        self._scene_cache.pop(key, None)
+        if self.base[key].osm_type != "new":
+            return [key]
+        with self._topo_lock:
+            env = self._surroundings()
+            if self._topo is None or self._topo_tree is None:
+                return None
+            # Grupo: o fecho por "intersecta" dos contornos de base (contém os recortados,
+            # que só encolhem), com os rejeitados também (ligam vizinhos de ambos os lados).
+            group = {self._topo_pos[key]}
+            frontier = [key]
+            while frontier:
+                hits = self._topo_tree.query(
+                    [self.base[k].footprint for k in frontier], predicate="intersects"
+                )[1]
+                fresh = set(hits.tolist()) - group
+                group |= fresh
+                frontier = [self._topo_keys[i] for i in fresh]
+            keys = [self._topo_keys[i] for i in sorted(group)]
+            redo = set(keys)
+            topo = {k: b for k, b in self._topo.items() if k not in redo}
+            topo |= self._resolve(keys, env)
+            self._topo = topo  # troca atómica: os pedidos em curso veem o antigo ou o novo
+            for k in keys:
+                self._wgs84.pop(k, None)
+                self._scene_cache.pop(k, None)
+            return keys
 
     def osm_context(self) -> dict[str, Any]:
         """Landuse, vias, muros/vedações e edifícios do OSM à volta da área (GeoJSON), com as
@@ -711,12 +785,23 @@ class ReviewService:
         return {"date": ctx.get("date"), "n": len(ctx["features"])}
 
     def all_buildings(self) -> list[Building]:
-        return [self.building(k) for k in self.base]
+        # A topologia uma só vez (não por edifício, como em ``building``).
+        topo = self._topology()
+        return [
+            hit
+            if b.osm_type == "new" and (hit := topo.get(k)) is not None
+            else apply_review(b, self.reviews.get(k))
+            for k, b in self.base.items()
+        ]
 
-    def _geom_wgs84(self, key: str) -> Any:
+    def _geom_wgs84(self, key: str, b: Building | None = None) -> Any:
+        """Contorno em WGS84; ``b``: o edifício de ``key`` já com a revisão, se à mão."""
         if key not in self._wgs84:
             # Edifícios novos: o contorno que vai ser exportado (recortes incluídos).
-            g = (self.building(key) if key.startswith("new/") else self.base[key]).footprint
+            if key.startswith("new/"):
+                g = (b if b is not None else self.building(key)).footprint
+            else:
+                g = self.base[key].footprint
             self._wgs84[key] = shapely.transform(
                 g, lambda c: np.column_stack(self._to_wgs84.transform(c[:, 0], c[:, 1]))
             )
@@ -735,7 +820,7 @@ class ReviewService:
             else "unknown"
         )
         osm_shape = normalize_osm_shape(b.existing_tags.get("roof:shape"))
-        c = self._geom_wgs84(b.key).centroid
+        c = self._geom_wgs84(b.key, b).centroid
         review = self.reviews.get(b.key)
         colours = self._colours(b)
         change = self._change(b)
@@ -773,38 +858,31 @@ class ReviewService:
         return [self._row(b) for b in self.all_buildings()]
 
     def geojson(self) -> dict[str, Any]:
-        feats: list[dict[str, Any]] = []
-        for b in self.all_buildings():
-            row = self._row(b)
-            feats.append(
-                {
-                    "type": "Feature",
-                    "id": len(feats),
-                    "geometry": mapping(self._geom_wgs84(b.key)),
-                    "properties": {
-                        k: row[k]
-                        for k in (
-                            "key",
-                            "status",
-                            "shape",
-                            "shape_conf",
-                            "height",
-                            "needs_review",
-                            "match",
-                            "roof_colour",
-                            "building_colour",
-                            "osm3d",
-                            "change",
-                            "archived",
-                            "candidate",
-                            "candidate_source",
-                            "building_type",
-                        )
-                    }
-                    | {"flags": ",".join(row["flags"])},
-                }
-            )
-        return {"type": "FeatureCollection", "features": feats}
+        return {
+            "type": "FeatureCollection",
+            "features": [self._feature(b) for b in self.all_buildings()],
+        }
+
+    def _feature(self, b: Building) -> dict[str, Any]:
+        """Edifício no GeoJSON do mapa (id fixo por chave)."""
+        row = self._row(b)
+        props = {k: row[k] for k in _FEATURE_PROPS} | {"flags": ",".join(row["flags"])}
+        return {
+            "type": "Feature",
+            "id": self._feature_ids[b.key],
+            "geometry": mapping(self._geom_wgs84(b.key, b)),
+            "properties": props,
+        }
+
+    def _after_review(self, key: str) -> dict[str, Any]:
+        """Detalhe de ``key`` depois de a revisão mudar, com os edifícios do mapa que
+        mudaram com ela (``map_features``; None: recarregar o mapa todo)."""
+        changed = self._review_changed(key)
+        out = self.detail(key)
+        out["map_features"] = (
+            None if changed is None else [self._feature(self.building(k)) for k in changed]
+        )
+        return out
 
     # ----------------------------------------------------------------- detalhe
 
@@ -1365,9 +1443,7 @@ class ReviewService:
         )
         self.store.save(review)
         self.reviews[key] = review
-        self._scene_cache.pop(key, None)
-        self._topology_changed()
-        return self.detail(key)
+        return self._after_review(key)
 
     def archive(self, status: ReviewStatus, archived: bool = True) -> dict[str, Any]:
         """(Des)arquiva todos os aceites ou todos os rejeitados."""
@@ -1383,9 +1459,7 @@ class ReviewService:
             raise NotFound(key)
         self.store.delete(key)
         self.reviews.pop(key, None)
-        self._scene_cache.pop(key, None)
-        self._topology_changed()
-        return self.detail(key)
+        return self._after_review(key)
 
     # ----------------------------------------------------------------- resumo
 

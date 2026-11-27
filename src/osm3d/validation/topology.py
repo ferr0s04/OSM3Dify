@@ -433,7 +433,11 @@ def _fit_to_osm_buildings(s: _State, env: Surroundings, rules: TopologyRules) ->
 
 def _fit_between_new(states: list[_State], rules: TopologyRules) -> None:
     tree = shapely.STRtree([s.fp for s in states])
-    for i, j in zip(*tree.query([s.fp for s in states], predicate="intersects"), strict=True):
+    pairs = tree.query([s.fp for s in states], predicate="intersects")
+    # Ordem fixa (i, j): o resultado não depende da forma da árvore, e recalcular só um
+    # grupo de edifícios sobrepostos (na mesma ordem relativa) dá o mesmo que o todo.
+    pairs = pairs[:, np.lexsort((pairs[1], pairs[0]))]
+    for i, j in zip(*pairs.tolist(), strict=True):
         if i >= j:
             continue
         a, b = states[i], states[j]

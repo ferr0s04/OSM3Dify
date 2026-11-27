@@ -625,6 +625,7 @@ export class BuildingMap {
 
   async setData(geojson) {
     await this.ready;
+    this.features = new Map(geojson.features.map((f) => [f.properties.key, f]));
     this.keyToId = new Map(geojson.features.map((f) => [f.properties.key, f.id]));
     this.index.buildings = new Map(geojson.features.map((f) => [f.properties.key, f.geometry]));
     const src = this.map.getSource("buildings");
@@ -705,8 +706,31 @@ export class BuildingMap {
     if (this.mode === "real") this.renderLegend();
   }
 
+  patchFeatures(features) {
+    // Só os edifícios que mudaram (p.ex. numa revisão), sem voltar a carregar e indexar
+    // o GeoJSON todo (o estado "selected" de cada um fica, é por id).
+    const src = this.map.getSource("buildings");
+    if (!src || !this.features || !features.length) return;
+    for (const f of features) {
+      this.features.set(f.properties.key, f);
+      this.keyToId.set(f.properties.key, f.id);
+      this.index.buildings.set(f.properties.key, f.geometry);
+    }
+    if (typeof src.updateData === "function") src.updateData({ remove: features.map((f) => f.id), add: features });
+    else src.setData({ type: "FeatureCollection", features: [...this.features.values()] });
+  }
+
+  setFeatureProps(key, props) {
+    // Muda propriedades de um edifício já no mapa (p.ex. o estado, antes da resposta).
+    const f = this.features?.get(key);
+    if (f) this.patchFeatures([{ ...f, properties: { ...f.properties, ...props } }]);
+  }
+
   setVisibleKeys(keys) {
-    // Filtros da barra: mostram/escondem edifícios no mapa (2D e 3D).
+    // Filtros da barra: mostram/escondem edifícios no mapa (2D e 3D). O filtro do mapa
+    // obriga a refazer as quadrículas: só quando o conjunto muda.
+    const same = this.visibleKeys && keys && this.visibleKeys.size === keys.size && [...keys].every((k) => this.visibleKeys.has(k));
+    if (same) return;
     this.visibleKeys = keys;
     this.applyFilter();
     this.roofs?.setVisible(keys);

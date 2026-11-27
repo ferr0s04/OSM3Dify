@@ -238,6 +238,46 @@ function move(delta) {
 
 // ------------------------------------------------------------------ seleção
 
+// Detalhe, malha e pontos pedidos antes de serem precisos: o edifício para onde se
+// avança ao aceitar/rejeitar o atual já está carregado quando se carrega na tecla. Cada
+// entrada serve uma vez (ao abrir, sai); as que uma revisão ou edição pode ter mudado
+// saem antes (forgetPrefetched).
+const prefetched = new Map();
+const PREFETCH_MAX = 4;
+
+function loadBuilding(key) {
+  const hit = prefetched.get(key);
+  if (hit) {
+    prefetched.delete(key);
+    return hit;
+  }
+  return requestBuilding(key);
+}
+
+function requestBuilding(key) {
+  const e = { detail: api.detail(key), mesh: api.mesh(key), points: api.points(key) };
+  for (const p of Object.values(e)) p.catch(() => {}); // falha tratada por quem o usar
+  return e;
+}
+
+function prefetch(key) {
+  if (!key || prefetched.has(key) || key === state.selected) return;
+  prefetched.set(key, requestBuilding(key));
+  while (prefetched.size > PREFETCH_MAX) prefetched.delete(prefetched.keys().next().value);
+}
+
+function forgetPrefetched(keys = null) {
+  if (keys === null) prefetched.clear();
+  else for (const k of keys) prefetched.delete(k);
+}
+
+function prefetchNext(key, token) {
+  // O edifício para onde review() avança a partir deste (ver nearestRow).
+  if (token !== state.token || !state.filtered.some((r) => r.key === key)) return;
+  const row = state.rows.find((r) => r.key === key);
+  prefetch(nearestRow(key, row)?.key);
+}
+
 async function select(key) {
   if (!key) return;
   clearMulti();
@@ -250,7 +290,8 @@ async function select(key) {
   $("#viewer-status").textContent = "a carregar…";
   viewer.clearAll();
   try {
-    const [detail, mesh] = await Promise.all([api.detail(key), api.mesh(key)]);
+    const load = loadBuilding(key);
+    const [detail, mesh] = await Promise.all([load.detail, load.mesh]);
     if (token !== state.token) return;
     state.detail = detail;
     state.touched = new Set(OVERRIDE_FIELDS.filter((f) => detail.overrides[f] !== null));
@@ -262,10 +303,11 @@ async function select(key) {
     viewer.setModel(mesh);
     viewer.frame(mesh);
     $("#viewer-status").textContent = "a carregar pontos LiDAR… (a 1.ª vez por quadrícula demora)";
-    const pts = await api.points(key);
+    const pts = await load.points;
     if (token !== state.token) return;
     viewer.setPoints(pts);
     $("#viewer-status").textContent = `${pts.count.toLocaleString("pt-PT")} pontos · rmse ${fmt(detail.effective?.rmse_m, " m")}`;
+    prefetchNext(key, token); // depois dos pontos deste, para não lhes tirar o servidor
   } catch (e) {
     if (token === state.token) $("#viewer-status").textContent = `erro: ${e.message}`;
   }
@@ -722,45 +764,136 @@ function patchRow(detail) {
   if (i >= 0) state.rows[i] = { ...state.rows[i], ...Object.fromEntries(Object.keys(state.rows[i]).map((k) => [k, detail[k]])) };
 }
 
-async function afterReviewChange(detail, advance) {
+// Gravações das revisões, pela ordem das teclas. A interface não espera por elas: a
+// lista, as contagens, o mapa e o edifício seguinte mudam logo (ver review).
+let reviewQueue = Promise.resolve();
+let reviewsInFlight = 0;
+window.addEventListener("beforeunload", (e) => {
+  if (reviewsInFlight) e.preventDefault(); // revisões ainda a gravar
+});
+
+function setRowStatus(key, status) {
+  const row = state.rows.find((r) => r.key === key);
+  if (row) row.status = status;
+  map.setFeatureProps(key, { status });
+}
+
+function patchRowFromFeature(f) {
+  // Vizinho cuja topologia mudou com a revisão (recorte, sinalizações): a linha da lista
+  // fica com o que o mapa mostra.
+  const row = state.rows.find((r) => r.key === f.properties.key);
+  if (!row) return;
+  for (const [k, v] of Object.entries(f.properties)) {
+    if (k in row) row[k] = k === "flags" ? (v ? v.split(",") : []) : v;
+  }
+}
+
+function applyReviewResult(detail) {
+  // Resposta do servidor (pela ordem da fila): o estado oficial deste edifício e dos
+  // edifícios novos sobrepostos a ele, cuja topologia pode ter mudado.
   patchRow(detail);
+  const feats = detail.map_features;
+  if (feats) {
+    for (const f of feats) patchRowFromFeature(f);
+    map.patchFeatures(feats.filter((f) => f.properties.candidate));
+    forgetPrefetched(feats.map((f) => f.properties.key));
+  } else {
+    // A topologia da área toda vai ser refeita: o mapa recarrega-se em segundo plano.
+    forgetPrefetched();
+    api.geojson().then((gj) => map.setData(municipalGeojson(gj))).catch(() => {});
+  }
   renderProgress();
-  const current = state.selected;
-  const idx = state.filtered.findIndex((r) => r.key === current);
-  map.setData(municipalGeojson(await api.geojson()));
   applyFilters();
-  // Atualiza os telhados 3D deste edifício no mapa (forma/cores podem ter mudado).
-  if (map.roofs) map.updateBuilding(await api.sceneOne(current));
-  // Edifício do OSM (aberto no mapa, fora da lista): fica selecionado.
-  if (advance && idx >= 0) {
-    // Avança para o próximo da lista filtrada (o atual pode ter saído do filtro).
-    const next = state.filtered[Math.min(idx, state.filtered.length - 1)];
-    const target = next && next.key !== current ? next : state.filtered[idx + 1];
-    if (target) return select(target.key);
-  }
-  select(current);
+  // Telhados 3D deste edifício no mapa (forma/cores podem ter mudado).
+  if (map.roofs) api.sceneOne(detail.key).then((b) => map.updateBuilding(b)).catch(() => {});
+  // O edifício aberto agora (o seguinte) é um dos que mudaram: atualizar o detalhe.
+  const sel = state.selected;
+  if (sel && sel !== detail.key && (!feats || feats.some((f) => f.properties.key === sel))) refreshSelected();
 }
 
-async function review(status) {
-  if (!state.detail) return;
-  const note = document.querySelector('[name="note"]')?.value ?? null;
+async function refreshSelected() {
+  // Detalhe do edifício aberto, sem o fechar nem perder as correções por guardar; a
+  // malha só se não há correções (com elas, a pré-visualização é que manda).
+  const key = state.selected;
+  const token = state.token;
   try {
-    const parts = state.parts.active
-      ? { layout: state.parts.layout, overrides: state.parts.overrides.map((o) => o ?? {}) }
-      : null;
-    const detail = await api.saveReview(state.selected, status, note, overrides(), parts);
-    toast(`${detail.key}: ${status === "accepted" ? "aceite" : "rejeitado"}`, 1500);
-    await afterReviewChange(detail, true);
-  } catch (e) {
-    toast(`Erro ao guardar: ${e.message}`);
-  }
+    const detail = await api.detail(key);
+    if (token !== state.token || JSON.stringify(detail) === JSON.stringify(state.detail)) return;
+    state.detail = detail;
+    rerenderDetail();
+    if (state.touched.size) return schedulePreview();
+    const mesh = await api.mesh(key);
+    if (token === state.token) viewer.setModel(mesh);
+  } catch { /* fica o que está */ }
 }
 
-async function resetReview() {
-  if (!state.detail) return;
-  const detail = await api.resetReview(state.selected);
-  toast(`${detail.key}: revisão reposta`, 1500);
-  await afterReviewChange(detail, false);
+function nearestRow(key, from) {
+  // O mais perto de `from` (lon/lat) na lista filtrada, sem `key`; os por rever antes dos
+  // já revistos (com o filtro "todos", o vizinho acabado de aceitar não é o seguinte).
+  if (from?.lon == null || from?.lat == null) return null;
+  const k = Math.cos((from.lat * Math.PI) / 180);
+  let best = null;
+  for (const r of state.filtered) {
+    if (r.key === key) continue;
+    const d = ((r.lon - from.lon) * k) ** 2 + (r.lat - from.lat) ** 2;
+    const rank = r.status === "pending" && !r.archived ? 0 : 1;
+    if (!best || rank < best.rank || (rank === best.rank && d < best.d)) best = { r, d, rank };
+  }
+  return best?.r ?? null;
+}
+
+function review(status) {
+  // status null: repor (volta a "por rever" e fica no mesmo edifício).
+  const d = state.detail;
+  if (!d || state.selected !== d.key) return;
+  const key = d.key;
+  // O formulário é lido já: ao avançar, é substituído pelo do edifício seguinte.
+  const note = document.querySelector('[name="note"]')?.value ?? null;
+  const ov = overrides();
+  const parts = state.parts.active
+    ? { layout: state.parts.layout, overrides: state.parts.overrides.map((o) => o ?? {}) }
+    : null;
+  const row = state.rows.find((r) => r.key === key);
+  const before = row?.status ?? d.status;
+  const inList = state.filtered.some((r) => r.key === key);
+  // Avança para o edifício da lista filtrada mais perto deste (por rever primeiro), e não
+  // para o seguinte na ordem da lista, que pode estar do outro lado da área. Edifício do
+  // OSM (aberto no mapa, fora da lista) ou repor: fica neste.
+  const target = status && inList ? nearestRow(key, row ?? d) : null;
+
+  // 1. Gravar, em fila. Com a fila vazia, o pedido sai já (antes dos do edifício
+  // seguinte, para o servidor já ter a revisão). Se falhar, lista e mapa voltam atrás.
+  const save = () => (status ? api.saveReview(key, status, note, ov, parts) : api.resetReview(key));
+  const sent = reviewsInFlight ? reviewQueue.then(save) : save();
+  reviewsInFlight++;
+  reviewQueue = sent
+    .then(
+      (detail) => {
+        applyReviewResult(detail);
+        // Ficou neste edifício: volta a abri-lo com o que foi gravado.
+        if (!target && state.selected === key) select(key);
+      },
+      (e) => {
+        setRowStatus(key, before);
+        renderProgress();
+        applyFilters();
+        toast(`${key}: não foi gravado (${e.message})`, 7000);
+      },
+    )
+    .catch((e) => console.error(e))
+    .finally(() => reviewsInFlight--);
+
+  // 2. Já: lista, contagens, mapa e o edifício seguinte (normalmente já pré-carregado).
+  setRowStatus(key, status ?? "pending");
+  forgetPrefetched([key]);
+  renderProgress();
+  applyFilters();
+  if (target) select(target.key);
+  toast(`${key}: ${status === "accepted" ? "aceite" : status === "rejected" ? "rejeitado" : "revisão reposta"}`, 1500);
+}
+
+function resetReview() {
+  review(null);
 }
 
 // ------------------------------------------------------------- arranque
@@ -835,6 +968,7 @@ function wire() {
     e.target.disabled = true;
     try {
       await editQueue; // as edições do mapa ainda a gravar entram nesta exportação
+      await reviewQueue; // e as revisões
       const r = await api.export();
       const topo = r.topology ? ` · Topologia: ${r.topology} (pormenor no CSV)` : "";
       toast(`${r.exported} edifícios exportados (${r.conflicts} com conflitos de tags) → ${r.path}${topo}`, 14000);
@@ -1443,7 +1577,9 @@ async function saveLinked(others) {
 async function reloadEditedMap() {
   // O contexto OSM (landuse, edifícios do OSM), os municipais e os muros com as edições;
   // depois, as ligações do elemento em edição aos vizinhos.
+  forgetPrefetched();
   const [gj] = await Promise.all([api.geojson(), loadOsmContext(), loadWalls()]);
+  forgetPrefetched(); // e o que se pré-carregou entretanto
   await map.setData(municipalGeojson(gj));
   map.editor.refreshLinks();
 }
@@ -1463,7 +1599,8 @@ async function saveBuildingGeometry(key, nodes) {
 
 async function afterFootprintChange(detail, token) {
   // Contorno novo: o detalhe (tags, sinalizações), o modelo e os pontos mudam (o mapa
-  // recarrega-o quem chama).
+  // recarrega-o quem chama). A topologia da área é refeita: o pré-carregado pode ter mudado.
+  forgetPrefetched();
   state.detail = detail;
   rerenderDetail();
   patchRow(detail);
@@ -1575,6 +1712,7 @@ async function refreshOsmContext(e) {
 }
 
 async function reload() {
+  forgetPrefetched();
   const [rows, geojson] = await Promise.all([api.buildings(), api.geojson()]);
   setRows(rows);
   renderProgress();
