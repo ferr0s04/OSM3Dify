@@ -381,3 +381,40 @@ def test_review_and_wall_edits_reuse_cached_topology(tmp_path: Path) -> None:
     )
     svc._save_edits(walls)
     assert svc._effective_context()[1] == path
+
+
+def test_osm_mode_previews_the_adjusted_landuse(tmp_path: Path) -> None:
+    """No modo "ajustar o OSM", o detalhe e a pré-visualização trazem o landuse como fica
+    na exportação (o mapa mostra-o logo); noutro modo, nada."""
+    from osm3d.app.service import Overrides
+    from osm3d.pipeline import context_path
+    from tests.test_app import _app_with_candidate
+
+    app = _app_with_candidate(tmp_path)
+    svc = app.state.ctx.svc
+    key = "new/123456"
+    to_wgs = Transformer.from_crs(svc.cfg.processing_crs, "EPSG:4326", always_xy=True)
+    minx, miny, maxx, maxy = svc.base[key].footprint.bounds
+    # Residencial que contém o edifício todo menos uma lasca de 0,4 m a este.
+    ring = [(minx - 20, miny - 20), (maxx - 0.4, miny - 20), (maxx - 0.4, maxy + 20),
+            (minx - 20, maxy + 20), (minx - 20, miny - 20)]  # fmt: skip
+    refs = [1, 2, 3, 4, 1]
+    geom = [dict(zip(("lon", "lat"), to_wgs.transform(x, y), strict=True)) for x, y in ring]
+    ctx = {"elements": [{"type": "way", "id": 500, "nodes": refs, "geometry": geom,
+                         "tags": {"landuse": "residential"}}]}  # fmt: skip
+    context_path(svc.cfg).write_text(json.dumps(ctx), encoding="utf-8")
+
+    adjs = svc.detail(key)["osm_adjustments"]
+    assert [a["id"] for a in adjs] == ["way/500"]
+    assert adjs[0]["geometry"]["type"] == "Polygon" and "contornar" in adjs[0]["description"]
+    # O landuse ajustado passa a conter o edifício.
+    xs, ys = to_wgs.transform(maxx, (miny + maxy) / 2)
+    from shapely.geometry import Point, shape
+
+    assert shape(adjs[0]["geometry"]).contains(Point(xs, ys))
+
+    assert svc.preview(key, Overrides(topology="keep"))["osm_adjustments"] == []
+    assert svc.preview(key, Overrides(topology="osm"))["osm_adjustments"][0]["id"] == "way/500"
+    # Um edifício do OSM não tem este modo.
+    osm_key = next(k for k in svc.base if not k.startswith("new/"))
+    assert svc.detail(osm_key)["osm_adjustments"] is None

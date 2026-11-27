@@ -16,10 +16,12 @@ import atexit
 import logging
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from concurrent.futures import Executor
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 import shapely
 from shapely.geometry import Polygon, box
 from shapely.geometry.base import BaseGeometry
@@ -32,8 +34,8 @@ from osm3d.domain.models import (
     GroundChoice,
     QAFlag,
     Roof,
+    RoofModel,
     RoofShape,
-    Source,
 )
 from osm3d.geospatial.point_clouds import PointSet, assign_points, read_points
 from osm3d.geospatial.raster import DtmMosaic, sample_ground_elevation, wall_foot_profile
@@ -49,8 +51,10 @@ from osm3d.reconstruction.roof_fitting import (
     RoofFit,
     fit_main_volume,
     fit_roof,
+    fit_surface,
     group_beats_individuals,
 )
+from osm3d.reconstruction.roof_models import model_surface_z
 
 log = logging.getLogger(__name__)
 
@@ -249,6 +253,39 @@ def attached_clusters(footprints: list[BaseGeometry], gap_m: float = 0.3) -> lis
     return [g for g in groups.values() if len(g) >= 2]
 
 
+# Tarefa de um grupo encostado (passa para os processos do pool): planta conjunta e
+# pontos (referencial do LiDAR), chão mais baixo, plantas e chão de cada edifício, os
+# ajustes individuais, os parâmetros e a confiança mínima da forma.
+_SharedTask = tuple[
+    Polygon, PointSet, float, list[BaseGeometry], list[float], list[FitResult], FitParams, float
+]
+# Resultado: telhado do grupo (JSON) e, por edifício, o seu telhado e altura (JSON) ou None.
+_SharedDone = tuple[str, list[tuple[str, str] | None]] | None
+
+
+def _shared_roof_task(task: _SharedTask) -> _SharedDone:
+    union, pts, ground, footprints, grounds, bests, params, min_conf = task
+    group_fit = fit_roof(union, pts, ground, params)
+    if (
+        group_fit.best is None
+        or group_fit.roof.shape.value is RoofShape.UNKNOWN
+        or group_fit.roof.shape.confidence < min_conf
+        or not group_beats_individuals(group_fit.best, bests)
+    ):
+        return None
+    members: list[tuple[str, str] | None] = []
+    for fp, g in zip(footprints, grounds, strict=True):
+        # As tags de cada edifício descrevem o telhado sobre a planta dele: o da ponta de
+        # um hipped em banda é side_hipped, os do meio gabled (ver member_roof).
+        own = member_roof(group_fit.roof, union, fp, g, params)
+        if own is None:
+            members.append(None)  # nenhuma forma o reproduz: fica com o ajuste próprio
+            continue
+        height = own.height.model_copy(update={"confidence": group_fit.height.confidence})
+        members.append((own.roof.model_dump_json(), height.model_dump_json()))
+    return group_fit.roof.model_dump_json(), members
+
+
 def apply_shared_roofs(
     results: list[Building],
     fits: list[RoofFit | None],
@@ -256,16 +293,19 @@ def apply_shared_roofs(
     offset: tuple[float, float],
     cfg: Config,
     max_group: int = 12,
+    pool: Executor | None = None,
 ) -> int:
     """Telhados contínuos sobre edifícios encostados (casas geminadas/em banda).
 
     Para cada grupo de edifícios encostados com planta conjunta retangular, ajusta um
     único telhado ao conjunto. Se esse telhado explicar os pontos melhor do que os
-    telhados individuais (mesmo critério penalizado), cada edifício recebe a forma,
-    altura de telhado e orientação do conjunto. Devolve o n.º de edifícios alterados.
+    telhados individuais (mesmo critério penalizado), cada edifício recebe o telhado do
+    conjunto visto sobre a sua planta (ver ``member_roof``). Os grupos são independentes:
+    com ``pool``, ajustam-se em paralelo. Devolve o n.º de edifícios alterados.
     """
-    changed = 0
     params = fit_params(cfg)
+    groups: list[list[int]] = []
+    tasks: list[_SharedTask] = []
     for cluster in attached_clusters([b.footprint for b in results]):
         members = [
             i
@@ -285,38 +325,279 @@ def apply_shared_roofs(
             continue
         if union.area / union.minimum_rotated_rectangle.area < MIN_RECTANGULARITY:
             continue
-
         grounds = [results[i].ground_elevation_m for i in members]
-        pts = PointSet.concat(point_sets[i] for i in members)
-        group_fit = fit_roof(
-            _shift(union, offset), pts, min(g for g in grounds if g is not None), params
+        assert all(g is not None for g in grounds)
+        groups.append(members)
+        tasks.append(
+            (
+                _shift(union, offset),
+                PointSet.concat(point_sets[i] for i in members),
+                min(g for g in grounds if g is not None),
+                [_shift(results[i].footprint, offset) for i in members],
+                [g for g in grounds if g is not None],
+                [fits[i].best for i in members],  # type: ignore[union-attr,misc]
+                params,
+                cfg.roofs.min_shape_confidence,
+            )
         )
-        if (
-            group_fit.best is None
-            or group_fit.roof.shape.value is RoofShape.UNKNOWN
-            or group_fit.roof.shape.confidence < cfg.roofs.min_shape_confidence
-            or not group_beats_individuals(group_fit.best, [fits[i].best for i in members])  # type: ignore[union-attr,misc]
-        ):
+    changed = 0
+    for members, done in zip(groups, ordered_map(pool, _shared_roof_task, tasks), strict=True):
+        if done is None:
             continue
-
         group_keys = ",".join(results[i].key for i in members)
-        for i in members:
+        for i, own in zip(members, done[1], strict=True):
+            if own is None:
+                continue
             b = results[i]
-            assert b.ground_elevation_m is not None
-            height = Estimate[float](
-                value=group_fit.best.top_z - b.ground_elevation_m,
-                confidence=group_fit.height.confidence,
-                source=Source.LIDAR,
-            )
-            part = BuildingPart(
-                id=f"{b.key}#1", geometry=b.footprint, height=height, roof=group_fit.roof
-            )
+            roof = Roof.model_validate_json(own[0])
+            height = Estimate[float].model_validate_json(own[1])
+            part = BuildingPart(id=f"{b.key}#1", geometry=b.footprint, height=height, roof=roof)
             flags = [f for f in b.qa_flags if f.code not in _ROOF_FLAG_CODES]
             flags += _height_flags(height.value)
             flags.append(_flag("shared_roof", f"Telhado contínuo com: {group_keys}", "info"))
             diagnostics = dict(b.diagnostics, roof_group_size=float(len(members)))
             results[i] = b.model_copy(
                 update={"parts": [part], "qa_flags": flags, "diagnostics": diagnostics}
+            )
+            changed += 1
+    return changed
+
+
+def member_roof(
+    group_roof: Roof,
+    group_footprint: BaseGeometry,
+    footprint: BaseGeometry,
+    ground_z: float,
+    params: FitParams,
+) -> RoofFit | None:
+    """Telhado de um edifício de um grupo com telhado contínuo, como as tags dele o
+    desenham: a forma S3DB (e o modelo) que reproduz a superfície do telhado do grupo sobre
+    a planta do edifício. Plantas no referencial do LiDAR. None se nenhuma a reproduz.
+
+    Um hipped sobre uma banda de casas, visto só sobre a casa da ponta, tem a água da ponta
+    de um lado e é cortado na parede comum do outro: é side_hipped, não hipped (que um
+    renderizador desenharia com águas nas duas pontas de cada casa).
+    """
+    model = group_roof.model
+    if model is None:
+        return None
+    step = min(0.5, float(np.sqrt(footprint.area / 150.0)))  # >= ~150 amostras
+    minx, miny, maxx, maxy = footprint.bounds
+    gx, gy = np.meshgrid(
+        np.arange(minx + step / 2, maxx, step), np.arange(miny + step / 2, maxy, step)
+    )
+    x, y = gx.ravel(), gy.ravel()
+    inside = shapely.contains_xy(footprint, x, y)
+    x, y = x[inside], y[inside]
+    shape = group_roof.shape.value
+    z = model_surface_z(model, shape, x, y, model.eave_z, group_footprint)
+    samples = PointSet(np.column_stack([x, y, z]), np.full(len(x), 6, dtype=np.uint8))
+    candidates = tuple(s for s in params.candidates if s is not RoofShape.ROUND or s is shape)
+    fit = fit_surface(
+        footprint,
+        samples,
+        ground_z,
+        replace(params, candidates=candidates),
+        group_roof.shape.confidence,
+    )
+    if fit is None:
+        return None
+    colour = group_roof.colour
+    return replace(fit, roof=fit.roof.model_copy(update={"colour": colour}))
+
+
+# --------------------------------------------------- geminados / em banda
+
+ATTACHED_FLAG = "attached_heights"
+# Incerteza da diferença de altura entre vizinhos em terreno plano (chão do MDT).
+ATTACHED_BASE_NOISE_M = 0.1
+
+
+def _trunc_rmse(r: npt.NDArray[np.float64], t: float) -> float:
+    return float(np.sqrt(np.mean(np.minimum(r * r, t * t))))
+
+
+def _shape_increase(
+    pts: PointSet, own: RoofModel, other: RoofModel, shape: RoofShape, t: float
+) -> float:
+    """Quanto pior o telhado ``other`` (prolongado) explica estes pontos do que ``own``,
+    descontado um desnível constante entre os dois (casas em banda numa encosta)."""
+    x, y, z = pts.xyz[:, 0], pts.xyz[:, 1], pts.xyz[:, 2]
+    r_own = z - model_surface_z(own, shape, x, y, own.eave_z)
+    r_other = z - model_surface_z(other, shape, x, y, other.eave_z)
+    return _trunc_rmse(r_other - np.median(r_other), t) - _trunc_rmse(r_own - np.median(r_own), t)
+
+
+def _weighted_median(values: list[float], weights: list[float]) -> float:
+    order = np.argsort(values)
+    cum = np.cumsum(np.asarray(weights)[order])
+    return float(np.asarray(values)[order][np.searchsorted(cum, cum[-1] / 2)])
+
+
+def harmonize_attached(
+    results: list[Building],
+    point_sets: list[PointSet],
+    cfg: Config,
+) -> int:
+    """Iguala height e roof:height de edifícios encostados com o mesmo telhado.
+
+    Dois edifícios com parede comum são "o mesmo telhado" quando têm a mesma forma e o
+    modelo de cada um, prolongado, explica os pontos do outro quase tão bem como o
+    próprio (descontado um desnível constante: em banda numa encosta, cada casa sobe com
+    o terreno e a altura relativa é a mesma). Juntam-se em grupos cujas alturas diferem
+    menos do que as tolerâncias (todos com todos: não se encadeia uma rua inteira em
+    escada) e cada grupo fica com a mediana pesada pelos pontos — o vizinho com o ajuste
+    mais bem suportado decide, em vez de uma média que muda os dois. Diferenças que o
+    LiDAR vê como reais (formas diferentes ou alturas além da tolerância) ficam.
+
+    O telhado de cada um mantém a planta e a orientação; só os níveis mudam (o modelo 3D
+    fica coerente com as tags). Devolve o n.º de edifícios alterados.
+    """
+    h_cfg = cfg.heights
+    if not h_cfg.attached_harmonize or len(results) < 2:
+        return 0
+    t = fit_params(cfg).truncation_m
+    ok = [
+        i
+        for i, b in enumerate(results)
+        if len(b.parts) == 1
+        and b.layout is None
+        and b.ground_elevation_m is not None
+        and (m := b.parts[0].roof.model) is not None
+        and not m.skeleton  # o esqueleto não se prolonga para fora da planta
+        and b.parts[0].roof.shape.value is not RoofShape.UNKNOWN
+        and b.parts[0].roof.shape.confidence >= cfg.roofs.min_shape_confidence
+        and len(point_sets[i]) >= cfg.heights.min_points_per_building
+    ]
+    if len(ok) < 2:
+        return 0
+
+    def levels(i: int) -> tuple[float, float]:
+        part = results[i].parts[0]
+        return part.height.value, part.roof.height.value if part.roof.height else 0.0
+
+    def h_tolerance(i: int) -> float:
+        # O telhado do LiDAR é preciso ao cm; o ruído da altura (relativa) está no chão.
+        # Em terreno plano o chão de dois vizinhos coincide: diferenças de 0,2-0,3 m são
+        # reais. Numa encosta (desnível no pé das paredes) o chão de cada um é incerto.
+        step = results[i].diagnostics.get("terrain_step_m", 0.0)
+        return min(h_cfg.attached_height_tolerance_m, ATTACHED_BASE_NOISE_M + 0.2 * step)
+
+    gap = 0.3
+    fps = [results[i].footprint for i in ok]
+    src, dst = shapely.STRtree(fps).query([f.buffer(gap) for f in fps], predicate="intersects")
+    edges: list[tuple[float, int, int]] = []
+    for a, b in zip(src.tolist(), dst.tolist(), strict=True):
+        if a >= b:
+            continue
+        i, j = ok[a], ok[b]
+        pi, pj = results[i].parts[0], results[j].parts[0]
+        shape = pi.roof.shape.value
+        if pj.roof.shape.value is not shape:
+            continue
+        (hi, rhi), (hj, rhj) = levels(i), levels(j)
+        dh, drh = abs(hi - hj), abs(rhi - rhj)
+        if dh > min(h_tolerance(i), h_tolerance(j)) or drh > h_cfg.attached_roof_height_tolerance_m:
+            continue
+        shared = fps[a].buffer(gap).intersection(fps[b].boundary).length
+        if shared < h_cfg.attached_min_shared_m:
+            continue
+        mi, mj = pi.roof.model, pj.roof.model
+        assert mi is not None and mj is not None
+        limit = h_cfg.attached_max_shape_increase_m
+        if (
+            _shape_increase(point_sets[i], mi, mj, shape, t) > limit
+            or _shape_increase(point_sets[j], mj, mi, shape, t) > limit
+        ):
+            continue
+        edges.append((max(dh, drh), i, j))
+    if not edges:
+        return 0
+
+    # Grupos por ligação completa: junta-se pela diferença mais pequena primeiro e só se
+    # o grupo junto continuar dentro das tolerâncias.
+    group: dict[int, int] = {i: i for i in ok}
+    members: dict[int, list[int]] = {i: [i] for i in ok}
+    for _, i, j in sorted(edges):
+        gi, gj = group[i], group[j]
+        if gi == gj:
+            continue
+        merged = members[gi] + members[gj]
+        hs, rhs = zip(*(levels(k) for k in merged), strict=True)
+        if (
+            max(hs) - min(hs) > min(h_tolerance(k) for k in merged)
+            or max(rhs) - min(rhs) > h_cfg.attached_roof_height_tolerance_m
+        ):
+            continue
+        members[gi] = merged
+        del members[gj]
+        for k in merged:
+            group[k] = gi
+
+    changed = 0
+    for keys in members.values():
+        if len(keys) < 2:
+            continue
+        weights = [
+            results[k].diagnostics.get("n_points", 1.0)
+            * results[k].diagnostics.get("inlier_ratio", 1.0)
+            for k in keys
+        ]
+        hs, rhs = zip(*(levels(k) for k in keys), strict=True)
+        h_target = _weighted_median(list(hs), weights)
+        rh_target = min(_weighted_median(list(rhs), weights), h_target)
+        names = sorted(results[k].key for k in keys)
+        others = ", ".join(names[:6]) + (f" (+{len(names) - 6})" if len(names) > 6 else "")
+        for k in keys:
+            b = results[k]
+            part = b.parts[0]
+            h, rh = levels(k)
+            if abs(h - h_target) < 1e-6 and abs(rh - rh_target) < 1e-6:
+                continue
+            roof = part.roof
+            model = roof.model
+            assert model is not None and b.ground_elevation_m is not None
+            new_roof = roof.model_copy(
+                update={
+                    "height": (
+                        roof.height.model_copy(update={"value": rh_target})
+                        if roof.height is not None
+                        else None
+                    ),
+                    "model": model.model_copy(
+                        update={
+                            "eave_z": b.ground_elevation_m + h_target - rh_target,
+                            "roof_height": rh_target if roof.height is not None else 0.0,
+                        }
+                    ),
+                }
+            )
+            new_part = part.model_copy(
+                update={
+                    "height": part.height.model_copy(update={"value": h_target}),
+                    "roof": new_roof,
+                }
+            )
+            what = f"height {h:.2f} → {h_target:.2f} m"
+            if roof.height is not None:
+                what += f", roof:height {rh:.2f} → {rh_target:.2f} m"
+            flags = [f for f in b.qa_flags if f.code not in ("height_outlier", ATTACHED_FLAG)]
+            flags += _height_flags(h_target)
+            flags.append(
+                _flag(
+                    ATTACHED_FLAG,
+                    f"Igualado aos encostados com o mesmo telhado ({others}): {what}",
+                    "info",
+                )
+            )
+            diagnostics = dict(
+                b.diagnostics,
+                attached_group_size=float(len(keys)),
+                attached_dh_m=h_target - h,
+                attached_droof_m=rh_target - rh,
+            )
+            results[k] = b.model_copy(
+                update={"parts": [new_part], "qa_flags": flags, "diagnostics": diagnostics}
             )
             changed += 1
     return changed
@@ -402,7 +683,10 @@ def reconstruct_area(
             minx, miny, maxx, maxy = shapely.union_all([b.footprint for b in group]).bounds
             bbox = (minx - margin, miny - margin, maxx + margin, maxy + margin)
             points = read_points(
-                (lidar_tiles[t] for t in available), bbox, cfg.heights.building_classes
+                (lidar_tiles[t] for t in available),
+                bbox,
+                cfg.heights.building_classes,
+                cache_dir=cfg.paths.lidar_cache,
             )
             offset, iou0, iou1 = estimate_tile_offset(
                 [b.footprint for b in group],
@@ -429,8 +713,11 @@ def reconstruct_area(
             ]
             tile_results = [built for built, _ in done]
             fits = [fit for _, fit in done]
-            shared = apply_shared_roofs(tile_results, fits, point_sets, offset, cfg)
+            shared = apply_shared_roofs(tile_results, fits, point_sets, offset, cfg, pool=pool)
             if progress and shared:
                 progress(f"  quadrícula {tile}: {shared} edifícios com telhado partilhado")
+            same = harmonize_attached(tile_results, point_sets, cfg)
+            if progress and same:
+                progress(f"  quadrícula {tile}: {same} encostados com alturas igualadas")
             results.extend(tile_results)
     return results, reports

@@ -118,6 +118,11 @@ class PathsConfig(BaseModel):
     def areas_path(self) -> Path:
         return self.areas_file or self.processed.parent / "areas.json"
 
+    @property
+    def lidar_cache(self) -> Path:
+        """Pontos dos LAZ já descomprimidos (partilhados por todas as áreas)."""
+        return self.processed / "lidar_cache"
+
 
 class BarrierRule(BaseModel):
     """Linhas da camada com estes atributos (todos) → estas tags OSM."""
@@ -297,6 +302,17 @@ class HeightsConfig(BaseModel):
     ground_percentile: float = Field(default=5, ge=0, le=50)
     ndsm_resolution_m: float = 0.5
     min_points_per_building: int = 50
+    # Edifícios encostados (geminados, em banda) com o mesmo telhado: as pequenas
+    # diferenças de height/roof:height entre eles são ruído do ajuste e igualam-se.
+    attached_harmonize: bool = True
+    attached_min_shared_m: float = Field(default=2.0, ge=0)  # parede comum mínima
+    # Diferença máxima dentro de um grupo (abaixo do arredondamento da exportação, 0,5 m:
+    # alturas que o LiDAR vê como diferentes ficam como estão).
+    attached_height_tolerance_m: float = Field(default=0.35, ge=0)
+    attached_roof_height_tolerance_m: float = Field(default=0.6, ge=0)
+    # "Mesmo telhado": o modelo do vizinho explica os pontos deste com no máximo este
+    # aumento do erro (m, descontado o desnível entre os dois).
+    attached_max_shape_increase_m: float = Field(default=0.03, ge=0)
 
 
 class RoofsConfig(BaseModel):

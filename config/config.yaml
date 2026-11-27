@@ -92,6 +92,16 @@ heights:
   ground_percentile: 5
   ndsm_resolution_m: 0.5
   min_points_per_building: 50
+  # Geminados/em banda: edifícios encostados (parede comum >= attached_min_shared_m) cujo
+  # telhado tem a mesma forma nos pontos LiDAR (o modelo de um explica os pontos do outro
+  # com <= attached_max_shape_increase_m de erro a mais, descontado o desnível) ficam com
+  # o mesmo height e roof:height, se diferirem menos do que as tolerâncias (o valor comum
+  # é a mediana pesada pelos pontos). Diferenças maiores são reais e ficam.
+  attached_harmonize: true
+  attached_min_shared_m: 2.0
+  attached_height_tolerance_m: 0.35
+  attached_roof_height_tolerance_m: 0.6
+  attached_max_shape_increase_m: 0.03
 
 roofs:
   # side_hipped = "três águas": hip numa ponta, empena na outra (roof:direction = ponta em hip).

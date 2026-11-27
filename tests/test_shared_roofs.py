@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 from shapely.geometry import box
 
 from osm3d.config import load_config
@@ -54,11 +55,14 @@ def test_semi_detached_gabled_becomes_shared_roof() -> None:
     changed = apply_shared_roofs(results, fits, point_sets, (0.0, 0.0), CFG)
 
     assert changed == 2
-    for b in results:
+    # As tags de cada metade descrevem o telhado sobre a planta dela: uma água virada para
+    # fora, até à cumeeira comum (um gabled em cada metade desenhar-se-ia com duas águas).
+    for b, facing in zip(results, (0.0, 180.0), strict=True):
         roof = b.parts[0].roof
-        assert roof.shape.value is RoofShape.GABLED
-        assert roof.ridge_azimuth_deg is not None
-        assert abs(roof.ridge_azimuth_deg - 90) < 2
+        assert roof.shape.value is RoofShape.SKILLION
+        assert roof.facing_azimuth_deg is not None
+        assert abs((roof.facing_azimuth_deg - facing + 180) % 360 - 180) < 2
+        assert roof.height is not None and abs(roof.height.value - 2.5) < 0.1
         assert any(f.code == "shared_roof" for f in b.qa_flags)
         assert abs(b.parts[0].height.value - 8.5) < 0.2  # 6 m + 2,5 m
 
@@ -71,3 +75,29 @@ def test_independent_roofs_stay_separate() -> None:
     north.xyz[:, 2] += 2.0  # metade norte 2 m mais alta: não é um telhado contínuo
     fits[0] = fit_roof(results[0].footprint, north, 100.0, fit_params(CFG))
     assert apply_shared_roofs(results, fits, point_sets, (0.0, 0.0), CFG) == 0
+
+
+def test_terraced_hipped_roof_end_houses_are_side_hipped() -> None:
+    """Hipped contínuo sobre 3 casas em banda: as das pontas ficam side_hipped (água na
+    ponta de fora, empena na parede comum) e a do meio gabled. O modelo 3D de cada uma é
+    o que as tags dela desenham."""
+    from osm3d.reconstruction.building import member_roof
+    from osm3d.reconstruction.roof_models import model_surface_z
+
+    syn = make_roof(
+        RoofShape.HIPPED, length=24, width=10, azimuth_deg=90, roof_height=3.0, ridge_ratio=0.5
+    )
+    fit = fit_roof(syn.footprint, syn.points, syn.ground_z, fit_params(CFG))
+    assert fit.roof.shape.value is RoofShape.HIPPED
+    houses = [box(CX + x0, CY - 5, CX + x0 + 8, CY + 5) for x0 in (-12, -4, 4)]
+    shapes = []
+    for fp in houses:
+        own = member_roof(fit.roof, syn.footprint, fp, syn.ground_z, fit_params(CFG))
+        assert own is not None and own.roof.model is not None
+        shapes.append(own.roof.shape.value)
+        # O modelo próprio reproduz o telhado do grupo sobre a casa.
+        x, y = np.array([fp.centroid.x]), np.array([fp.centroid.y])
+        z_own = model_surface_z(own.roof.model, own.roof.shape.value, x, y, 0.0)
+        z_group = model_surface_z(fit.roof.model, RoofShape.HIPPED, x, y, 0.0)
+        assert abs(z_own[0] - z_group[0]) < 0.15
+    assert shapes == [RoofShape.SIDE_HIPPED, RoofShape.GABLED, RoofShape.SIDE_HIPPED]

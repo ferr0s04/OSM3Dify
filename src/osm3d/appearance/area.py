@@ -51,7 +51,9 @@ def colour_area(
     lidar_tiles: dict[str, Path],
     progress: Callable[[str], None] | None = None,
     ortho_paths: list[Path] | None = None,
+    cache_dir: Path | None = None,
 ) -> list[Building]:
+    """Cor dos telhados (``cache_dir``: cache dos pontos dos LAZ, ver ``read_points``)."""
     by_tile: dict[str, list[int]] = defaultdict(list)
     for i, b in enumerate(buildings):
         if b.parts:
@@ -69,7 +71,7 @@ def colour_area(
             group = [buildings[i] for i in idxs]
             minx, miny, maxx, maxy = shapely.union_all([b.footprint for b in group]).bounds
             bbox = (minx - MARGIN_M, miny - MARGIN_M, maxx + MARGIN_M, maxy + MARGIN_M)
-            points = read_points(lidar_tiles.values(), bbox, [BUILDING_CLASS])
+            points = read_points(lidar_tiles.values(), bbox, [BUILDING_CLASS], cache_dir=cache_dir)
             n_coloured = n_ortho = 0
             # Edifícios com o mesmo deslocamento de co-registo partilham a atribuição
             # dos pontos (os OSM de uma quadrícula; os candidatos têm cada um o seu).

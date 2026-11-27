@@ -49,6 +49,7 @@ _REBUILT_FLAGS = {
     "roof_shape_low_confidence",
     "height_outlier",
     "shared_roof",
+    "attached_heights",  # igualado aos encostados: o contorno novo ajusta-se sozinho
     "invalid_footprint",
     "no_parts",
     "osm_building_parts",
@@ -67,6 +68,9 @@ _REBUILT_DIAGNOSTICS = {
     "inlier_ratio",
     "terrain_step_m",
     "roof_group_size",
+    "attached_group_size",
+    "attached_dh_m",
+    "attached_droof_m",
 }
 
 PointsAround = Callable[[tuple[float, float, float, float]], PointSet]

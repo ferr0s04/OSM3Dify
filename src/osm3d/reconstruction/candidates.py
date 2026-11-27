@@ -18,10 +18,11 @@ import atexit
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 import shapely
 from pyproj import Transformer
 from shapely.geometry import LineString, Point, Polygon
@@ -106,6 +107,51 @@ def candidate_id(x: float, y: float) -> int:
     return (int(round(x)) + 500_000) * 1_000_000 + int(round(y))
 
 
+# Mesmo edifício entre duas corridas: sobreposição (interseção / união) mínima, ou só
+# metade com o mesmo gid municipal (contorno redesenhado na nova versão da cartografia).
+SAME_CANDIDATE_IOU = 0.8
+SAME_GID_IOU = 0.5
+
+
+def keep_candidate_ids(found: list[Building], previous: list[Building]) -> list[Building]:
+    """Cada edifício mantém a chave da corrida anterior, se for o mesmo.
+
+    As revisões, as correções e os contornos editados estão associados à chave, que vem
+    do centróide arredondado ao metro. Um contorno municipal ligeiramente diferente (nova
+    versão da cartografia) podia mudá-la, e o edifício aceite voltava como "por rever".
+    """
+    if not previous or not found:
+        return found
+    new_keys = {b.key for b in found}
+    previous_keys = {b.key for b in previous}
+    old = [b for b in previous if b.osm_type == "new" and b.key not in new_keys]
+    if not old:
+        return found
+    tree = shapely.STRtree([b.footprint for b in old])
+    taken: set[str] = set()
+    out = []
+    for b in found:
+        best, best_iou = None, 0.0
+        if b.key not in previous_keys:  # chave nova: era outra?
+            gid = b.diagnostics.get("municipal_gid")
+            for i in tree.query(b.footprint, predicate="intersects"):
+                o = old[int(i)]
+                if o.key in taken:
+                    continue
+                union = b.footprint.union(o.footprint).area
+                iou = b.footprint.intersection(o.footprint).area / union if union else 0.0
+                same_gid = gid is not None and o.diagnostics.get("municipal_gid") == gid
+                if iou > best_iou and (
+                    iou >= SAME_CANDIDATE_IOU or (same_gid and iou >= SAME_GID_IOU)
+                ):
+                    best, best_iou = o, iou
+        if best is not None:
+            taken.add(best.key)
+            b = b.model_copy(update={"osm_id": best.osm_id})
+        out.append(b)
+    return out
+
+
 # ------------------------------------------------------------------- deteção
 
 
@@ -118,9 +164,10 @@ def detect_candidates(
     municipal_cfg: MunicipalSourceConfig,
     progress: Callable[[str], None] | None = None,
     workers: int | None = None,
+    cache_dir: Path | None = None,
 ) -> list[Building]:
     """Edifícios municipais em falta no OSM e confirmados pelo LiDAR, quadrícula a
-    quadrícula (``workers``: processos)."""
+    quadrícula (``workers``: processos; ``cache_dir``: cache dos pontos dos LAZ)."""
     available = sorted(set(lidar_tiles) & set(dtm_tiles))
     osm_index = shapely.STRtree(osm_buildings) if osm_buildings else None
     muni_index = shapely.STRtree([m.geometry for m in municipal])
@@ -137,6 +184,7 @@ def detect_candidates(
         [dtm_tiles[t] for t in available],
         boundary,
         municipal_cfg,
+        cache_dir,
     )
     # Uma quadrícula por processo: o resultado é o mesmo, pela mesma ordem.
     found: dict[int, Building] = {}
@@ -171,6 +219,7 @@ class _TileEnv:
     dtm: list[Path]
     boundary: BaseGeometry | None
     municipal_cfg: MunicipalSourceConfig
+    cache_dir: Path | None = None  # cache dos pontos dos LAZ (ver read_points)
 
 
 class _OpenedEnv:
@@ -211,7 +260,7 @@ def _detect_tile(task: _TileTask, opened: _OpenedEnv) -> tuple[list[str], str]:
     tile, near, near_m = task
     env = opened.env
     bounds = _tile_bounds(tile)
-    pts = read_points(env.lidar.values(), bounds, [6])
+    pts = read_points(env.lidar.values(), bounds, [6], cache_dir=env.cache_dir)
     if not len(pts):
         return [], ""
     ctx = _TileContext(
@@ -236,6 +285,21 @@ class _TileContext:
     dtm: DtmMosaic
     osm: list[BaseGeometry]  # contornos OSM perto
     boundary: BaseGeometry | None
+    # Pontos ordenados por x: os de uma caixa saem de uma fatia (sem percorrer todos).
+    _by_x: npt.NDArray[np.intp] = field(init=False, repr=False)
+    _xs: npt.NDArray[np.float64] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._by_x = np.argsort(self.pts.xyz[:, 0], kind="stable")
+        self._xs = self.pts.xyz[self._by_x, 0]
+
+    def in_box(self, x0: float, y0: float, x1: float, y1: float) -> npt.NDArray[np.intp]:
+        """Índices dos pontos dentro da caixa (limites incluídos)."""
+        lo = int(np.searchsorted(self._xs, x0, side="left"))
+        hi = int(np.searchsorted(self._xs, x1, side="right"))
+        idx = self._by_x[lo:hi]
+        y = self.pts.xyz[idx, 1]
+        return np.sort(idx[(y >= y0) & (y <= y1)])
 
     def owns(self, c: Point) -> bool:
         """Cada candidato é tratado na quadrícula do seu centróide (sem duplicados)."""
@@ -274,10 +338,7 @@ def lidar_support(footprint_lidar: Polygon, ctx: _TileContext) -> tuple[float, f
     if inner.is_empty or inner.area < 2.0:
         inner = footprint_lidar
     xyz = ctx.pts.xyz
-    bx0, by0, bx1, by1 = inner.bounds
-    near = np.flatnonzero(
-        (xyz[:, 0] >= bx0) & (xyz[:, 0] <= bx1) & (xyz[:, 1] >= by0) & (xyz[:, 1] <= by1)
-    )
+    near = ctx.in_box(*inner.bounds)
     inside = near[shapely.contains_xy(inner, xyz[near, 0], xyz[near, 1])]
     if not len(inside):
         return 0.0, None

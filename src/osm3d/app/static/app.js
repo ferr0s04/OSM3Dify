@@ -10,10 +10,12 @@ import { SQUARE_MESSAGES, posKey, squareRings } from "./geom-editor.js";
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+// Explicação longa num "?" (tooltip), para os campos do painel caberem sem scroll.
+const help = (text) => `<span class="help" title="${esc(text)}">?</span>`;
 const fmt = (v, unit = "") => (v === null || v === undefined ? "—" : `${v}${unit}`);
 const SHAPES = ["flat", "skillion", "gabled", "hipped", "side_hipped", "pyramidal", "round", "unknown"];
 const OVERRIDE_FIELDS = ["topology", "ground", "building", "roof_shape", "height", "roof_height", "roof_orientation", "roof_direction", "roof_colour", "building_colour"];
-const COLOUR_SOURCE = { "omissão": "sem tag: cor por omissão", OSM: "já no OSM", estimada: "estimada", manual: "corrigida" };
+const COLOUR_SOURCE = { "omissão": "omissão", OSM: "já no OSM", estimada: "estimada", manual: "corrigida" };
 const COLOUR_VIA = { orthophoto: "ortofoto + LiDAR", lidar: "só LiDAR" };
 
 // Origem da cor estimada e confiança (abaixo do mínimo, a tag não é exportada).
@@ -24,7 +26,7 @@ function colourSource(c, conf) {
     const min = state.summary?.min_colour_confidence ?? 0;
     s += ` · ${Math.round(conf * 100)}%${c.roof_source === "omissão" && conf < min ? ` < ${Math.round(min * 100)}%: não exportada` : ""}`;
   }
-  if (!$("#opt-roof-colour").checked) s += " · estimada não exportada (opção roof:colour desligada; só a escolhida à mão)";
+  if (!$("#opt-roof-colour").checked) s += " · não exportada";
   return s;
 }
 
@@ -289,11 +291,13 @@ async function select(key, { keepView = false } = {}) {
   map.selectWall(null);
   $("#viewer-status").textContent = "a carregar…";
   if (!keepView) viewer.clearAll();
+  map.showOsmAdjustments(null);
   try {
     const load = loadBuilding(key);
     const [detail, mesh] = await Promise.all([load.detail, load.mesh]);
     if (token !== state.token) return;
     state.detail = detail;
+    map.showOsmAdjustments(detail.osm_adjustments);
     state.touched = new Set(OVERRIDE_FIELDS.filter((f) => detail.overrides[f] !== null));
     state.parts = { view: null, active: false, layout: null, overrides: [], info: null, selected: null };
     map.select(key, detail.bbox);
@@ -327,6 +331,7 @@ function deselect() {
   map.stopEditing();
   map.select(null);
   map.selectWall(null);
+  map.showOsmAdjustments(null);
   viewer.clearAll();
   $("#viewer-status").textContent = "";
   $("#detail").innerHTML = '<p class="muted pad">Selecione um edifício na lista ou no mapa.</p>';
@@ -507,18 +512,18 @@ function renderGround(d, val, t) {
   const sel = val("ground", g.choice);
   const opt = (c, label) =>
     `<option value="${c}" ${sel === c ? "selected" : ""}>${label}: chão ${g[c + "_m"]} m → height ${g.heights[c]} m</option>`;
-  return `<label class="full ground ${t("ground")}">terreno de referência (desnível de ${g.step_m} m)
-      <span class="est">${esc(g.reason)}</span>
+  const tip = `${g.reason}\n\nbaixo: ponto mais baixo (p.ex. estrada) · lote: terreno dominante junto às paredes`;
+  return `<label class="full ground ${t("ground")}"><span>terreno de referência (desnível ${g.step_m} m) ${help(tip)}</span>
       <select name="ground">
-        ${opt("low", "baixo (ponto mais baixo, p.ex. estrada)")}
-        ${opt("high", "lote (terreno dominante junto às paredes)")}
+        ${opt("low", "baixo")}
+        ${opt("high", "lote")}
       </select></label>`;
 }
 
 const TOPOLOGY_MODES = {
-  osm: "ajustar o OSM (landuse / edifício existente contornam este edifício)",
-  trim: "recortar este edifício (sai a lasca que sobrepõe o OSM)",
-  keep: "manter como está (o afastamento/sobreposição é verdadeiro)",
+  osm: "ajustar o OSM a este contorno",
+  trim: "recortar este edifício",
+  keep: "manter (sobreposição verdadeira)",
 };
 
 function renderTopology(d, val, t) {
@@ -530,12 +535,29 @@ function renderTopology(d, val, t) {
     .map(([k, label]) => `<option value="${k}" ${sel === k ? "selected" : ""}>${label}${k === topo.default ? " — padrão" : ""}</option>`)
     .join("");
   const msgs = d.qa_flags.filter((f) => ["adjusts_osm", "topology_trimmed", "straddles_landuse", "overlaps_osm_building", "crosses_highway", "overlaps_new_building"].includes(f.code));
+  const tip = [
+    ...msgs.map((f) => f.message),
+    `Padrão: ${topo.default === "osm" ? "o contorno municipal manda" : "este edifício é recortado"}. Ver as camadas OSM no mapa (landuse, muros, vias). Muda ao aceitar.`,
+  ].join("\n");
   return `<div class="full topology-box ${t("topology")}">
-      <b>Sobreposição com o OSM</b> <span class="est">padrão: ${topo.default === "osm" ? "contorno municipal manda" : "este edifício é recortado"}</span>
-      ${msgs.map((f) => `<div class="small">${esc(f.message)}</div>`).join("")}
+      <b>Sobreposição com o OSM</b> ${help(tip)}
       <select name="topology">${opts}</select>
-      <div class="small muted">Ver as camadas OSM no mapa (landuse, muros, vias). Muda ao aceitar.</div>
+      <div class="small muted" id="topo-adj">${topologyStatus(d.osm_adjustments)}</div>
     </div>`;
+}
+
+function topologyStatus(adjs) {
+  // Modo "ajustar o OSM": o que muda no OSM (já desenhado no mapa).
+  if (!adjs?.length) return "";
+  const done = adjs.filter((a) => a.geometry).length;
+  const failed = adjs.length - done;
+  const tip = adjs.map((a) => `${a.geometry ? "✓" : "✗"} ${a.description}`).join("\n");
+  return `<span title="${esc(tip)}">${done ? `${done} elemento${done > 1 ? "s" : ""} do OSM ajustado${done > 1 ? "s" : ""} no mapa` : ""}${done && failed ? " · " : ""}${failed ? `${failed} não ajustáve${failed > 1 ? "is" : "l"}` : ""}</span>`;
+}
+
+function renderTopologyStatus(adjs) {
+  const el = $("#topo-adj");
+  if (el) el.innerHTML = topologyStatus(adjs);
 }
 
 function renderOsmChange(d) {
@@ -547,11 +569,11 @@ function renderOsmChange(d) {
   const conflicts = Object.entries(d.tags.conflicts);
   const added = Object.keys(d.tags.added);
   const text = {
-    novo: "Sem informação 3D no OSM: todas as tags propostas são novas.",
-    complementa: "Já tem 3D no OSM. A análise acrescenta tags em falta sem contradizer as existentes.",
-    diverge: "Já tem 3D no OSM e a análise <b>propõe valores diferentes</b>. A exportação mantém os do OSM; confirmar no terreno/imagem antes de alterar.",
-    igual: "Já tem 3D no OSM e a análise não acrescenta nada.",
-    "sem proposta": "Sem reconstrução para este edifício.",
+    novo: "Sem 3D no OSM: as tags são todas novas.",
+    complementa: "Acrescenta tags em falta ao 3D do OSM.",
+    diverge: `<b>Valores diferentes</b> do 3D do OSM (fica o do OSM) ${help("Confirmar no terreno/imagem antes de alterar.")}`,
+    igual: "O 3D do OSM já tem tudo.",
+    "sem proposta": "Sem reconstrução.",
   }[kind];
   return `<div class="osm-box" style="border-color:${CHANGE_COLORS[kind]}">
     <div><span class="chip" style="background:${CHANGE_COLORS[kind]};color:white">${esc(CHANGE_LABELS[kind])}</span> ${text}</div>
@@ -579,7 +601,7 @@ function renderTags(tags, existing) {
           <td>${esc(tags.proposed[k] ?? "")}</td><td class="final">${esc(tags.final[k] ?? "")}</td></tr>`;
       })
       .join("")}</table>
-    ${Object.keys(tags.conflicts).length ? `<p class="small muted">Conflitos: mantém-se o valor do OSM (não sobrescrever trabalho de mapeadores).</p>` : ""}`;
+    ${Object.keys(tags.conflicts).length ? `<p class="small muted">Conflitos: fica o valor do OSM ${help("Não se sobrescreve o trabalho dos mapeadores.")}</p>` : ""}`;
 }
 
 function renderGeometry(d) {
@@ -591,11 +613,10 @@ function renderGeometry(d) {
   const where = g.kind === "osm"
     ? "Vai no .osm da exportação, aplicado aos dados atuais do OSM (como os landuse), mesmo sem aceitar as tags 3D."
     : "Vai no edifício novo, ao aceitar.";
-  return `<h3>Contorno ${g.edited ? '<span class="chip">editado à mão</span>' : ""}</h3>
+  const tip = `${BUILDING_EDIT_TIP}\n\n${where} Ao mudar o contorno, o telhado, a altura e a cor são reajustados ao LiDAR.`;
+  return `<h3>Contorno ${g.editable ? help(tip) : ""} ${g.edited ? '<span class="chip">editado à mão</span>' : ""}</h3>
     ${g.editable
-      ? `${BUILDING_EDIT_HINT}
-         ${others.length ? `<p class="small">Vértices cinzentos são partilhados com: ${others.map(esc).join(", ")}. Movê-los move-os também nesses elementos.</p>` : ""}
-         <p class="small muted">${where} Ao mudar o contorno, o telhado, a altura e a cor são reajustados ao LiDAR.</p>
+      ? `${others.length ? `<p class="small" title="Os vértices cinzentos movem-se também nesses elementos.">Vértices partilhados com: ${others.map(esc).join(", ")}</p>` : ""}
          <div class="actions">
            <button class="btn" id="g-square" title="Esquadrar o contorno inteiro (Q no mapa; com um vértice selecionado, só esse canto)">⊾ Esquadrar</button>
            <button class="btn" id="g-reset" ${g.edited ? "" : "disabled"}>Repor contorno ${g.kind === "osm" ? "do OSM" : "municipal"}</button>
@@ -613,6 +634,7 @@ function startBuildingEdit() {
 
 function rerenderDetail() {
   // Volta a desenhar o detalhe sem perder as correções ainda não guardadas.
+  if (!state.touched.has("topology")) map.showOsmAdjustments(state.detail?.osm_adjustments);
   const values = {};
   for (const f of state.touched) {
     const el = document.querySelector(`[name="${f}"]`);
@@ -650,9 +672,8 @@ function renderDetail() {
         ? `<a href="${d.osm_url}" target="_blank" rel="noopener">abrir no OSM ↗</a>
            <a href="#" id="josm-link" data-obj="${josmType}${d.osm_id}">carregar no JOSM</a>
            <span class="muted">v${d.osm_version} · ${esc(d.existing_tags.building ?? "")} · ${fmt(d.area, " m²")}</span>`
-        : `<span class="chip candidate" title="Edifício da cartografia municipal sem contorno no OSM">em falta no OSM</span>
-           <span class="chip municipal" title="Contorno da cartografia municipal, confirmado pelo LiDAR">cartografia municipal</span>
-           <span class="muted">contorno municipal (gid ${fmt(d.diagnostics?.municipal_gid)}; LiDAR em ${Math.round((d.diagnostics?.municipal_lidar_cover ?? 0) * 100)}% da área) · ${fmt(d.area, " m²")} · ao aceitar, é exportado como edifício novo</span>`}
+        : `<span class="chip candidate" title="Contorno da cartografia municipal (confirmado pelo LiDAR) sem edifício no OSM: ao aceitar, é exportado como edifício novo">em falta no OSM</span>
+           <span class="muted" title="gid do contorno municipal · parte da área com LiDAR · área">gid ${fmt(d.diagnostics?.municipal_gid)} · LiDAR ${Math.round((d.diagnostics?.municipal_lidar_cover ?? 0) * 100)}% · ${fmt(d.area, " m²")}</span>`}
     </div>
     ${renderOsmChange(d)}
     <div class="actions">
@@ -661,35 +682,35 @@ function renderDetail() {
       <button class="btn" id="b-reset" title="U" ${d.reviewed_at ? "" : "disabled"}>Repor</button>
     </div>
 
-    ${renderGeometry(d)}
-
     <h3>Correções</h3>
     <form class="form" id="edit-form" autocomplete="off">
       ${renderTopology(d, val, t)}
       ${renderGround(d, val, t)}
-      ${d.candidate ? `<label class="full ${t("building")}">building (tipo do edifício novo) <span class="est">da cartografia municipal: ${esc(d.estimated_building ?? "yes")}</span>
+      ${d.candidate ? `<label class="full ${t("building")}">building <span class="est">municipal: ${esc(d.estimated_building ?? "yes")}</span>
         <select name="building">${buildingTypeOptions(val("building", d.building_type ?? "yes"))}</select></label>` : ""}
-      <label class="${t("roof_shape")}">forma do telhado (roof:shape) <span class="est">estimado: ${fmt(est.roof_shape)} (${fmt(est.roof_shape_conf)})</span>
+      <label class="${t("roof_shape")}">roof:shape <span class="est">est. ${fmt(est.roof_shape)} (${fmt(est.roof_shape_conf)})</span>
         <select name="roof_shape">${shapeOpts(val("roof_shape", eff.roof_shape))}</select></label>
-      <label class="${t("height")}">height (m) <span class="est">estimado: ${fmt(est.height)}</span>
+      <label class="${t("height")}">height (m) <span class="est">est. ${fmt(est.height)}</span>
         <input name="height" type="number" step="0.5" min="0" value="${val("height", eff.height)}"></label>
-      <label class="${t("roof_height")}">roof:height (m) <span class="est">estimado: ${fmt(est.roof_height)}</span>
+      <label class="${t("roof_height")}">roof:height (m) <span class="est">est. ${fmt(est.roof_height)}</span>
         <input name="roof_height" type="number" step="0.5" min="0" value="${val("roof_height", eff.roof_height)}"></label>
-      <label class="${t("roof_orientation")}">roof:orientation <span class="est">estimado: ${fmt(est.roof_orientation)}</span>
+      <label class="${t("roof_orientation")}">roof:orientation <span class="est">est. ${fmt(est.roof_orientation)}</span>
         <select name="roof_orientation">
           <option value="">—</option>
           <option value="along" ${val("roof_orientation", eff.roof_orientation) === "along" ? "selected" : ""}>along (cumeeira ao longo)</option>
           <option value="across" ${val("roof_orientation", eff.roof_orientation) === "across" ? "selected" : ""}>across (cumeeira através)</option>
         </select></label>
-      <label class="${t("roof_direction")}">roof:direction (°, uma água) <span class="est">estimado: ${fmt(est.roof_direction)}</span>
+      <label class="${t("roof_direction")}">roof:direction (°) <span class="est">est. ${fmt(est.roof_direction)}</span>
         <input name="roof_direction" type="number" step="1" min="0" max="359" value="${val("roof_direction", eff.roof_direction)}"></label>
-      <label class="${t("roof_colour")}">roof:colour <span class="est">${colourSource(d.colours, est.roof_colour_conf)}</span>
+      <label class="${t("roof_colour")}">roof:colour <span class="est" title="${esc(colourSource(d.colours, est.roof_colour_conf))}">${colourSource(d.colours, est.roof_colour_conf)}</span>
         <input name="roof_colour" type="color" list="palette" value="${toHex(val("roof_colour", d.colours.roof))}">
         ${swatches(toHex(val("roof_colour", d.colours.roof)), 'data-for="roof_colour"')}</label>
       <label class="${t("building_colour")}">building:colour <span class="est">${COLOUR_SOURCE[d.colours.walls_source]}</span>
         <input name="building_colour" type="color" value="${toHex(val("building_colour", d.colours.walls))}"></label>
-      <label class="full">nota<textarea name="note" rows="2">${esc(d.note ?? "")}</textarea></label>
+      <label class="full">nota<textarea name="note" rows="1">${esc(d.note ?? "")}</textarea></label>
     </form>
+
+    ${renderGeometry(d)}
 
     <h3>Partes (building:part)</h3>
     <div id="parts-section"></div>
@@ -742,6 +763,8 @@ function schedulePreview() {
       const p = await api.preview(key, overrides());
       if (token !== state.token) return;
       viewer.setModel(p.mesh);
+      map.showOsmAdjustments(p.osm_adjustments);
+      renderTopologyStatus(p.osm_adjustments);
       $("#tags").innerHTML = renderTags(p.tags, osmTags(state.detail));
       // Mudar o terreno de referência recalcula a altura (se não foi corrigida à mão).
       const h = document.querySelector('[name="height"]');
@@ -1187,15 +1210,15 @@ function renderPartsSection() {
     const sug = d.suggestion ?? [];
     el.innerHTML = `
       ${sug.length ? `<div class="suggestion">
-        <p class="small">A análise encontrou <b>${sug.length} volumes</b> com alturas ou telhados diferentes neste contorno:
+        <p class="small" title="Volumes com alturas ou telhados diferentes neste contorno">Sugestão: <b>${sug.length} volumes</b>
           ${sug.map((p, i) => `<span class="chip" style="border-left:3px solid ${PART_COLORS[i % PART_COLORS.length]}">${fmt(p.height, " m")} · ${esc(SHAPE_LABELS[p.roof_shape] ?? p.roof_shape)}${p.area ? ` · ${p.area} m²` : ""}</span>`).join(" ")}</p>
         <div class="actions">
-          <button class="btn primary" id="p-suggested" title="Aplica a divisão sugerida como building:part do mesmo edifício (fica ao aceitar; a geometria edita-se na vista Planta)">Aplicar sugestão: building:part</button>
-          <button class="btn" id="p-suggested-buildings" title="Aplica a divisão sugerida como edifícios separados, cada um com as suas tags 3D (fica ao aceitar)">Aplicar sugestão: edifícios separados</button>
+          <button class="btn primary" id="p-suggested" title="Aplica a divisão sugerida como building:part do mesmo edifício (fica ao aceitar; a geometria edita-se na vista Planta)">Aplicar: building:part</button>
+          <button class="btn" id="p-suggested-buildings" title="Aplica a divisão sugerida como edifícios separados, cada um com as suas tags 3D (fica ao aceitar)">Aplicar: edifícios separados</button>
         </div></div>` : ""}
       <div class="actions">
-        <button class="btn" id="p-manual" title="Desenhar a divisão na vista Planta: partes do mesmo edifício (building:part), com alturas e telhados próprios">Dividir à mão em building:part</button>
-        <button class="btn" id="p-buildings" title="Desenhar a divisão na vista Planta: cada peça passa a ser um edifício (building=*) com as suas tags 3D">Dividir à mão em vários edifícios</button>
+        <button class="btn" id="p-manual" title="Desenhar a divisão na vista Planta: partes do mesmo edifício (building:part), com alturas e telhados próprios">Dividir em building:part</button>
+        <button class="btn" id="p-buildings" title="Desenhar a divisão na vista Planta: cada peça passa a ser um edifício (building=*) com as suas tags 3D">Dividir em edifícios</button>
       </div>`;
     $("#p-suggested")?.addEventListener("click", () => startParts("suggested"));
     $("#p-suggested-buildings")?.addEventListener("click", () => startParts("suggested", "buildings"));
@@ -1223,20 +1246,19 @@ function renderPartsSection() {
     <div class="parts-list">
       ${Array.from({ length: n }, (_, i) => `
         <div class="part-card ${i === state.parts.selected ? "sel" : ""}" data-part="${i}" style="border-left-color:${PART_COLORS[i % PART_COLORS.length]}">
-          <h4><span>${esc(pieceName(i))}</span><span class="est small muted" data-est="${i}"></span></h4>
+          <h4><span>${esc(pieceName(i))}</span><span class="est small muted" data-est="${i}"></span>${i === 0 ? help("Os campos mostram o valor em vigor (estimado, ou corrigido a laranja); mudar um campo corrige-o. A divisão fica ao aceitar.") : ""}</h4>
           <div class="form">
-            <label class="${t(i, "roof_shape")}">forma do telhado (roof:shape)<select data-f="roof_shape" data-i="${i}">${shapeOpts(i)}</select></label>
+            <label class="${t(i, "roof_shape")}">roof:shape<select data-f="roof_shape" data-i="${i}">${shapeOpts(i)}</select></label>
             <label class="${t(i, "height")}">height (m)<input data-f="height" data-i="${i}" type="number" step="0.5" min="0" value="${partValue(i, "height")}"></label>
             <label class="${t(i, "min_height")}">min_height (m)<input data-f="min_height" data-i="${i}" type="number" step="0.5" min="0" value="${partValue(i, "min_height")}"></label>
             <label class="${t(i, "roof_height")}">roof:height (m)<input data-f="roof_height" data-i="${i}" type="number" step="0.5" min="0" value="${partValue(i, "roof_height")}"></label>
             <label class="${t(i, "roof_orientation")}">roof:orientation<select data-f="roof_orientation" data-i="${i}">${orientOpts(i)}</select></label>
-            <label class="${t(i, "roof_direction")}">roof:direction (°, uma água)<input data-f="roof_direction" data-i="${i}" type="number" step="1" min="0" max="359" value="${partValue(i, "roof_direction")}"></label>
+            <label class="${t(i, "roof_direction")}">roof:direction (°)<input data-f="roof_direction" data-i="${i}" type="number" step="1" min="0" max="359" value="${partValue(i, "roof_direction")}"></label>
             <label class="${t(i, "roof_colour")}">roof:colour<input data-f="roof_colour" data-i="${i}" type="color" list="palette" value="${colour(i)}">
               ${swatches(colour(i), `data-i="${i}"`)}</label>
           </div>
         </div>`).join("")}
     </div>
-    <p class="small muted">Os campos mostram o valor em vigor (estimado, ou corrigido a laranja); mudar um campo corrige-o. A divisão fica ao aceitar.</p>
     <div class="actions">
       ${state.viewMode === "plan" ? "" : `<button class="btn" id="p-plan" title="Mover, dividir ou juntar as partes na vista Planta">Editar a divisão na Planta</button>`}
       <button class="btn" id="p-single">Voltar a edifício único</button></div>`;
@@ -1280,7 +1302,7 @@ function updatePartsInfo() {
     const e = p.estimated ?? p;
     const span = document.querySelector(`[data-est="${i}"]`);
     if (span) {
-      span.textContent = `estimado: ${SHAPE_LABELS[e.roof_shape] ?? e.roof_shape} · ${fmt(e.height, " m")}` +
+      span.textContent = `est. ${SHAPE_LABELS[e.roof_shape] ?? e.roof_shape} · ${fmt(e.height, " m")}` +
         (e.min_height ? ` (base ${e.min_height} m)` : "") + ` · ${fmt(p.area, " m²")}`;
     }
     // Campos sem correção: o valor em vigor (o que vai nas tags), como no edifício único.
@@ -1422,6 +1444,7 @@ async function selectWall(key) {
   try {
     const d = await api.wall(key);
     if (token !== state.token) return;
+    map.showOsmAdjustments(null);
     state.wall = d;
     state.landuse = null;
     state.selected = null;
@@ -1475,10 +1498,10 @@ const EDIT_HINT = `<p class="small muted">No mapa: arrastar um vértice (encaixa
   Arrastar o triângulo a meio de uma aresta ou duplo clique cria um vértice. Clique (ou botão direito) num vértice ou
   numa aresta abre as opções: apagar (Delete), desligar (D), esquadrar (Q), alinhar o muro (S). Ctrl+Z desfaz.</p>`;
 
-const BUILDING_EDIT_HINT = `<p class="small muted">No mapa, como no iD: arrastar um vértice (encaixa em edifícios,
-  landuse e muros); arrastar o triângulo a meio de uma aresta ou duplo clique cria um vértice. Clique (ou botão
-  direito) num vértice ou numa aresta abre as opções: apagar (Delete), desligar (D), esquadrar o canto, a aresta ou o
-  edifício (Q: o edifício; com um vértice selecionado, o canto). Ctrl+Z desfaz.</p>`;
+const BUILDING_EDIT_TIP = "No mapa, como no iD: arrastar um vértice (encaixa em edifícios, landuse e muros); " +
+  "arrastar o triângulo a meio de uma aresta ou duplo clique cria um vértice. Clique (ou botão direito) num vértice " +
+  "ou numa aresta abre as opções: apagar (Delete), desligar (D), esquadrar o canto, a aresta ou o edifício " +
+  "(Q: o edifício; com um vértice selecionado, o canto). Ctrl+Z desfaz.";
 
 async function selectLanduse(key) {
   // Limite de um landuse do OSM: edita-se como no iD (os nós partilhados movem-se em
@@ -1489,6 +1512,7 @@ async function selectLanduse(key) {
   try {
     const d = await api.landuse(id);
     if (token !== state.token) return;
+    map.showOsmAdjustments(null);
     state.landuse = d;
     state.wall = null;
     state.selected = null;

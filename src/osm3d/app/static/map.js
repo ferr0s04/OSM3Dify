@@ -534,10 +534,49 @@ export class BuildingMap {
     return out;
   }
 
+  async showOsmAdjustments(adjustments) {
+    // Edifício novo no modo "ajustar o OSM": o landuse/edifícios do OSM como ficam na
+    // exportação, em vez dos atuais (estes ficam tracejados por baixo). null: nenhum.
+    await this.ready;
+    this.adjustments = adjustments ?? null;
+    const byId = new Map((this.data.ctx?.features ?? []).map((f) => [f.properties.id, f]));
+    const kinds = this.osmKinds; // camadas OSM ligadas (landuse, edifícios…)
+    const shown = (adjustments ?? []).filter((a) => a.geometry && byId.has(a.id) && (!kinds || kinds.has(byId.get(a.id).properties.kind)));
+    this.adjustedIds = shown.map((a) => a.id);
+    const geojson = {
+      type: "FeatureCollection",
+      features: shown.map((a) => ({
+        type: "Feature",
+        geometry: a.geometry,
+        properties: { ...byId.get(a.id).properties, description: a.description },
+      })),
+    };
+    const src = this.map.getSource("osm-adjusted");
+    if (src) src.setData(geojson);
+    else if (this.map.getSource("osm-ctx")) {
+      this.map.addSource("osm-adjusted", { type: "geojson", data: geojson });
+      const before = this.map.getLayer("b-fill") ? "b-fill" : undefined;
+      const landuse = ["==", ["get", "kind"], "landuse"];
+      const colour = ["case", landuse, LANDUSE_COLOR, OSM_CTX_COLORS.building];
+      this.map.addLayer({ id: "ctx-adjusted-was", type: "line", source: "osm-ctx", filter: ["in", ["get", "id"], ["literal", []]],
+        paint: { "line-color": "#64748b", "line-width": 1, "line-dasharray": [1.5, 1.5], "line-opacity": 0.8 } }, before);
+      this.map.addLayer({ id: "ctx-adjusted-fill", type: "fill", source: "osm-adjusted",
+        paint: { "fill-color": colour, "fill-opacity": ["case", landuse, 0.12, 0.06] } }, before);
+      this.map.addLayer({ id: "ctx-adjusted-line", type: "line", source: "osm-adjusted",
+        paint: { "line-color": colour, "line-width": ["interpolate", ["linear"], ["zoom"], 15, 1.5, 19, 3] } }, before);
+    }
+    this.applyCtxFilters();
+  }
+
   applyCtxFilters() {
     // Way do OSM em edição: só a geometria do editor (a do contexto ainda é a antiga).
+    // Ajustada à volta do edifício aberto: a geometria ajustada (e a atual tracejada).
     if (!this.map.getLayer("ctx-landuse-line")) return;
-    const notEditing = ["!=", ["get", "id"], this.editingCtx ?? ""];
+    const adjusted = ["literal", this.adjustedIds ?? []];
+    if (this.map.getLayer("ctx-adjusted-was")) {
+      this.map.setFilter("ctx-adjusted-was", ["all", ["in", ["get", "id"], adjusted], ["!=", ["get", "id"], this.editingCtx ?? ""]]);
+    }
+    const notEditing = ["all", ["!=", ["get", "id"], this.editingCtx ?? ""], ["!", ["in", ["get", "id"], adjusted]]];
     const landuse = ["==", ["get", "kind"], "landuse"];
     const building = ["==", ["get", "kind"], "building"];
     const polygon = ["==", ["geometry-type"], "Polygon"];
@@ -680,6 +719,7 @@ export class BuildingMap {
     for (const [k, ids] of Object.entries(CTX_LAYERS)) {
       for (const id of ids) if (this.map.getLayer(id)) this.map.setLayoutProperty(id, "visibility", kinds.has(k) ? "visible" : "none");
     }
+    if (this.adjustments) this.showOsmAdjustments(this.adjustments); // só os das camadas ligadas
   }
 
   async setData(geojson) {

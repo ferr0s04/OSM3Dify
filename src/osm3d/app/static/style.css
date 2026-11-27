@@ -50,7 +50,7 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-radius: 3
 .chip.osm { background: #ede9fe; color: #5b21b6; }
 .chip.candidate { background: #ffedd5; color: #9a3412; }
 .badges { display: flex; flex-direction: column; gap: 2px; align-items: flex-end; }
-.osm-box { border-left: 4px solid; background: #f8f9fb; padding: 8px 10px; border-radius: 4px; margin: 8px 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.osm-box { border-left: 4px solid; background: #f8f9fb; padding: 5px 8px; border-radius: 4px; margin: 4px 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 .osm-box code { background: #eef1f5; padding: 0 3px; border-radius: 3px; font-size: 12px; }
 
 /* layout da revisão */
@@ -99,7 +99,7 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-radius: 3
 .mlayers .msel-menu .btn { margin: 4px 10px; }
 .mlayers .msel-menu > div { padding: 2px 10px 6px; white-space: normal; }
 .ctx-popup .maplibregl-popup-content { padding: 4px 8px; font-size: 12px; }
-.topology-box { border: 1px solid var(--border); border-left: 4px solid #d97706; border-radius: 6px; padding: 6px 10px; margin: 8px 0; font-size: 13px; }
+.topology-box { border: 1px solid var(--border); border-left: 4px solid #d97706; border-radius: 6px; padding: 4px 8px; margin: 0; font-size: 12px; }
 .topology-box select { width: 100%; margin-top: 4px; }
 .sw { width: 11px; height: 11px; border-radius: 2px; border: 1px solid rgba(0,0,0,.25); vertical-align: -1px; }
 .form input[type=color] { height: 30px; padding: 2px; }
@@ -146,19 +146,20 @@ kbd { background: var(--chip); border: 1px solid var(--border); border-radius: 3
 .problems { color: var(--bad); font-size: 12.5px; margin: 6px 0; }
 .viewer-status { position: absolute; bottom: 8px; left: 8px; color: #aab2c0; font-size: 12px; }
 
-.detail { overflow-y: auto; flex: 1; padding: 12px 14px 24px; }
+.detail { overflow-y: auto; flex: 1; padding: 8px 12px 20px; }
 .detail h2 { font-size: 16px; margin: 0 0 4px; display: flex; gap: 8px; align-items: center; }
-.detail h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
-.links { display: flex; gap: 10px; font-size: 12px; margin-bottom: 6px; }
+.detail h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 10px 0 4px; display: flex; gap: 6px; align-items: center; }
+.links { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; font-size: 12px; margin-bottom: 4px; }
 .links a { color: var(--accent); text-decoration: none; }
-.actions { display: flex; gap: 6px; margin: 10px 0; flex-wrap: wrap; }
-.form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
-.form label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); }
+.actions { display: flex; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
+.form { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 10px; }
+.form label { display: flex; flex-direction: column; gap: 1px; font-size: 12px; color: var(--muted); }
+.form label .est { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .form label.touched { color: var(--accent); font-weight: 600; }
 .form input, .form select, .form textarea { font: inherit; padding: 4px 6px; border: 1px solid var(--border); border-radius: 5px; color: var(--text); }
 .form .full { grid-column: 1 / -1; }
 .form .est { font-size: 11px; color: var(--muted); font-weight: 400; }
-.form label.ground { background: #fff7e8; border-left: 3px solid var(--warn); padding: 6px 8px; border-radius: 4px; }
+.form label.ground { background: #fff7e8; border-left: 3px solid var(--warn); padding: 4px 8px; border-radius: 4px; }
 /* Paleta de cores de telhado: um clique escolhe a cor (o seletor livre continua ao lado). */
 .swatches { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px; }
 .swatch { width: 18px; height: 18px; border: 1px solid var(--border); border-radius: 4px; padding: 0; cursor: pointer; }
@@ -279,3 +280,5 @@ label.redo select { font: inherit; padding: 2px 4px; border: 1px solid var(--bor
 
 /* Divisão: building:part ou vários edifícios. */
 .split-mode { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+/* Explicações longas do painel de detalhe: num "?" com tooltip. */
+.help { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border: 1px solid var(--border); border-radius: 50%; color: var(--muted); font-size: 10px; font-weight: 600; cursor: help; text-transform: none; letter-spacing: 0; vertical-align: middle; flex: none; }

@@ -454,8 +454,75 @@ def fit_roof(
     rival = next((r for r in results if r.shape is not best.shape), None)
     delta = math.inf if rival is None else rival.score - best.score
     shape_conf = 1.0 - math.exp(-delta / _CONFIDENCE_SCALE)
+    return _roof_fit(best, results, len(xyz), ground_z, params, shape_conf)
+
+
+# Ajuste a uma superfície conhecida: toda a grelha da cumeeira (sem os limites de
+# plausibilidade dos dados reais) e, entre formas que a reproduzem por igual, a mais simples.
+SURFACE_RIDGE_RATIOS = tuple(round(r, 2) for r in np.arange(0.0, 0.951, 0.05))
+SURFACE_TIE_M = 0.02
+
+
+def fit_surface(
+    geometry: BaseGeometry,
+    points: PointSet,
+    ground_z: float,
+    params: FitParams,
+    shape_confidence: float,
+) -> RoofFit | None:
+    """Forma e parâmetros S3DB que melhor reproduzem uma superfície de telhado conhecida,
+    amostrada sem ruído sobre ``geometry`` (p.ex. o telhado contínuo de um grupo de casas
+    em banda visto só sobre uma delas: a da ponta fica side_hipped, as do meio gabled).
+
+    Sem custos a priori (não há ruído a explicar). ``None`` se nenhuma forma a reproduz
+    com erro abaixo de ``params.max_rmse_m``.
+    """
+    xyz = points.xyz
+    if len(xyz) < params.min_points:
+        return None
+    frame = LocalFrame.from_geometry(geometry)
+    hyps = hypotheses_for(geometry, params.candidates)
+    if RoofShape.SIDE_HIPPED in params.candidates:
+        hyps += [
+            Hypothesis(RoofShape.SIDE_HIPPED, f, flip, ridge_ratio=r)
+            for f in (frame, frame.rotated())
+            for flip in (False, True)
+            for r in SURFACE_RIDGE_RATIOS
+            if r not in SIDE_HIPPED_RIDGE_RATIOS
+        ]
+    results = [res for hyp in hyps if (res := _evaluate(hyp, xyz, params)) is not None]
+    if RoofShape.HIPPED in params.candidates:
+        results += [
+            res
+            for f in (frame, frame.rotated())
+            for hyp in asymmetric_hipped(f)
+            if (res := _evaluate(hyp, xyz, params)) is not None
+        ]
+    if not results:
+        return None
+
+    def error(r: FitResult) -> float:
+        return math.sqrt(r.rss / r.n) if r.n else math.inf
+
+    lowest = min(error(r) for r in results)
+    if lowest > params.max_rmse_m:
+        return None
+    tied = [r for r in results if error(r) <= lowest + SURFACE_TIE_M]
+    best = min(tied, key=lambda r: (r.n_params, error(r)))
+    results.sort(key=error)
+    return _roof_fit(best, results, len(xyz), ground_z, params, shape_confidence)
+
+
+def _roof_fit(
+    best: FitResult,
+    results: list[FitResult],
+    n_points: int,
+    ground_z: float,
+    params: FitParams,
+    shape_conf: float,
+) -> RoofFit:
     fit_quality = max(0.0, 1.0 - best.rmse_m / (2 * params.max_rmse_m))
-    height_conf = min(1.0, len(xyz) / 200.0) * fit_quality
+    height_conf = min(1.0, n_points / 200.0) * fit_quality
 
     hyp = best.hypothesis
     roof = Roof(

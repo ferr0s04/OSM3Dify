@@ -88,8 +88,10 @@ from osm3d.validation.topology import (
     CODES as TOPOLOGY_CODES,
 )
 from osm3d.validation.topology import (
+    Adjustment,
     Surroundings,
     TopologyRules,
+    adjusted_feature,
     blocks_buildings,
     default_mode,
     load_surroundings,
@@ -365,18 +367,7 @@ class ReviewService:
                 )
                 self._topo[key] = hit  # uma só chave: atómico para os pedidos em curso
                 return [key]
-            # Grupo: o fecho por "intersecta" dos contornos de base (contém os recortados,
-            # que só encolhem), com os rejeitados também (ligam vizinhos de ambos os lados).
-            group = {self._topo_pos[key]}
-            frontier = [key]
-            while frontier:
-                hits = self._topo_tree.query(
-                    [self.base[k].footprint for k in frontier], predicate="intersects"
-                )[1]
-                fresh = set(hits.tolist()) - group
-                group |= fresh
-                frontier = [self._topo_keys[i] for i in fresh]
-            keys = [self._topo_keys[i] for i in sorted(group)]
+            keys = self._topo_group(key)
             redo = set(keys)
             topo = {k: b for k, b in self._topo.items() if k not in redo}
             topo |= self._resolve(keys, env)
@@ -385,6 +376,71 @@ class ReviewService:
                 self._wgs84.pop(k, None)
                 self._scene_cache.pop(k, None)
             return keys
+
+    def _topo_group(self, key: str) -> list[str]:
+        """Edifícios novos cuja topologia depende da de ``key`` (ordem de ``base``): o fecho
+        por "intersecta" dos contornos de base (contém os recortados, que só encolhem), com
+        os rejeitados também (ligam vizinhos de ambos os lados). Com ``_topo_lock``."""
+        assert self._topo_tree is not None
+        group = {self._topo_pos[key]}
+        frontier = [key]
+        while frontier:
+            hits = self._topo_tree.query(
+                [self.base[k].footprint for k in frontier], predicate="intersects"
+            )[1]
+            fresh = set(hits.tolist()) - group
+            group |= fresh
+            frontier = [self._topo_keys[i] for i in fresh]
+        return [self._topo_keys[i] for i in sorted(group)]
+
+    def osm_adjustments(self, b: Building) -> list[dict[str, Any]] | None:
+        """Como ficam, na exportação, os elementos do OSM (landuse, edifícios) ajustados à
+        volta do edifício novo ``b`` (com a revisão e as correções por guardar): para o
+        mapa os mostrar já. ``[]``: nada a ajustar (ou outro modo); None: não se aplica.
+        """
+        if b.osm_type != "new":
+            return None
+        if mode_of(b) != "osm":
+            return []
+        env = self._surroundings()
+        if env is None:
+            return None
+        self._topology()  # a árvore dos contornos
+        with self._topo_lock:
+            keys = self._topo_group(b.key) if b.key in self._topo_pos else [b.key]
+        group = []
+        for k in keys:
+            nb = b if k == b.key else apply_review(self.base[k], self.reviews.get(k))
+            if k == b.key or (not nb.review_archived and nb.review_status != "rejected"):
+                group.append(nb)
+        rules = TopologyRules.from_config(self.cfg.topology)
+        _, res = resolve_topology(group, env, rules)
+        by_feature: dict[tuple[str, int], list[Adjustment]] = {}
+        for a in res.adjustments:
+            if a.building_key == b.key:
+                by_feature.setdefault((a.feature.osm_type, a.feature.osm_id), []).append(a)
+        out = []
+        for (osm_type, osm_id), adjs in sorted(by_feature.items()):
+            width = max((a.max_width_m or 0.0 for a in adjs), default=0.0) or None
+            geom = adjusted_feature(
+                adjs[0].feature.geom, [(a.obstacle, a.include) for a in adjs], rules, width
+            )
+            wgs = None
+            if geom is not None:
+                wgs = mapping(
+                    shapely.transform(
+                        geom,
+                        lambda c: np.column_stack(self._to_wgs84.transform(c[:, 0], c[:, 1])),
+                    )
+                )
+            out.append(
+                {
+                    "id": f"{osm_type}/{osm_id}",
+                    "geometry": wgs,  # None: não se ajusta (fica sinalizado)
+                    "description": "; ".join(a.description for a in adjs),
+                }
+            )
+        return out
 
     def osm_context(self) -> dict[str, Any]:
         """Landuse, vias, muros/vedações e edifícios do OSM à volta da área (GeoJSON), com as
@@ -1070,6 +1126,8 @@ class ReviewService:
             # Tipo estimado (antes da correção da revisão), p.ex. o da cartografia municipal.
             "estimated_building": base.existing_tags.get("building"),
             "tags": self._tags(b),
+            # Modo "ajustar o OSM": o landuse/edifícios do OSM como ficam na exportação.
+            "osm_adjustments": self.osm_adjustments(b),
             "colours": self._colours(b),
             "osm_change": {
                 "kind": (ch := self._change(b)).kind.value,
@@ -1298,8 +1356,13 @@ class ReviewService:
         if base is None:
             raise NotFound(key)
         b = apply_corrections(base, overrides)
+        if b.osm_type == "new" and overrides.topology is None:
+            # O modo guardado na revisão (as correções por guardar só o mudam se o trazem).
+            saved = apply_review(base, self.reviews.get(key))
+            b = b.model_copy(update={"topology_mode": saved.topology_mode})
         return {
             "mesh": self.mesh_for(b),
+            "osm_adjustments": self.osm_adjustments(b),
             "tags": self._tags(b),
             "effective": self._part_info(b),
             "ground": self._ground_info(b),

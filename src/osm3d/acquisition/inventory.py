@@ -204,14 +204,19 @@ def has_product(files: Iterable[LocalFile], product: str) -> bool:
 
 
 def point_caches(processed_root: Path, lidar_file: Path) -> list[Path]:
-    """Caches ``.npz`` de pontos de um LAZ (``<processed>/<área>/cache/<nome>.npz``)."""
+    """Caches ``.npz`` de pontos de um LAZ: a da aplicação de revisão, por área
+    (``<processed>/<área>/cache/<nome>.npz``), e a das fases, partilhada
+    (``<processed>/lidar_cache/<nome>.c<classes>.npz``)."""
     if not processed_root.is_dir():
         return []
-    return [
+    review = [
         area / "cache" / f"{lidar_file.stem}.npz"
         for area in sorted(processed_root.iterdir())
         if (area / "cache" / f"{lidar_file.stem}.npz").is_file()
     ]
+    stages = processed_root / "lidar_cache"
+    shared = sorted(stages.glob(f"{lidar_file.stem}.c*.npz")) if stages.is_dir() else []
+    return review + shared
 
 
 def delete_local(

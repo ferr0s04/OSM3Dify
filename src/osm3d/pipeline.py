@@ -134,7 +134,7 @@ def stage_state(config: Config, stage: Stage) -> tuple[StageState, str]:
             return "stale", "as quadrículas com LAZ e MDT mudaram"
         used = candidates_sources(config) or {}
         if used.get("version") != CANDIDATES_VERSION:
-            return "stale", "candidatos de uma versão anterior (com deteção só pelo LiDAR)"
+            return "stale", "candidatos de uma versão anterior da reconstrução"
         mpath = municipal_path(config)
         if not mpath.exists() or mpath.stat().st_mtime > made:
             return "stale", "cartografia municipal por obter ou mais recente"
@@ -230,7 +230,7 @@ def run_stage(
             orthos = ortho_files(config)
             if progress and not orthos:
                 progress("  sem ortofotos: cor só do LiDAR (descarregar ortofotos melhora-a)")
-            coloured = colour_area(buildings, lidar, progress, orthos)
+            coloured = colour_area(buildings, lidar, progress, orthos, config.paths.lidar_cache)
             return write_buildings(coloured, out, config.processing_crs)
         case Stage.QA:
             from osm3d.export.geopackage import read_buildings, write_buildings
@@ -364,7 +364,9 @@ def footprint_refitter(config: Config) -> Any:
         from osm3d.footprint_edits import tiles_covering
 
         laz = tiles_covering(index_tiles(config.sources.lidar_dir, (".laz", ".las")), bounds, 0.0)
-        return read_points(laz, bounds)
+        # O reajuste só usa os pontos de edifício (telhado e cor): os da cache das fases.
+        classes = sorted({*config.heights.building_classes, 6})
+        return read_points(laz, bounds, classes, cache_dir=config.paths.lidar_cache)
 
     return FootprintRefitter(
         config,
@@ -574,8 +576,10 @@ def refresh_context(
     return ctx
 
 
-# Versão dos candidatos: outra = refazer (a 2 deixou de detetar edifícios só pelo LiDAR).
-CANDIDATES_VERSION = 2
+# Versão dos candidatos: outra = refazer (a 2 deixou de detetar edifícios só pelo LiDAR;
+# a 3 iguala as alturas dos encostados com o mesmo telhado e dá a cada casa de um telhado
+# contínuo a forma que as tags dela desenham).
+CANDIDATES_VERSION = 3
 
 
 def _run_candidates(
@@ -589,7 +593,11 @@ def _run_candidates(
     from osm3d.export.geopackage import write_buildings
     from osm3d.municipal_area import area_buildings
     from osm3d.reconstruction.building import reconstruct_area
-    from osm3d.reconstruction.candidates import detect_candidates, load_context
+    from osm3d.reconstruction.candidates import (
+        detect_candidates,
+        keep_candidate_ids,
+        load_context,
+    )
     from osm3d.validation.quality import check_building
 
     if not config.sources.municipal_sources:
@@ -638,15 +646,31 @@ def _run_candidates(
         mcfg,
         progress=progress,
         workers=config.workers,
+        cache_dir=config.paths.lidar_cache,
     )
     if progress:
         progress(f"  {len(found)} edifícios da cartografia municipal em falta no OSM")
+    # O mesmo edifício mantém a chave da corrida anterior (as revisões estão nela).
+    if out.exists():
+        from osm3d.export.geopackage import read_buildings
+
+        try:
+            previous = read_buildings(out)
+        except Exception as exc:  # artefacto ilegível: só se perde a continuidade
+            if progress:
+                progress(f"  candidatos anteriores ilegíveis ({exc}): chaves não comparadas")
+            previous = []
+        before = {b.key for b in found}
+        found = keep_candidate_ids(found, previous)
+        kept = sum(b.key not in before for b in found)
+        if progress and kept:
+            progress(f"  {kept} com o contorno municipal mudado mantêm a chave anterior")
     # O LiDAR dá a forma e a altura do telhado, como aos edifícios do OSM.
     fitted, _ = reconstruct_area(found, lidar, dtm, config, progress)
     # Cor do telhado, como na fase colours dos edifícios OSM.
     from osm3d.appearance.area import colour_area
 
-    fitted = colour_area(fitted, lidar, progress, ortho_files(config))
+    fitted = colour_area(fitted, lidar, progress, ortho_files(config), config.paths.lidar_cache)
     checked = []
     for b in fitted:
         known = {f.code for f in b.qa_flags}
